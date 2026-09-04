@@ -447,7 +447,7 @@ async def test_native_recovery_cancellation_abandons_blocking_http(
         release.set()
 
 
-def test_open_native_session_refreshes_headers_without_local_rebind(
+def test_open_native_session_retries_transient_recovery_with_fresh_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _script_http(
@@ -463,15 +463,9 @@ def test_open_native_session_refreshes_headers_without_local_rebind(
         ),
         _HostHttpResult(202, {"queued": False, "recovery": "native_terminal_ready"}),
         _HostHttpResult(
-            200,
-            {
-                "host_id": "host_remote",
-                "runner_id": "runner_remote",
-                "labels": {"omnigent.wrapper": "codex-native-ui"},
-                "permission_level": None,
-            },
+            500,
+            {"error": {"code": "internal_error", "message": "AP is restarting"}},
         ),
-        _HostHttpResult(202, {"queued": False, "recovery": "already_connected"}),
     )
     attached: list[tuple[str, dict[str, str]]] = []
     outcomes = iter((False, True))
@@ -490,8 +484,8 @@ def test_open_native_session_refreshes_headers_without_local_rebind(
         assert callable(attach)
         assert callable(recover)
         assert await attach(kwargs["attach_url"], headers=kwargs["headers"]) is False
-        # The management request in the real recovery callback replaces this
-        # cache entry after the server rejects its expired bearer.
+        # Mimic auth replay refreshing the shared cache before the recovery
+        # request gets a transient server error.
         cli_module._host_http_headers_cache[(_BASE_URL, "host_remote")] = {
             "Authorization": "Bearer fresh",
             OMNIGENT_SLICE_KEY_HEADER: "host_remote",
@@ -535,10 +529,76 @@ def test_open_native_session_refreshes_headers_without_local_rebind(
     assert reconnect_calls[0]["session_id"] == "conv/123"
     assert reconnect_calls[0]["terminal_id"] == "terminal_codex_main"
     assert reconnect_calls[0]["close_attach_on_terminal_gone"] is True
+    assert reconnect_calls[0]["propagate_recover_errors"] is True
     # The native wrapper's normal resume path starts this machine's daemon and
     # can rebind. ``open`` instead attaches the terminal the remote host owns.
     ensure_daemon.assert_not_called()
     run_attach.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("status_code", "body", "expected_error"),
+    [
+        (404, {}, "Session 'conv_123' was not found"),
+        (403, {"error": {"message": "access revoked"}}, "access revoked"),
+    ],
+)
+def test_open_native_reconnect_stops_on_permanent_recovery_error(
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+    body: dict[str, object],
+    expected_error: str,
+) -> None:
+    """A permanent post-attach recovery error exits instead of looping."""
+    _script_http(
+        monkeypatch,
+        _HostHttpResult(
+            200,
+            {
+                "host_id": "host_remote",
+                "runner_id": "runner_remote",
+                "labels": {"omnigent.wrapper": "codex-native-ui"},
+                "permission_level": None,
+            },
+        ),
+        _HostHttpResult(202, {"queued": False, "recovery": "native_terminal_ready"}),
+        _HostHttpResult(status_code, body),
+    )
+    attach_calls = 0
+
+    async def attach_local_terminal(
+        _url: str,
+        *,
+        headers: dict[str, str],
+        **_kwargs: object,
+    ) -> bool:
+        nonlocal attach_calls
+        assert headers == {"Authorization": "Bearer current"}
+        attach_calls += 1
+        return False
+
+    async def terminal_is_gone(**_kwargs: object) -> bool:
+        return False
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("omnigent.claude_native.attach_local_terminal", attach_local_terminal)
+    monkeypatch.setattr(
+        "omnigent.claude_native._is_terminal_resource_gone",
+        terminal_is_gone,
+    )
+    monkeypatch.setattr("omnigent.claude_native._sleep", no_sleep)
+    monkeypatch.setattr(
+        "omnigent.chat._remote_headers",
+        Mock(return_value={"Authorization": "Bearer current"}),
+    )
+
+    result = CliRunner().invoke(cli, ["open", "conv_123", "--server", _BASE_URL])
+
+    assert result.exit_code != 0
+    assert expected_error in result.output
+    assert attach_calls == 1
 
 
 class _FakeHttpResponse:

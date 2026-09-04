@@ -8366,9 +8366,10 @@ def _attach_recovered_open_session(
         async def _recover_native_attach() -> None:
             """Recover placement and refresh routing/auth before a reconnect."""
             nonlocal attempt
-            next_attempt = await _recover_open_session_once_async(
+            next_attempt = await _recover_open_session_while_waiting_async(
                 base_url=base_url,
                 conversation_id=conversation_id,
+                previous=attempt,
             )
             attempt = await _wait_for_open_session_async(
                 base_url=base_url,
@@ -8388,6 +8389,7 @@ def _attach_recovered_open_session(
                 session_id=conversation_id,
                 terminal_id=terminal_id,
                 close_attach_on_terminal_gone=True,
+                propagate_recover_errors=True,
             )
         )
         return
