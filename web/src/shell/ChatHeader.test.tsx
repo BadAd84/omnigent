@@ -54,6 +54,8 @@ const mobileMenu = {
   onOpenChanges: () => {},
   onOpenShells: () => {},
   onOpenSubagents: () => {},
+  githubPanelOpen: false,
+  onOpenGithub: () => {},
   onOpenMainExecutionLog: () => {},
 };
 
@@ -69,6 +71,7 @@ function renderHeader(props: {
   boundAgent?: Agent;
   wrapperLabel?: string | null;
   canShare?: boolean;
+  canFork?: boolean;
   shareDisabled?: boolean;
   shareDisabledReason?: string;
   hasHeaderMenu?: boolean;
@@ -77,6 +80,7 @@ function renderHeader(props: {
   showFilesPanel?: boolean;
   mobileMenu?: typeof mobileMenu;
   onOpenSidebar?: (peek?: boolean) => void;
+  onFork?: () => void;
 }) {
   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
@@ -99,9 +103,11 @@ function renderHeader(props: {
             boundAgent={props.boundAgent}
             wrapperLabel={props.wrapperLabel ?? null}
             canShare={props.canShare ?? false}
+            canFork={props.canFork ?? false}
             shareDisabled={props.shareDisabled}
             shareDisabledReason={props.shareDisabledReason}
             onShare={() => {}}
+            onFork={props.onFork ?? (() => {})}
             hasAgentInfo={props.hasAgentInfo ?? false}
             onAgentInfo={() => {}}
             hasHeaderMenu={props.hasHeaderMenu ?? false}
@@ -206,6 +212,41 @@ describe("ChatHeader — open-sidebar toggle visibility", () => {
       expect(onOpenSidebar).not.toHaveBeenCalledWith(true);
       fireEvent.click(toggle);
       expect(onOpenSidebar).toHaveBeenLastCalledWith(false);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("suppresses the hover tooltip once the dwell fires the peek", () => {
+    // The peek card fades in click-through, so the pointer keeps resting on the
+    // toggle past the tooltip's own delay. The peek is the intended hover
+    // reveal, so its "Open sidebar" tooltip must not also pop over the card.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.pointerEnter(toggle);
+      // Past the 400ms peek dwell and the tooltip's 600ms hover delay.
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.queryByRole("tooltip", { name: "Open sidebar" })).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still shows the tooltip on keyboard focus (no peek armed)", () => {
+    // Focus never arms a peek, so the tooltip stays available for a11y.
+    vi.useFakeTimers();
+    try {
+      renderHeader({ sidebarOpen: false });
+      const toggle = screen.getByRole("button", { name: "Open sidebar" });
+
+      fireEvent.focus(toggle);
+      act(() => vi.advanceTimersByTime(1000));
+
+      expect(screen.getByRole("tooltip", { name: "Open sidebar" })).toBeInTheDocument();
     } finally {
       vi.useRealTimers();
     }
@@ -421,7 +462,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
                 boundAgent={undefined}
                 wrapperLabel={null}
                 canShare={false}
+                canFork={false}
                 onShare={() => {}}
+                onFork={() => {}}
                 hasAgentInfo={false}
                 onAgentInfo={() => {}}
                 hasHeaderMenu={false}
@@ -443,7 +486,9 @@ function renderHeaderWithSession(ctx: TerminalFirstContextValue | null) {
               boundAgent={undefined}
               wrapperLabel={null}
               canShare={false}
+              canFork={false}
               onShare={() => {}}
+              onFork={() => {}}
               hasAgentInfo={false}
               onAgentInfo={() => {}}
               hasHeaderMenu={false}
@@ -526,16 +571,16 @@ describe("ChatHeader — floating mobile controls", () => {
     expect(toggle).toHaveClass("size-10");
   });
 
-  it("insets the pill's leading edge for the Chat/Terminal track", () => {
+  it("insets both pill edges around the switcher and trailing kebab", () => {
     // The track paints its own background to its edge, so with the pill's
-    // zero padding it sat flush against the border while an icon-only
-    // neighbour cleared it by the slack in its 40px box. The inset is
+    // zero padding it sat flush against the leading border, while the expanded
+    // kebab sat flush against the trailing border. The inset is
     // conditional: a lone kebab must stay the 40px circle asserted above.
     isMobileMock.mockReturnValue(true);
     renderHeaderWithSession(makeTerminalFirstCtx());
 
     const cluster = screen.getByTestId("view-mode-toggle").parentElement;
-    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:pl-1.5");
+    expect(cluster).toHaveClass("max-md:has-data-[slot=view-mode-toggle]:px-1.5");
     // The guard keys off the track's own data-slot, so it has to be present.
     expect(screen.getByTestId("view-mode-toggle")).toHaveAttribute("data-slot", "view-mode-toggle");
   });
@@ -700,6 +745,30 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     expect(screen.getByTestId("session-actions-menu")).toBeInTheDocument();
   });
 
+  it("keeps the desktop fallback menu limited to Fork", () => {
+    const onFork = vi.fn();
+    renderHeader({
+      sidebarOpen: true,
+      conversationId: conversation.id,
+      conversationTitle: conversation.title,
+      actionConversation: null,
+      canFork: true,
+      hasAgentInfo: true,
+      hasRailContent: true,
+      showFilesPanel: true,
+      onFork,
+    });
+
+    const trigger = screen.getByTestId("desktop-fork-actions-menu");
+    fireEvent.pointerDown(trigger, { button: 0 });
+    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+      "Fork",
+    ]);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Fork" }));
+
+    expect(onFork).toHaveBeenCalledOnce();
+  });
+
   it("folds the workspace-rail entries into the one mobile kebab", () => {
     // Previously a second `PanelRight` trigger sat beside the kebab; the rail
     // entries now ride in the same menu, so a phone has a single trigger.
@@ -718,13 +787,22 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
       button: 0,
     });
 
-    expect(screen.getAllByRole("menuitem").map((item) => item.textContent?.trim())).toEqual([
+    // Strip SVG <title> text (e.g. "Github" from GithubMono) before comparing —
+    // textContent includes it but it's invisible; the labels are what matters.
+    const svgTitleText = (el: Element) =>
+      [...el.querySelectorAll("title")].map((t) => t.textContent ?? "").join("");
+    expect(
+      screen
+        .getAllByRole("menuitem")
+        .map((item) => (item.textContent ?? "").replace(svgTitleText(item), "").trim()),
+    ).toEqual([
       "Pin",
       "Rename",
       "Mark as unread",
       "Add to project",
       "Files",
       "Changes",
+      "GitHub",
       "Agents1",
       "Archive",
       "Delete",
