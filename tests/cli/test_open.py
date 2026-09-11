@@ -104,7 +104,9 @@ def test_open_shared_native_editor_fails_before_recovery_or_attach(
     run_attach = Mock()
     native_attach = Mock()
     monkeypatch.setattr("omnigent.chat.run_attach", run_attach)
-    monkeypatch.setattr("omnigent.claude_native._attach_with_reconnect", native_attach)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._attach_with_reconnect", native_attach
+    )
 
     result = CliRunner().invoke(cli, ["open", "conv_123", "--server", _BASE_URL])
 
@@ -474,7 +476,10 @@ def test_open_native_session_retries_transient_recovery_with_fresh_headers(
         attached.append((url, dict(headers)))
         return next(outcomes)
 
-    monkeypatch.setattr("omnigent.claude_native.attach_local_terminal", attach_local_terminal)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.attach_local_terminal",
+        attach_local_terminal,
+    )
     reconnect_calls: list[dict[str, object]] = []
 
     async def attach_with_reconnect(**kwargs: object) -> None:
@@ -493,7 +498,10 @@ def test_open_native_session_retries_transient_recovery_with_fresh_headers(
         await recover()
         assert await attach(kwargs["attach_url"], headers=kwargs["headers"]) is True
 
-    monkeypatch.setattr("omnigent.claude_native._attach_with_reconnect", attach_with_reconnect)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._attach_with_reconnect",
+        attach_with_reconnect,
+    )
     cli_module._host_http_keyless_demotions.add((_BASE_URL, "host_remote"))
     remote_headers = Mock(
         return_value={
@@ -583,12 +591,15 @@ def test_open_native_reconnect_stops_on_permanent_recovery_error(
     async def no_sleep(_delay: float) -> None:
         return None
 
-    monkeypatch.setattr("omnigent.claude_native.attach_local_terminal", attach_local_terminal)
     monkeypatch.setattr(
-        "omnigent.claude_native._is_terminal_resource_gone",
+        "omnigent.harnesses.claude_native.main.attach_local_terminal",
+        attach_local_terminal,
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._is_terminal_resource_gone",
         terminal_is_gone,
     )
-    monkeypatch.setattr("omnigent.claude_native._sleep", no_sleep)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.main._sleep", no_sleep)
     monkeypatch.setattr(
         "omnigent.chat._remote_headers",
         Mock(return_value={"Authorization": "Bearer current"}),

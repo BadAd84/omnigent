@@ -634,7 +634,7 @@ class OmnigentClient:
 
     @staticmethod
     def _native_agent_for_row(row: dict[str, Any]) -> Any | None:
-        from omnigent.native_coding_agents import (
+        from omnigent.native.native_coding_agents import (
             native_coding_agent_for_agent_name,
             native_coding_agent_for_harness,
         )

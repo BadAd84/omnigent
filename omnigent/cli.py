@@ -8145,10 +8145,10 @@ def _read_open_session_binding(
 ) -> _OpenSessionBinding:
     """Read the placement and wrapper used to recover a session."""
     from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
-    from omnigent.claude_native_bridge import url_component
-    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+    from omnigent.harnesses.claude_native.bridge import url_component
+    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
     from omnigent.server.auth import LEVEL_OWNER
-    from omnigent.server_url import display_server_url
+    from omnigent.util.server_url import display_server_url
 
     result = _host_http_json(
         base_url=base_url,
@@ -8213,7 +8213,7 @@ def _recover_open_session_once(
     conversation_id: str,
 ) -> _OpenRecoveryAttempt:
     """Ask the server to ensure the session's runner and terminal are ready."""
-    from omnigent.claude_native_bridge import url_component
+    from omnigent.harnesses.claude_native.bridge import url_component
 
     binding = _read_open_session_binding(
         base_url=base_url,
@@ -8539,16 +8539,19 @@ def _attach_recovered_open_session(
     no_wait: bool,
 ) -> None:
     """Attach the recovered session without changing its runner placement."""
-    from omnigent.native_coding_agents import native_coding_agent_for_wrapper_label
+    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 
     native_agent = native_coding_agent_for_wrapper_label(attempt.wrapper_label)
     if native_agent is not None:
         import asyncio
 
-        from omnigent.claude_native import _attach_with_reconnect, attach_local_terminal
         from omnigent.conversation_browser import open_conversation_link_if_enabled
         from omnigent.entities.session_resources import terminal_resource_id
-        from omnigent.native_terminal import terminal_attach_url
+        from omnigent.harnesses.claude_native.main import (
+            _attach_with_reconnect,
+            attach_local_terminal,
+        )
+        from omnigent.native.native_terminal import terminal_attach_url
 
         open_conversation_link_if_enabled(
             base_url=base_url,
