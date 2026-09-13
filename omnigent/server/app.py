@@ -2845,6 +2845,18 @@ def create_app(
         if pending is not None and not pending.done():
             pending.cancel()
 
+    async def _initialize_adopted_session(conv: Any, client: Any) -> None:
+        """Session-init an adopted orphan on its new runner.
+
+        The handshake's crash-recovery scan restarts a turn the persisted
+        history shows as interrupted, so adoption resumes the orphan's
+        in-flight work the same way a managed relaunch does.
+
+        :param conv: The adopted (re-bound) conversation row.
+        :param client: HTTP client for the adopting runner.
+        """
+        await runner_session_initializer.initialize(conv, client, timeout=10.0)
+
     async def _mark_disconnected_runner_failed(runner_id: str) -> None:
         """Reconcile a dropped runner's sessions once the grace expires.
 
@@ -2863,6 +2875,7 @@ def create_app(
         """
         from omnigent.server.routes.sessions import (
             RUNNER_DISCONNECT_GRACE_S,
+            _adopt_or_park_orphaned_subagents,
             _mark_runner_sessions_offline,
         )
         from omnigent.server.schemas import ErrorDetail
@@ -2902,6 +2915,18 @@ def create_app(
                 message="Runner disconnected unexpectedly.",
             ),
             conversation_store,
+        )
+        # Proactive orphan recovery: re-bind the interrupted sub-agent
+        # children to a live runner owned by the same user (resuming their
+        # in-flight turn via the session-init crash-recovery scan), or park
+        # them for the owner's next connecting runner.
+        await _adopt_or_park_orphaned_subagents(
+            affected,
+            runner_id,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            tunnel_registry=tunnel_registry,
+            initialize_session=_initialize_adopted_session,
         )
 
     async def _on_runner_disconnect(runner_id: str) -> None:
@@ -2986,7 +3011,10 @@ def create_app(
         :param error: Human-readable cause from the daemon (exit code +
             log tail), e.g. ``"runner process exited with code 1 ..."``.
         """
-        from omnigent.server.routes.sessions import _mark_runner_sessions_offline
+        from omnigent.server.routes.sessions import (
+            _adopt_or_park_orphaned_subagents,
+            _mark_runner_sessions_offline,
+        )
         from omnigent.server.schemas import ErrorDetail
 
         # The crash report is authoritative and carries the richer cause;
@@ -3008,6 +3036,16 @@ def create_app(
             conversation_store,
             fail_idle_top_level=True,
         )
+        # Same proactive orphan recovery as the disconnect-grace path: a
+        # crash report is just an earlier, richer confirmation of death.
+        await _adopt_or_park_orphaned_subagents(
+            affected,
+            runner_id,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            tunnel_registry=tunnel_registry,
+            initialize_session=_initialize_adopted_session,
+        )
 
     async def _on_runner_connect(runner_id: str) -> None:
         """Re-assign sessions and restart SSE relays on reconnect.
@@ -3024,6 +3062,7 @@ def create_app(
             _session_sandbox_status_cache,
         )
         from omnigent.server.routes.sessions import (
+            _adopt_parked_orphans_onto_connected_runner,
             _ensure_runner_relay,
             _publish_runner_recovered_status,
             _publish_sandbox_status,
@@ -3129,6 +3168,17 @@ def create_app(
             cached_sandbox = _session_sandbox_status_cache.get(conv.id)
             if cached_sandbox is not None and cached_sandbox.stage == "failed":
                 _publish_sandbox_status(conv.id, "ready")
+
+        # A relaunched runner usually mints a fresh id, so the by-runner-id
+        # loop above cannot see the sessions an earlier runner death
+        # orphaned. Adopt the parked ones owned by this runner's user.
+        await _adopt_parked_orphans_onto_connected_runner(
+            runner_id,
+            conversation_store=conversation_store,
+            runner_router=runner_router,
+            tunnel_registry=tunnel_registry,
+            initialize_session=_initialize_adopted_session,
+        )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
         """Owner for a delegated runner, by its bound session.
