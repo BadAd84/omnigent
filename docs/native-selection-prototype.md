@@ -87,3 +87,45 @@ In Cursor's integrated terminal, and then in a standalone terminal:
   mouse behavior still need real-terminal comparison before a default rollout.
 
 This is a transport experiment, not a replacement local control-mode client.
+
+## Regression gate and rollback
+
+Start with a disposable conversation, not an important running task. Use this
+checkout's CLI without replacing your installed CLI, and set the flag on each
+command rather than exporting it in your shell profile. Keep the web UI open
+for approvals. The terminal emulator and agent are separate choices: testing
+inside Cursor does not require using the Cursor agent.
+
+Test the default path first with the variable removed, then repeat with it set
+to `1`. The default path must not print the experimental startup notice. The
+opt-in path must print it; otherwise you may be testing a different installation
+or a wrapper that did not inherit the variable.
+
+| Check | Default path | Experimental path |
+| --- | --- | --- |
+| Fresh launch and resume | Existing prompt, history, and session identity | Same session and usable prompt after resume |
+| Plain-text selection | Existing terminal/tmux behavior | Plain drag, release, copy, and paste without losing selection on release |
+| Input and interrupt | Existing behavior | Normal typing, multiline paste, Unicode, and interrupt still work |
+| Scroll and resize | Existing behavior | Scrollback remains usable; resizing does not garble the prompt |
+| Simultaneous web attachment | Existing behavior | Both clients show output; input is not duplicated |
+| Session lifecycle | Existing detach/exit behavior | No unexpected runner shutdown or hang; shell input/echo restored after exit |
+| Approval | Existing approval flow | Complete an approval in the web UI; tmux popups are intentionally unavailable |
+| Connection failure | Existing recovery behavior | Existing recovery retained for Claude/Codex/Antigravity; other launchers exit cleanly and can be resumed manually |
+
+For a practical manual pass, prioritize your usual agent in Cursor's integrated
+terminal, then the same agent in Ghostty or iTerm. Before widening the experiment,
+also exercise Claude, Codex, and Antigravity if available: they have distinct
+reconnect and cleanup paths. The automated routing tests cover all 11 launchers,
+but do not replace hands-on testing of the installed agent TUIs. Exercise network
+failure only with a disposable connection; do not restart a shared server.
+
+Rollback requires no configuration or session migration. Stop the experimental
+client and rerun the same launcher/resume command with the variable removed:
+
+```bash
+env -u OMNIGENT_EXPERIMENTAL_CONTROL_MODE_ATTACH uv run --no-sync omnigent claude --resume SESSION_ID
+```
+
+Replace `claude` and `SESSION_ID`, and retain your usual server/auth arguments.
+Keep this opt-in until the default-path regression checks pass and the missing
+tmux UI, selection limitations, and reconnect differences are acceptable.
