@@ -307,6 +307,9 @@ _NATIVE_PANE_TURN_STATUSES = ("running", "waiting")
 # Native status edges are sparse, so terminal output refreshes this bounded
 # liveness window; an abandoned pane stops pinning the runner once it expires.
 _NATIVE_PANE_TURN_STALE_S = 120.0
+# Harnesses whose settle edge arrives only via their forwarder's
+# ``external_session_status`` POST (no PTY-derived status source).
+_FORWARDER_SETTLED_NATIVE_HARNESSES = frozenset({"codex-native", "antigravity-native"})
 # Cached server version from the /api/version probe; ``None`` until a probe
 # succeeds. A failed probe stays ``None`` and is retried on the next
 # session-create — the GET is cheap and self-heals a transient failure.
@@ -5088,8 +5091,14 @@ def create_runner_app(
             "hermes-native",
         }:
             return
-        if status == "idle" and harness in {"codex-native", "antigravity-native"}:
+        if status == "idle" and harness in _FORWARDER_SETTLED_NATIVE_HARNESSES:
             return
+        if harness in _FORWARDER_SETTLED_NATIVE_HARNESSES and status in _NATIVE_PANE_TURN_STATUSES:
+            # Terminal delivery takes over from here and the settle edge comes
+            # from the harness forwarder's POST; a forwarder still attaching
+            # can miss the turn's started event, so this dispatch-time edge
+            # must create the idle-watchdog pin itself.
+            _set_native_pane_status(conv_id, status)
         event: _JsonObject = {"type": "session.status", "status": status}
         if error is not None:
             event["error"] = error
@@ -5104,6 +5113,8 @@ def create_runner_app(
                 extra={"session_id": conv_id},
             )
         _publish_event(conv_id, event)
+
+    app.state.publish_turn_status = _publish_turn_status
 
     def _is_native_harness(conv_id: str) -> bool:
         return is_native_harness(_session_harness_name(conv_id))
@@ -8730,6 +8741,11 @@ def create_runner_app(
             recovered_entry: _SubagentWorkEntry | None = None
             if status in ("running", "waiting", "idle", "failed"):
                 _set_native_pane_status(conversation_id, status)
+                # Forwarder-driven harnesses (codex-native & co.) report status
+                # here instead of the PTY publisher, so this edge refreshes the
+                # runner idle clock too — a settling edge restarts the idle
+                # window instead of leaving the runner reapable next poll.
+                _mark_runner_activity()
                 resource_registry.note_external_session_status(conversation_id, status)
                 _fan_out_child_delta_to_parent(
                     conversation_id,

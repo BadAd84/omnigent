@@ -477,3 +477,57 @@ def test_inprocess_turn_status_does_not_pin_idle_watchdog() -> None:
         assert app.state.has_active_work() is False
     finally:
         _session_event_queues_ref.pop("conv_inprocess", None)
+
+
+async def test_dispatch_running_edge_pins_watchdog_for_forwarder_settled_native() -> None:
+    """The runner's own dispatch-time ``running`` edge creates the pane pin.
+
+    codex-native has no PTY-derived status source: its settle edge arrives
+    only via the forwarder's ``external_session_status`` POST, and a forwarder
+    still attaching can miss the turn's ``turn/started`` entirely. The
+    dispatch-time edge must therefore create the idle-watchdog pin itself —
+    and must keep NOT doing so for in-process harnesses, whose turns are
+    counted via ``_active_turns``.
+
+    :returns: None.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.spec.types import AgentSpec, ExecutorSpec
+
+    conv_id = "3d2b90afc1e64f27a95d8ce04b7f6a12"
+    codex_native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return codex_native_spec
+
+    from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    try:
+        # No seeded spec → harness unknown → the in-process rule applies:
+        # the edge records status without a stamp and never pins.
+        app.state.publish_turn_status("conv_inprocess_dispatch", "running")
+        assert app.state.has_active_work() is False
+
+        async with _runner_client(app) as client:
+            # POST /v1/sessions seeds _session_spec_cache so the dispatch
+            # edge below resolves the session's harness to "codex-native".
+            create_resp = await client.post(
+                "/v1/sessions",
+                json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+            )
+            assert create_resp.status_code == 201, create_resp.text
+            app.state.publish_turn_status(conv_id, "running")
+            assert app.state.has_active_work() is True
+    finally:
+        _session_event_queues_ref.pop("conv_inprocess_dispatch", None)
+        _session_event_queues_ref.pop(conv_id, None)
