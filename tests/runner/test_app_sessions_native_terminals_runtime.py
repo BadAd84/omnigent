@@ -3237,7 +3237,7 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
             closed["app_server"] = True
 
     async def _raise_no_thread(*_args: object, **_kwargs: object) -> str:
-        raise TimeoutError("no thread/started observed")
+        raise RuntimeError("event stream ended before thread startup")
 
     # The helper lazily imports wait_for_thread_started from the forwarder
     # module on each call, so patching the module attribute takes effect.
@@ -3266,27 +3266,11 @@ async def test_codex_discover_thread_and_forward_cleans_up_on_discovery_failure(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("exc", "expected_cause"),
-    [
-        (TimeoutError("no thread/started observed"), "startup timed out"),
-        (
-            RuntimeError("event stream ended"),
-            "event stream ended before a thread was created",
-        ),
-    ],
-)
 async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    exc: Exception,
-    expected_cause: str,
 ) -> None:
-    """
-    The startup breadcrumb must describe the actual failure mode: a timeout
-    reads as "startup timed out", while a RuntimeError (TUI exited / event
-    stream ended) must NOT be mislabeled as a timeout.
-    """
+    """A closed stream is reported as a definitive startup failure."""
     from omnigent.harnesses.codex_native import forwarder as codex_native_forwarder
     from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
     from omnigent.runner.app import (
@@ -3303,7 +3287,7 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
             return None
 
     async def _raise(*_args: object, **_kwargs: object) -> str:
-        raise exc
+        raise RuntimeError("event stream ended")
 
     monkeypatch.setattr(codex_native_forwarder, "wait_for_thread_started", _raise)
 
@@ -3324,11 +3308,9 @@ async def test_codex_discover_thread_and_forward_records_accurate_startup_error(
 
     recorded = read_bridge_startup_error(tmp_path)
     assert recorded is not None
-    assert expected_cause in recorded
-    assert type(exc).__name__ in recorded
-    # A RuntimeError must never be described as a timeout.
-    if not isinstance(exc, TimeoutError):
-        assert "timed out" not in recorded
+    assert "event stream ended before a thread was created" in recorded
+    assert "RuntimeError" in recorded
+    assert "timed out" not in recorded
 
 
 @pytest.mark.asyncio

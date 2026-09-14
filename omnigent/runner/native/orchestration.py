@@ -4818,21 +4818,17 @@ async def _codex_discover_thread_and_forward(
                         _THREAD_START_TIMEOUT_SECONDS,
                     )
                     thread_id = await wait_for_thread_started(event_client, timeout=None)
-        except (TimeoutError, RuntimeError) as exc:
+        except RuntimeError as exc:
             # Failed discovery records the cause before releasing resources.
             _logger.exception(
                 "Codex TUI never started a thread for %s; chat will not forward",
                 session_id,
             )
             # Bridge state is never written here; the executor surfaces the recorded cause.
-            cause = (
-                "startup timed out"
-                if isinstance(exc, TimeoutError)
-                else "event stream ended before a thread was created"
-            )
             write_bridge_startup_error(
                 bridge_dir,
-                f"Codex app-server never started a thread ({cause}: "
+                "Codex app-server never started a thread "
+                "(event stream ended before a thread was created: "
                 f"{type(exc).__name__}). Launch routing: {routing_summary}. "
                 "(The runner log has the same near 'native-codex routing'.)",
             )

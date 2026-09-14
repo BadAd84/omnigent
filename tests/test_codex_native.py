@@ -12098,10 +12098,10 @@ def test_resolve_native_codex_launch_no_broker_sidecar_falls_back_to_login(
     assert "no provider configured" in launch.summary  # CLI-login fallback, not the gateway
 
 
-def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
+def test_codex_discover_thread_and_forward_writes_routing_summary_on_stream_end(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """A startup timeout records the launch routing summary in the bridge error (#2745)."""
+    """Failed thread discovery preserves the launch routing in the bridge error."""
     from omnigent.harnesses.codex_native import forwarder as _fwd
     from omnigent.harnesses.codex_native.bridge import read_bridge_startup_error
     from omnigent.runner.native import orchestration as native_orch
@@ -12109,10 +12109,10 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     bridge_dir = tmp_path / "bridge"
     bridge_dir.mkdir()
 
-    async def _timeout(_client: object) -> str:
-        raise TimeoutError("no thread event")
+    async def _stream_ended(_client: object) -> str:
+        raise RuntimeError("event stream ended before thread startup")
 
-    monkeypatch.setattr(_fwd, "wait_for_thread_started", _timeout)
+    monkeypatch.setattr(_fwd, "wait_for_thread_started", _stream_ended)
 
     class _FakeClient:
         async def close(self) -> None:
@@ -12133,7 +12133,7 @@ def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(
     err = read_bridge_startup_error(bridge_dir)
     assert err is not None
     assert "Launch routing: Codex CLI login (no provider configured) -- SENTINEL" in err
-    assert "startup timed out" in err
+    assert "event stream ended before a thread was created" in err
 
 
 # --- headless login-fallback fail-fast: no credential can start the TUI thread ---
