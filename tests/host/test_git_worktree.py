@@ -376,6 +376,47 @@ def test_list_worktrees_returns_main_first(git_repo: Path) -> None:
     assert main.branch == "main"
     assert main.is_main is True
     assert main.detached is False
+    assert main.remote_provider is None
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "https://github.com/omnigent-ai/omnigent.git",
+        "ssh://git@github.com/omnigent-ai/omnigent.git",
+        "git@github.com:omnigent-ai/omnigent.git",
+    ],
+)
+def test_list_worktrees_classifies_verified_github_remotes(
+    git_repo: Path, remote_url: str
+) -> None:
+    """HTTPS, SSH, and scp-style github.com remotes are classified GitHub."""
+    _git(git_repo, "remote", "add", "origin", remote_url)
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {"github"}
+
+
+def test_list_worktrees_classifies_known_non_github_remote(git_repo: Path) -> None:
+    """A recognized non-GitHub remote remains a usable ordinary folder."""
+    _git(git_repo, "remote", "add", "origin", "https://gitlab.com/acme/repo.git")
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {"other"}
+
+
+@pytest.mark.parametrize(
+    "remote_url",
+    [
+        "git@github-personal:omnigent-ai/omnigent.git",
+        "ssh://git@github.enterprise.example/omnigent-ai/omnigent.git",
+    ],
+)
+def test_list_worktrees_keeps_unverified_github_like_hosts_unknown(
+    git_repo: Path, remote_url: str
+) -> None:
+    """SSH aliases and enterprise domains are not guessed to be GitHub."""
+    _git(git_repo, "remote", "add", "origin", remote_url)
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {None}
 
 
 def test_list_worktrees_includes_linked(git_repo: Path) -> None:
@@ -392,12 +433,17 @@ def test_list_worktrees_includes_linked(git_repo: Path) -> None:
 
 def test_list_worktrees_from_linked_resolves_same_list(git_repo: Path) -> None:
     """Listing from inside a linked worktree resolves the main repo's full list."""
+    _git(git_repo, "remote", "add", "origin", "git@github.com:acme/repo.git")
     created = create_worktree(repo_path=str(git_repo), branch_name="feature/a")
-    # Query from the linked worktree — should still see BOTH worktrees.
-    result = list_worktrees(repo_path=created.worktree_path)
+    nested = Path(created.worktree_path) / "nested"
+    nested.mkdir()
+    # Query from a subdirectory of the linked worktree — should still see BOTH
+    # worktrees and the main repository's provider classification.
+    result = list_worktrees(repo_path=str(nested))
     paths = {w.path for w in result}
     assert str(git_repo) in paths
     assert created.worktree_path in paths
+    assert {worktree.remote_provider for worktree in result} == {"github"}
 
 
 def test_list_worktrees_reports_detached_head(git_repo: Path) -> None:
