@@ -419,7 +419,18 @@ def validate_claude_hook_interpreter_compatibility(
 
 
 class ClaudePromptTimeout(RuntimeError):
-    """Claude Code's input box did not render before delivery timed out."""
+    """Claude Code's input box did not render before delivery timed out.
+
+    :param args: Standard exception args; ``args[0]`` is the message.
+    :param blocked_on: Slug naming what the pane was showing instead of the
+        input box (see :func:`_classify_unready_pane`), e.g.
+        ``"launch-preamble"``. Callers log it as a structured attribute so the
+        unrelated causes behind this one timeout can be counted apart.
+    """
+
+    def __init__(self, *args: object, blocked_on: str = "unknown") -> None:
+        super().__init__(*args)
+        self.blocked_on = blocked_on
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -5034,6 +5045,79 @@ def _format_terminal_failure_tail(pane: str) -> str:
     return f" Last terminal output:\n{tail}"
 
 
+# What the pane shows when Claude Code's input box never mounts, ordered most
+# to least specific. Each entry is (slug, markers): a case-insensitive
+# substring match against the last non-empty capture. Drawn from the observed
+# population of these timeouts, where the great majority are not Claude Code
+# failing at all — the pane is still inside the launch command that runs before
+# it, waiting on a credential step nobody is watching.
+_UNREADY_PANE_CAUSES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    # A password prompt blocks the launch outright and no one can see it.
+    (
+        "password-prompt",
+        ("you will be prompted for your password", "enter password to configure", "password:"),
+    ),
+    # A browser SSO / OAuth handshake the person never completed.
+    (
+        "sso-login-wait",
+        (
+            "logging in via sso",
+            "if the browser does not open automatically",
+            "code_challenge=",
+            "a browser may open for",
+        ),
+    ),
+    # Omnigent's own pre-launch setup is still the last thing on screen, so
+    # Claude Code was never reached within the deadline.
+    (
+        "launch-preamble",
+        (
+            "generating claude-code mcp client config",
+            "no changes made to",
+            "unity ai gateway connected",
+            "running dbcert to obtain a new certificate",
+        ),
+    ),
+    # A modal Claude Code draws over the composer and waits on a keypress.
+    (
+        "startup-dialog",
+        (
+            "enter to confirm",
+            "version pin",
+            "update installed",
+            "what should claude do instead?",
+        ),
+    ),
+)
+
+
+def _classify_unready_pane(pane: str) -> str:
+    """
+    Name what the pane was showing instead of Claude Code's input box.
+
+    These timeouts all surface as one error, but they are several unrelated
+    faults — a blocked ``sudo`` prompt, an unfinished browser login, a launch
+    script that never reached Claude Code, a modal waiting on a keypress — and
+    only the pane text tells them apart. Reducing it to a slug lets the
+    failures be counted by cause without regex over captured terminal output
+    (which also carries the person's paths, so it is a poor grouping key).
+
+    :param pane: The last non-empty capture the readiness gate observed.
+        Empty when every capture came back blank.
+    :returns: A cause slug from :data:`_UNREADY_PANE_CAUSES`, ``"no-output"``
+        when nothing was ever captured, or ``"unknown"``.
+    """
+    if not pane.strip():
+        return "no-output"
+    # ``_capture_pane`` asks tmux for plain text (no ``-e``), so the capture
+    # carries no escape sequences to strip.
+    haystack = pane.lower()
+    for slug, markers in _UNREADY_PANE_CAUSES:
+        if any(marker in haystack for marker in markers):
+            return slug
+    return "unknown"
+
+
 def _wait_for_claude_prompt_ready(
     socket_path: str,
     tmux_target: str,
@@ -5063,11 +5147,14 @@ def _wait_for_claude_prompt_ready(
     :returns: None.
     :raises ClaudePromptTimeout: If the prompt never renders within
         *timeout_s* (Claude failed to boot). The message carries a poll
-        count, how many of those polls saw an empty capture, and the tail
-        of the last non-empty capture the loop actually observed (see
+        count, how many of those polls saw an empty capture, a cause slug
+        for what the pane showed instead (:func:`_classify_unready_pane`,
+        also on the exception's ``blocked_on``), and the tail of the last
+        non-empty capture the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
-        a startup crash, a torn/empty capture under a mid-turn repaint, or
-        a box that never appeared — is diagnosable from the error alone.
+        a blocked credential prompt, a startup crash, a torn/empty capture
+        under a mid-turn repaint, or a box that never appeared — is
+        diagnosable from the error alone.
     """
     deadline = time.monotonic() + timeout_s
     polls = 0
@@ -5097,12 +5184,15 @@ def _wait_for_claude_prompt_ready(
     # mostly-empty captures point at a torn read under a busy repaint (the
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
-    # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
+    # e.g. a ``JSON Parse error``, whose text the tail then surfaces). The
+    # cause slug names which of those it was without re-parsing the tail.
+    blocked_on = _classify_unready_pane(last_nonempty)
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         f"(input prompt never rendered in {polls} polls, "
-        f"{empty_polls} empty captures). The message was not delivered."
-        + _format_terminal_failure_tail(last_nonempty)
+        f"{empty_polls} empty captures, blocked_on={blocked_on}). "
+        "The message was not delivered." + _format_terminal_failure_tail(last_nonempty),
+        blocked_on=blocked_on,
     )
 
 
