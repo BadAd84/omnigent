@@ -539,6 +539,7 @@ export function ChatPage() {
   const boundAgentId = useChatStore((s) => s.boundAgentId);
   const boundAgentName = useChatStore((s) => s.boundAgentName);
   const composerSessionHarness = useChatStore((s) => s.sessionHarness);
+  const composerSessionModelSeeded = useChatStore((s) => s.sessionModelSeeded);
   const composerSeededHostId = useChatStore((s) => s.sessionHostId);
   // Fallback for session-scoped agents (created by `omnigent run --server`):
   // the sessions-derived list only carries id+name, so fetch the full
@@ -1019,11 +1020,12 @@ export function ChatPage() {
   const capabilitySource = useMemo(() => {
     if (activeSession)
       return { labels: activeSession.labels ?? {}, harness: activeSession.harness };
-    // Temp/optimistic window: no server session and the sidebar row carries no
-    // native identity, so derive the wrapper label from the SEEDED native
-    // harness (create identity) — otherwise the native model/effort/permission
-    // controls fail closed until the real snapshot arrives.
-    if (isTempConvId(urlConvId)) {
+    // Keep the seeded native identity through the temp-to-real ID handoff,
+    // until the session snapshot can supply its wrapper label and harness.
+    if (
+      isTempConvId(urlConvId) ||
+      (composerSessionModelSeeded && activeConversationId === urlConvId)
+    ) {
       const nativeAgent = nativeCodingAgentForHarness(composerSessionHarness);
       return {
         labels: nativeAgent ? { [WRAPPER_LABEL_KEY]: nativeAgent.wrapperLabel } : {},
@@ -1031,7 +1033,14 @@ export function ChatPage() {
       };
     }
     return { labels: activeConv?.labels ?? {}, harness: null };
-  }, [activeSession, activeConv, urlConvId, composerSessionHarness]);
+  }, [
+    activeSession,
+    activeConv,
+    urlConvId,
+    composerSessionHarness,
+    composerSessionModelSeeded,
+    activeConversationId,
+  ]);
   const modelPickerKind = modelPickerKindForConv(capabilitySource);
   // Effort ladders key on the model the session is actually on — the
   // reported `llmModel` — falling back to the sticky preference only

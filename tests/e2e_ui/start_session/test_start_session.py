@@ -485,6 +485,12 @@ async def _register_common_routes(
             await route.continue_()
 
     await page.route("**/v1/hosts", handle_hosts)
+    # Fake hosts have no backend probes; tests with catalogs or git repos override these.
+    await page.route(
+        "**/v1/hosts/*/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+    await page.route(_WORKTREES_RE, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
@@ -3203,6 +3209,21 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             create_bodies: list[dict[str, Any]] = []
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=create_bodies
+            )
+            await page.route(
+                _WORKTREES_RE,
+                lambda route: route.fulfill(
+                    json={
+                        "data": [
+                            {
+                                "path": "/work/repo",
+                                "branch": "main",
+                                "is_main": True,
+                                "detached": False,
+                            }
+                        ]
+                    }
+                ),
             )
             await page.add_init_script(
                 f"""window.localStorage.setItem(
