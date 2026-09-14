@@ -723,7 +723,9 @@ class CodexAppServerClient:
         response = await future
         error = response.get("error")
         if error:
-            raise CodexAppServerResponseError(error)
+            exc = CodexAppServerResponseError(error)
+            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            raise exc
         return response
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
@@ -3538,13 +3540,16 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     """
     Build terminal env overrides for the native Codex TUI.
 
+    The terminal and app-server share resource attributes for telemetry attribution.
+
     :param app_server: Running app-server wrapper.
     :returns: Environment variables for the terminal process.
     """
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
-        if key in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
+        if key
+        in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 

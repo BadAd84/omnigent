@@ -28,6 +28,7 @@ import type {
   SessionEventInput,
   SessionItem,
   SessionStatus,
+  SkillsStatus,
   SkillSummary,
 } from "./types";
 
@@ -125,6 +126,12 @@ interface SessionResponseWire {
    * Absent/`false` for non-managed/non-resumable hosts.
    */
   host_resumable?: boolean;
+  /**
+   * Whether the session is archived. The snapshot is the only carrier for a
+   * session opened directly by URL — the default list request excludes
+   * archived rows. Absent/`false` for active sessions.
+   */
+  archived?: boolean;
   status: SessionStatus;
   /**
    * Background shells (claude-native) still running as of the last status
@@ -239,6 +246,7 @@ interface SessionResponseWire {
    * description. Surfaced in the web composer's slash-command menu.
    */
   skills?: SkillSummary[];
+  skills_status?: SkillsStatus;
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
   /**
@@ -316,6 +324,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     runnerId: wire.runner_id,
     hostId: wire.host_id ?? null,
     hostResumable: wire.host_resumable ?? false,
+    archived: wire.archived ?? false,
     status: wire.status,
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
@@ -351,6 +360,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     skills: wire.skills ?? [],
+    skillsStatus: wire.skills_status,
     codexModelOptions: wire.model_options ?? [],
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
@@ -1152,13 +1162,18 @@ export interface SessionItemsPage {
  */
 export async function fetchSessionItemsPage(
   sessionId: string,
-  { olderThan, limit = SESSION_HISTORY_PAGE_SIZE }: { olderThan?: string; limit?: number } = {},
+  {
+    olderThan,
+    limit = SESSION_HISTORY_PAGE_SIZE,
+    signal,
+  }: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
 ): Promise<SessionItemsPage> {
   const params = new URLSearchParams({ limit: String(limit), order: "desc" });
   // "Older than the cursor" within a descending scan = items after it.
   if (olderThan) params.set("after", olderThan);
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(sessionId)}/items?${params}`,
+    { signal },
   );
   const page = await readJsonOrThrow<SessionItemsResponseWire>(res);
   // Server returns newest-first; reverse to chronological for rendering.
@@ -1291,6 +1306,37 @@ export function stopSession(sessionId: string): Promise<PostEventResponse> {
 /** Reconnect or relaunch the existing runner without replaying user input. */
 export function retrySession(sessionId: string): Promise<PostEventResponse> {
   return postEvent(sessionId, { type: "retry_session", data: {} });
+}
+
+// Multiple error cards can describe the same failed turn.
+const rateLimitedTurnRetries = new Map<string, Promise<void>>();
+
+/** Continue a rate-limited turn without replaying the original prompt or tools. */
+export function retryRateLimitedTurn(sessionId: string): Promise<void> {
+  const pending = rateLimitedTurnRetries.get(sessionId);
+  if (pending) return pending;
+
+  const retry = postEvent(sessionId, {
+    type: "message",
+    data: {
+      role: "user",
+      content: [
+        {
+          type: "input_text",
+          text: "Please continue from where you left off before the rate limit error.",
+        },
+      ],
+    },
+  })
+    .then((result) => {
+      if (result.denied) throw new Error("The retry was blocked by a policy");
+      if (!result.queued) throw new Error("The retry was not accepted");
+    })
+    .finally(() => {
+      rateLimitedTurnRetries.delete(sessionId);
+    });
+  rateLimitedTurnRetries.set(sessionId, retry);
+  return retry;
 }
 
 /**
