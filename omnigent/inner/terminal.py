@@ -1002,16 +1002,20 @@ class TerminalInstance:
     # Monotonic stamp of a successful :meth:`launch`, so the exit log can say
     # whether tmux vanished seconds into a launch or hours into a live session.
     _launched_at: float | None = field(default=None, repr=False)
-    # Capture failures that a following ``has-session`` proved benign. The exit
-    # counter resets on every recovery, so without this the log cannot tell a
-    # first-ever failure from the last of a long flapping streak.
+    # Count of capture failures a following ``has-session`` proved benign — one
+    # per recovered probe. The consecutive-failure counter resets on every
+    # recovery, so without this tally the exit log cannot tell a first-ever
+    # failure from the last of a long flapping streak.
     _recovered_capture_failures: int = field(default=0, repr=False)
-    # Largest wall-clock-ahead-of-monotonic gap seen across one watcher poll,
-    # and the monotonic time it was seen (see
-    # :data:`_WATCH_CLOCK_GAP_MIN_SECONDS`). ``0.0`` / ``None`` until the host
-    # stops running mid-watch.
+    # The most recent wall-clock-ahead-of-monotonic gap across one watcher poll,
+    # the monotonic time it was seen, and how many such gaps this terminal has
+    # seen (see :data:`_WATCH_CLOCK_GAP_MIN_SECONDS`). Deliberately the most
+    # recent rather than the largest: the absence that matters is the one
+    # directly before the exit, and a value and a timestamp taken from
+    # different gaps would describe an event that never happened.
     _watch_clock_gap_s: float = field(default=0.0, repr=False)
     _watch_clock_gap_at: float | None = field(default=None, repr=False)
+    _watch_clock_gaps: int = field(default=0, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1081,11 +1085,9 @@ class TerminalInstance:
         gap = (time.time() - wall_before) - (now - monotonic_before)
         if gap < _WATCH_CLOCK_GAP_MIN_SECONDS:
             return
-        # Keep the largest gap: several short suspends are less telling than
-        # the one long absence that explains the server's death.
-        if gap > self._watch_clock_gap_s:
-            self._watch_clock_gap_s = gap
+        self._watch_clock_gap_s = gap
         self._watch_clock_gap_at = now
+        self._watch_clock_gaps += 1
 
     def _tmux_gone_diagnostics(self) -> str:
         """Summarize why tmux vanished, for the "tmux unavailable" exit log.
@@ -1125,9 +1127,11 @@ class TerminalInstance:
             parts.append(f"{self._recovered_capture_failures} earlier probe failures recovered")
         if self._watch_clock_gap_at is not None:
             since = time.monotonic() - self._watch_clock_gap_at
+            earlier = self._watch_clock_gaps - 1
             parts.append(
                 f"host stopped running for ~{self._watch_clock_gap_s:.0f}s "
-                f"{since:.0f}s ago (suspend or clock step)"
+                f"{since:.0f}s ago (suspend or clock step"
+                + (f", {earlier} earlier)" if earlier else ")")
             )
         last_interaction = self._last_client_interaction_at
         if last_interaction == float("-inf"):
@@ -1628,7 +1632,7 @@ class TerminalInstance:
                 )
                 session_exists = await self._tmux_session_exists_async()
                 if session_exists is not False:
-                    self._recovered_capture_failures += consecutive_capture_failures + 1
+                    self._recovered_capture_failures += 1
                     consecutive_capture_failures = 0
                     if session_exists is None:
                         await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
@@ -1837,7 +1841,7 @@ class TerminalInstance:
             if snapshot is None:
                 session_exists = self._tmux_session_exists_sync()
                 if session_exists is not False:
-                    self._recovered_capture_failures += consecutive_capture_failures + 1
+                    self._recovered_capture_failures += 1
                     consecutive_capture_failures = 0
                     if session_exists is None and stop_event.wait(
                         _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS

@@ -249,9 +249,14 @@ def test_poll_clock_gap_records_a_host_that_stopped_running(tmp_path: Path) -> N
     assert "host stopped running for ~5400s" in summary
     assert "(suspend or clock step)" in summary
 
-    # A larger absence replaces a smaller one; the recency stamp still moves.
-    instance._note_poll_clock_gap(time.time() - 10.0, time.monotonic())
-    assert instance._watch_clock_gap_s == pytest.approx(5400.0, abs=1.0)
+    # A second absence reports itself, not the earlier larger one: the value and
+    # its timestamp must describe the same gap, and the gap that matters is the
+    # one directly before the exit. The earlier one is still counted.
+    instance._note_poll_clock_gap(time.time() - 30.0, time.monotonic())
+    assert instance._watch_clock_gap_s == pytest.approx(30.0, abs=1.0)
+    summary = instance._tmux_gone_diagnostics()
+    assert "host stopped running for ~30s" in summary
+    assert "1 earlier)" in summary
 
 
 def test_poll_clock_gap_ignores_ordinary_scheduling_delay(tmp_path: Path) -> None:
