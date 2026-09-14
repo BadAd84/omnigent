@@ -98,9 +98,11 @@ ACP_CLI_HARNESSES: dict[str, AcpCliHarness] = {
     # Keyed ``devin-acp``, not ``devin``: the bare vendor spelling now
     # canonicalizes to the native wrap (``devin-native``, see ``aliases`` in
     # omnigent/harness_plugins.py), the way ``opencode`` resolves to
-    # ``opencode-native``. This row keeps Devin's ACP path — and the sub-agent
-    # dialect in ``omnigent.inner.devin`` that only it surfaces — reachable as
-    # ``--harness devin-acp``.
+    # ``opencode-native``. Deprecated: native Devin replaced it as the offered
+    # Devin, so it is skipped in ``omnigent config`` setup (see cli_config.py).
+    # It stays registered and resolvable via ``--harness devin-acp`` — keeping
+    # Devin's ACP path and the sub-agent dialect in ``omnigent.inner.devin`` —
+    # so existing ACP sessions still resume.
     "devin-acp": AcpCliHarness(
         install=HarnessInstallSpec(
             "Devin (ACP)",
