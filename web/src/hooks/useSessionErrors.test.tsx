@@ -6,7 +6,7 @@ import type { MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { fetchSessionItemsPage, type SessionItemsPage } from "@/lib/sessionsApi";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { useSessionErrors } from "./useSessionErrors";
+import { useSessionErrors, useSessionErrorStates } from "./useSessionErrors";
 
 vi.mock("@/lib/sessionsApi", () => ({ fetchSessionItemsPage: vi.fn() }));
 const fetchPage = vi.mocked(fetchSessionItemsPage);
@@ -28,6 +28,20 @@ const errorPage: SessionItemsPage = {
   hasMore: true,
 };
 const normalPage: SessionItemsPage = { items: [message("Recovered.")], hasMore: true };
+const disconnectPage: SessionItemsPage = {
+  items: [
+    {
+      id: "disconnect1",
+      response_id: "response1",
+      type: "error",
+      status: "completed",
+      source: "execution",
+      code: "runner_disconnected",
+      message: "Runner disconnected unexpectedly.",
+    },
+  ],
+  hasMore: true,
+};
 
 function harness() {
   const client = new QueryClient({
@@ -58,6 +72,37 @@ afterEach(() => {
 });
 
 describe("useSessionErrors", () => {
+  it("clears a live runner disconnect as soon as host liveness recovers", () => {
+    const entry = conversationRegistry.acquire(session.id);
+    entry.setState({
+      blocks: itemsToBlocks(disconnectPage.items),
+      loadingConversation: false,
+      abortController: new AbortController(),
+    });
+    const { wrapper } = harness();
+    const hook = renderHook(
+      ({ host_online }) => useSessionErrorStates([{ ...session, host_online }]),
+      { wrapper, initialProps: { host_online: false } },
+    );
+
+    expect(hook.result.current).toEqual(["disconnected"]);
+    hook.rerender({ host_online: true });
+    expect(hook.result.current).toEqual(["recovered_disconnect"]);
+    expect(fetchPage).not.toHaveBeenCalled();
+  });
+
+  it("reads a failed unopened row so a recovered disconnect does not stay red", async () => {
+    fetchPage.mockResolvedValue(disconnectPage);
+    const { wrapper } = harness();
+    const hook = renderHook(
+      () => useSessionErrorStates([{ ...session, status: "failed", host_online: true }]),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(hook.result.current).toEqual(["recovered_disconnect"]));
+    expect(fetchPage).toHaveBeenCalledTimes(1);
+  });
+
   it("flags an unopened idle session from its latest native message and reuses the cache", async () => {
     fetchPage.mockResolvedValue(errorPage);
     const { wrapper } = harness();
@@ -219,13 +264,12 @@ describe("useSessionErrors", () => {
     expect(hook.result.current).toEqual([false]);
   });
 
-  it("does not request tails for running, failed, awaiting, or provisional rows", async () => {
+  it("does not request tails for running, awaiting, or provisional rows", async () => {
     const { wrapper } = harness();
     renderHook(
       () =>
         useSessionErrors([
           { ...session, id: "running", status: "running" },
-          { ...session, id: "failed", status: "failed" },
           { ...session, id: "awaiting", pending_elicitations_count: 1 },
           { ...session, id: "temp:pending" },
           { ...session, id: "provisional", provisional: true },

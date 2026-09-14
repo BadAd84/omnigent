@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { AnyBlock, BlockContext, ErrorBlock, TextDone } from "./blocks";
-import { latestActivityIsError } from "./sessionError";
+import { latestActivityErrorState, latestActivityIsError } from "./sessionError";
 
 const ctx: BlockContext = {
   agent: null,
@@ -28,6 +28,39 @@ describe("latestActivityIsError", () => {
   it("recognizes structured errors and ignores info-level notices", () => {
     expect(latestActivityIsError([error])).toBe(true);
     expect(latestActivityIsError([{ ...error, level: "info" }])).toBe(false);
+  });
+
+  it("distinguishes runner disconnects from genuine faults and host recovery", () => {
+    const disconnected = { ...error, code: "runner_disconnected" };
+    expect(latestActivityErrorState([disconnected], false)).toBe("disconnected");
+    expect(latestActivityErrorState([disconnected], true)).toBe("recovered_disconnect");
+    expect(latestActivityErrorState([error], true)).toBe("error");
+  });
+
+  it("preserves a genuine fault in a mixed fault and disconnect cascade", () => {
+    const disconnected = { ...error, code: "runner_disconnected", message: "Tunnel dropped" };
+    expect(latestActivityErrorState([error, disconnected], false)).toBe("error");
+    expect(latestActivityErrorState([error, disconnected], true)).toBe("error");
+  });
+
+  it("does not reach across a causal boundary for an older genuine fault", () => {
+    const older = { ...error, ctx: { ...ctx, responseId: "r0", turn: 0 } };
+    const disconnected = {
+      ...error,
+      ctx: { ...ctx, responseId: "r1", turn: 1 },
+      code: "runner_disconnected",
+    };
+    expect(latestActivityErrorState([older, disconnected], true)).toBe("recovered_disconnect");
+  });
+
+  it("lets a recovered disconnect override its generic failed lifecycle marker", () => {
+    const disconnected = { ...error, code: "runner_disconnected" };
+    expect(
+      latestActivityErrorState(
+        [disconnected, { type: "response_end", ctx, status: "failed", response: null }],
+        true,
+      ),
+    ).toBe("recovered_disconnect");
   });
 
   it("recognizes the native idle-session API rejection text", () => {

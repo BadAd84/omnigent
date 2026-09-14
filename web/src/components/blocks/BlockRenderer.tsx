@@ -857,6 +857,7 @@ function renderItem(
           cause={item.cause}
           remediation={item.remediation}
           level={item.level}
+          relatedErrors={item.relatedErrors}
           onRetry={onRetryError ? () => onRetryError(item) : undefined}
         />
       );

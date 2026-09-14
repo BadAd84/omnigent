@@ -159,7 +159,8 @@ import { isImeCompositionKeyEvent } from "@/lib/ime";
 import { useHasSessionDraft } from "@/lib/sessionDrafts";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionState, type SessionState } from "@/hooks/useSessionState";
-import { useSessionErrors } from "@/hooks/useSessionErrors";
+import { useSessionErrorStates } from "@/hooks/useSessionErrors";
+import type { LatestSessionError } from "@/lib/sessionError";
 import { useChatStore } from "@/store/chatStore";
 import {
   isConversationUnseen,
@@ -1454,7 +1455,7 @@ function ProjectFolder({
       frozenSortKeys,
     );
   }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
-  const errors = useSessionErrors(conversations);
+  const errors = useSessionErrorStates(conversations);
   const startingConversationId = useChatStore((s) =>
     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
   );
@@ -2497,13 +2498,14 @@ function UngroupDropZone() {
 /** Surface the most actionable state across a collapsed project's loaded rows. */
 function projectMarkerState(
   conversations: Conversation[],
-  errors: readonly boolean[],
+  errors: readonly (LatestSessionError | null)[],
   startingConversationId: string | null,
 ): SessionState | null {
   let awaiting = 0;
   let running = false;
   let starting = false;
   let error = false;
+  let disconnected = false;
   let unseen = false;
   for (const [i, c] of conversations.entries()) {
     const state = getSessionState(c, errors[i]);
@@ -2515,6 +2517,8 @@ function projectMarkerState(
       starting = true;
     } else if (state?.kind === "error") {
       error = true;
+    } else if (state?.kind === "disconnected") {
+      disconnected = true;
     } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
       unseen = true;
     }
@@ -2523,6 +2527,7 @@ function projectMarkerState(
   if (running) return { kind: "running" };
   if (starting) return { kind: "starting" };
   if (error) return { kind: "error" };
+  if (disconnected) return { kind: "disconnected" };
   if (unseen) return { kind: "unseen" };
   return null;
 }
@@ -3717,8 +3722,8 @@ function ConversationRowImpl({
   const canMarkUnread = !hasUnseenMessages;
   // Approvals and failures outrank the unread dot without clearing read state.
   const errorConversations = useMemo(() => [conversation], [conversation]);
-  const [latestMessageIsError] = useSessionErrors(errorConversations);
-  const derivedState = getSessionState(conversation, latestMessageIsError);
+  const [latestError] = useSessionErrorStates(errorConversations);
+  const derivedState = getSessionState(conversation, latestError);
   // The bound session's launch/relaunch window: a send is in flight (local
   // status "streaming") or the runner is auto-creating the PTY
   // (`terminalPending`), but the server hasn't confirmed `running` yet — a

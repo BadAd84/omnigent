@@ -238,7 +238,7 @@ describe("BlockRenderer dispatch", () => {
     };
 
     render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
-    const retry = screen.getByRole("button", { name: "Retry" });
+    const retry = screen.getByRole("button", { name: "Resume session" });
     fireEvent.click(retry);
     fireEvent.click(retry);
 
@@ -246,7 +246,7 @@ describe("BlockRenderer dispatch", () => {
     expect(onRetryError).toHaveBeenCalledWith(item);
     expect(screen.queryByRole("alert")).toBeNull();
     expect(screen.getByRole("status")).toHaveTextContent(/^Reconnecting$/);
-    expect(screen.queryByRole("button", { name: "Retry" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Resume session" })).toBeNull();
     resolveRetry?.();
     await waitFor(() => {
       expect(screen.queryByRole("status")).toBeNull();
