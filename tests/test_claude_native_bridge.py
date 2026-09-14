@@ -8219,6 +8219,18 @@ def test_classify_unready_pane_names_each_observed_cause(expected: str, pane: st
     assert claude_native_bridge._classify_unready_pane(pane) == expected
 
 
+def test_classify_unready_pane_ignores_a_bare_password_mention() -> None:
+    """The word alone must not claim the first-checked label.
+
+    The password table is scanned before every other cause, so a marker loose
+    enough to match ordinary agent output would relabel unrelated failures.
+
+    :returns: None.
+    """
+    pane = "Reading config...\n  db_password: <redacted>\nPassword: rotated\n"
+    assert claude_native_bridge._classify_unready_pane(pane) == "unknown"
+
+
 def test_classify_unready_pane_separates_no_output_from_unknown() -> None:
     """A blank capture is a torn read, not an unrecognized screen.
 

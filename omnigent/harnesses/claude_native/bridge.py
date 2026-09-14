@@ -5053,9 +5053,13 @@ def _format_terminal_failure_tail(pane: str) -> str:
 # it, waiting on a credential step nobody is watching.
 _UNREADY_PANE_CAUSES: tuple[tuple[str, tuple[str, ...]], ...] = (
     # A password prompt blocks the launch outright and no one can see it.
+    # Deliberately not a bare "password:" — this table is scanned first, and an
+    # agent that merely printed that word would take the label for itself. Both
+    # markers are the launcher's own announcement, which precedes the prompt in
+    # every observed report.
     (
         "password-prompt",
-        ("you will be prompted for your password", "enter password to configure", "password:"),
+        ("you will be prompted for your password", "enter password to configure"),
     ),
     # A browser SSO / OAuth handshake the person never completed.
     (
@@ -5069,11 +5073,14 @@ _UNREADY_PANE_CAUSES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ),
     # Omnigent's own pre-launch setup is still the last thing on screen, so
     # Claude Code was never reached within the deadline.
+    # Narrow phrasings only: a bare "no changes made to" also appears in
+    # ordinary agent output, and this label would then swallow unrelated
+    # failures. The truncated spelling is kept because a narrow pane wraps the
+    # line.
     (
         "launch-preamble",
         (
-            "generating claude-code mcp client config",
-            "no changes made to",
+            "claude-code mcp client config",
             "unity ai gateway connected",
             "running dbcert to obtain a new certificate",
         ),
