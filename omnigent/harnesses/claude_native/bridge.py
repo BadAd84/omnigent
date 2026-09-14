@@ -312,6 +312,16 @@ _FOREIGN_DIALOG_HINTS = (
     "Do you want to ",
     "Yes, and don't ask again",
 )
+# Startup dialogs and credential wrappers need human input before the composer mounts.
+_PENDING_STARTUP_INPUT_HINTS = (
+    "enter to confirm",
+    "waiting for oauth callback",
+    "logging in via sso...",
+    "open this url in your browser to authenticate",
+)
+_PASSWORD_PROMPT_RE = re.compile(
+    r"(?:^|\n)(?:\[sudo\] )?password(?: for [^:\n]+)?:\s*\Z", re.IGNORECASE
+)
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
 # still covering the slow warm-session render.
@@ -420,6 +430,10 @@ def validate_claude_hook_interpreter_compatibility(
 
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
+
+
+class ClaudePromptBlocked(ClaudePromptTimeout):
+    """Delivery timed out while startup was waiting for human input."""
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -5068,6 +5082,11 @@ def _wait_for_claude_prompt_ready(
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a startup crash, a torn/empty capture under a mid-turn repaint, or
         a box that never appeared — is diagnosable from the error alone.
+    :raises ClaudePromptBlocked: If the composer never mounted because a
+        dialog is parked awaiting a keypress. A ``ClaudePromptTimeout``
+        subclass, so a caller that only cares "delivery failed" needs no
+        change; a caller that reaps the terminal must skip the reap, since
+        the terminal is healthy and holds the prompt to be answered.
     """
     deadline = time.monotonic() + timeout_s
     polls = 0
@@ -5093,7 +5112,17 @@ def _wait_for_claude_prompt_ready(
         if time.monotonic() >= deadline:
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-    # Timed out. The poll/empty-capture counts separate the failure modes:
+    # Keep a pending confirmation or sign-in alive so the user can complete it.
+    if any(hint in last_nonempty.lower() for hint in _PENDING_STARTUP_INPUT_HINTS) or (
+        _PASSWORD_PROMPT_RE.search(last_nonempty) is not None
+    ):
+        raise ClaudePromptBlocked(
+            "Claude Code startup is waiting for input, so the "
+            f"message was not delivered (waited {timeout_s}s). Open the terminal "
+            "and complete the prompt or browser sign-in, then send again."
+            + _format_terminal_failure_tail(last_nonempty)
+        )
+    # The poll/empty-capture counts separate the remaining failure modes:
     # mostly-empty captures point at a torn read under a busy repaint (the
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,

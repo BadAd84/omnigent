@@ -10490,3 +10490,46 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+@pytest.mark.parametrize(
+    "dialog_pane",
+    [
+        "New MCP server found in this project: example\nEnter to confirm · Esc to cancel",
+        "Managed settings drift detected, applying updates...\nPassword:",
+        "[sudo] password for example:",
+        "Waiting for OAuth callback on port 12345. Please open this URL in your browser:",
+        "Logging in via SSO...\nIf the browser does not open automatically, open the URL.",
+        "Open this URL in your browser to authenticate:",
+    ],
+)
+def test_wait_for_claude_prompt_ready_reports_a_pending_dialog_separately(
+    monkeypatch: pytest.MonkeyPatch,
+    dialog_pane: str,
+) -> None:
+    """A dialog awaiting a keypress raises ``ClaudePromptBlocked``, not a boot timeout.
+
+    A selection dialog blocks the composer until a person answers. Calling that
+    a failed boot misdiagnoses a healthy terminal and, via the executor's reap,
+    kills the session holding the unanswered prompt.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda socket_path, tmux_target: dialog_pane,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptBlocked) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    message = str(excinfo.value)
+    assert "waiting for input" in message
+    # The boot-failure wording must not be used for a healthy terminal.
+    assert "did not become ready" not in message
+    # The dialog itself is attached so the person knows what to answer.
+    assert dialog_pane in message

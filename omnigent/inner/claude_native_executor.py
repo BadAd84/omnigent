@@ -12,6 +12,7 @@ from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
+    ClaudePromptBlocked,
     ClaudePromptTimeout,
     TmuxSessionNotAdvertised,
     inject_slash_command,
@@ -224,6 +225,14 @@ class ClaudeNativeExecutor(Executor):
                         self._bridge_dir,
                         content=text,
                     )
+        except ClaudePromptBlocked as exc:
+            # Preserve the terminal holding the unanswered startup prompt.
+            _logger.warning(
+                "claude-native: harness startup is waiting for input; message not delivered",
+                extra={"session_id": self._request_session_id},
+            )
+            yield ExecutorError(message=describe_exception(exc))
+            return
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
