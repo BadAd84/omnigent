@@ -34,7 +34,9 @@ def test_invalid_or_legacy_claim_is_unknown(tmp_path: Path, raw: bytes) -> None:
         ("pid:[1]", "pid:[1]", "boot-now", True, False, True),
         ("pid:[1]", "pid:[2]", "boot-now", False, False, False),
         (None, "none", "boot-now", False, False, False),
-        ("pid:[1]", "pid:[2]", "boot-before", True, True, False),
+        ("pid:[1]", "pid:[2]", "boot-before", True, False, False),
+        ("pid:[1]", "pid:[1]", "boot-before", False, False, False),
+        ("pid:[1]", "pid:[1]", None, False, False, False),
         ("none", "none", None, False, True, True),
     ],
 )
@@ -48,7 +50,10 @@ def test_owner_death_requires_resolvable_identity(
     probe: bool,
 ) -> None:
     monkeypatch.setattr(owner_claim, "current_pid_namespace", lambda: current_ns)
-    monkeypatch.setattr(owner_claim, "current_boot_id", lambda: "boot-now")
+    monkeypatch.setattr(owner_claim, "IS_LINUX", current_ns != "none")
+    monkeypatch.setattr(
+        owner_claim, "current_boot_id", lambda: None if current_ns == "none" else "boot-now"
+    )
     probes: list[int] = []
 
     def process_alive(pid: int) -> bool:

@@ -69,10 +69,11 @@ def read_owner_claim(directory: Path) -> OwnerClaim | None:
 
 
 def owner_is_gone(claim: OwnerClaim, *, process_alive: Callable[[int], bool]) -> bool:
-    """Require an earlier boot or a dead process in the same known namespace."""
+    """Require a dead process in the same boot and known namespace."""
     boot_id = current_boot_id()
-    if claim.boot_id is not None and boot_id is not None and claim.boot_id != boot_id:
-        return True
+    # Different boot IDs can belong to live kernels sharing a filesystem.
+    if claim.boot_id != boot_id or (IS_LINUX and boot_id is None):
+        return False
     pid_ns = current_pid_namespace()
     if pid_ns is None or claim.pid_ns != pid_ns:
         return False
