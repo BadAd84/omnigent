@@ -1,4 +1,4 @@
-"""Cold loads spin; refreshes and new tabs immediately reuse the last picker label."""
+"""Cold loads spin; cached pickers accept edits before live configuration arrives."""
 
 from __future__ import annotations
 
@@ -35,7 +35,12 @@ async def _paint_frames(page: Page) -> None:
 
 
 async def _expect_pending(
-    page: Page, cached_label: str | None, *, workspace_pending: bool = True
+    page: Page,
+    cached_label: str | None,
+    *,
+    effort: str = "Max",
+    permission: str = "Plan",
+    workspace_pending: bool = True,
 ) -> None:
     loading = page.get_by_role("status", name="Loading session configuration")
     picker = page.get_by_test_id("new-chat-landing-agent-select")
@@ -44,8 +49,8 @@ async def _expect_pending(
         await expect(picker).to_have_count(0)
     else:
         await expect(picker).to_contain_text(cached_label, timeout=30_000)
-        await expect(picker).to_contain_text("Max")
-        await expect(picker).to_be_disabled()
+        await expect(picker).to_contain_text(effort)
+        await expect(picker).to_be_enabled()
         await expect(picker).to_have_attribute("aria-busy", "true")
         await expect(loading).to_have_count(0)
     permissions_loading = page.get_by_role("status", name="Loading permissions")
@@ -54,8 +59,8 @@ async def _expect_pending(
         await expect(permissions_loading).to_be_visible()
         await expect(permissions).to_have_count(0)
     else:
-        await expect(permissions).to_have_text("Plan")
-        await expect(permissions).to_be_disabled()
+        await expect(permissions).to_have_text(permission)
+        await expect(permissions).to_be_enabled()
         await expect(permissions).to_have_attribute("aria-busy", "true")
         await expect(permissions_loading).to_have_count(0)
     workspace_loading = page.get_by_role("status", name="Loading working directory")
@@ -86,6 +91,9 @@ async def _drive(
         models_requested = asyncio.Event()
         live_label = _MODEL_LABEL
         cached_label: str | None = None
+        cached_effort = "Max"
+        cached_permission = "Plan"
+        creates = []
         try:
 
             async def agents(route: Route) -> None:
@@ -138,6 +146,13 @@ async def _drive(
                 body.update(managed_sandboxes_enabled=False, smart_routing_enabled=False)
                 await route.fulfill(response=response, json=body)
 
+            async def sessions(route: Route) -> None:
+                if route.request.method == "POST":
+                    creates.append(route.request.post_data_json)
+                    await route.fulfill(json={"id": "unexpected-create"})
+                else:
+                    await route.fulfill(json={"data": [], "has_more": False})
+
             await context.route(re.compile(r"/v1/agents(?:\?.*)?$"), agents)
             await context.route(re.compile(r"/v1/hosts(?:\?.*)?$"), hosts)
             await context.route("**/v1/hosts/*/harnesses/*/model-options", models)
@@ -145,16 +160,20 @@ async def _drive(
             await context.route("**/v1/info", info)
             await context.route(
                 re.compile(r"/v1/sessions(?:\?.*)?$"),
-                lambda route: route.fulfill(json={"data": [], "has_more": False}),
+                sessions,
             )
             await context.add_init_script(
                 f"""localStorage.setItem('omnigent:last-agent-id', 'ag_claude_e2e');
                 localStorage.setItem('omnigent:last-host-choice', '{_HOST_ID}');
                 localStorage.setItem('omnigent:recent-workspaces',
                     JSON.stringify({{{_HOST_ID}: ['/work/repo']}}));
-                localStorage.setItem('omnigent:last-mode-by-harness', JSON.stringify({{
-                    'claude-native': {{model: 'opus', effort: 'max', routing: 'off', mode: 'plan'}}
-                }}));"""
+                if (!localStorage.getItem('omnigent:last-mode-by-harness')) {{
+                    localStorage.setItem('omnigent:last-mode-by-harness', JSON.stringify({{
+                        'claude-native': {{
+                            model: 'opus', effort: 'max', routing: 'off', mode: 'plan'
+                        }}
+                    }}));
+                }}"""
             )
             await context.add_init_script(
                 """window.pickerLoadingSamples = [];
@@ -205,21 +224,70 @@ async def _drive(
                 loading = page.get_by_role("status", name="Loading session configuration")
                 picker = page.get_by_test_id("new-chat-landing-agent-select")
                 composer = page.get_by_test_id("new-chat-landing-input")
+                pending_label = cached_label
+                expected_model = live_label
+                expected_effort = cached_effort
+                expected_permission = cached_permission
 
-                await _expect_pending(page, cached_label)
+                await _expect_pending(
+                    page, cached_label, effort=cached_effort, permission=cached_permission
+                )
                 await expect(composer).to_be_enabled()
                 await composer.fill("I can type while configuration loads")
                 await expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+                if cached_label is not None:
+                    chosen_model = "sonnet" if visit == "reload" else "opus"
+                    expected_model = "Sonnet 4.6" if visit == "reload" else live_label
+                    expected_effort = "High" if visit == "reload" else "Max"
+                    expected_permission = "Manual" if visit == "reload" else "Plan"
+                    permission_mode = "default" if visit == "reload" else "plan"
+                    await picker.click()
+                    await page.get_by_test_id(
+                        "new-chat-landing-agent-config-ag_claude_e2e"
+                    ).click()
+                    await expect(
+                        page.get_by_test_id("new-chat-landing-agent-models")
+                    ).to_be_visible()
+                    await page.screenshot(
+                        path=output / f"{visit}-cached-model-menu.png", animations="disabled"
+                    )
+                    await page.get_by_test_id(
+                        f"new-chat-landing-agent-model-{chosen_model}"
+                    ).click()
+                    await page.get_by_test_id(
+                        f"new-chat-landing-agent-effort-{expected_effort.lower()}"
+                    ).click()
+                    await page.keyboard.press("Escape")
+                    await page.keyboard.press("Escape")
+                    await page.get_by_test_id("new-chat-landing-permission-chip").click()
+                    await page.screenshot(
+                        path=output / f"{visit}-cached-permission-menu.png", animations="disabled"
+                    )
+                    await page.get_by_test_id(
+                        f"new-chat-landing-permission-option-{permission_mode}"
+                    ).click()
+                    pending_label = expected_model
+                    await page.get_by_test_id("new-chat-landing-composer").dispatch_event("submit")
+                    assert not creates
+                    # Keep the model menu open through the handoff to live data.
+                    await picker.click()
+                    await page.get_by_test_id(
+                        "new-chat-landing-agent-config-ag_claude_e2e"
+                    ).click()
 
                 gates[first_response].set()
                 await asyncio.wait_for(served[first_response].wait(), timeout=10)
                 await _paint_frames(page)
-                await _expect_pending(page, cached_label)
+                await _expect_pending(
+                    page, pending_label, effort=expected_effort, permission=expected_permission
+                )
 
                 gates["hosts" if first_response == "agents" else "agents"].set()
                 await asyncio.wait_for(models_requested.wait(), timeout=10)
                 await _paint_frames(page)
-                await _expect_pending(page, cached_label)
+                await _expect_pending(
+                    page, pending_label, effort=expected_effort, permission=expected_permission
+                )
                 await page.get_by_test_id("new-chat-landing").screenshot(
                     path=output / f"{visit}-loading.png", animations="disabled"
                 )
@@ -228,11 +296,24 @@ async def _drive(
                 await expect(
                     page.get_by_test_id("new-chat-landing-workspace-chip")
                 ).to_be_enabled()
-                await _expect_pending(page, cached_label, workspace_pending=False)
+                await _expect_pending(
+                    page,
+                    pending_label,
+                    effort=expected_effort,
+                    permission=expected_permission,
+                    workspace_pending=False,
+                )
 
                 gates["models"].set()
-                await expect(picker).to_contain_text(live_label)
-                await expect(picker).to_contain_text("Max")
+                await expect(picker).to_contain_text(expected_model)
+                await expect(picker).to_contain_text(expected_effort)
+                await expect(picker).not_to_have_attribute("aria-busy", "true")
+                if cached_label is not None:
+                    choice = page.get_by_test_id(f"new-chat-landing-agent-model-{chosen_model}")
+                    await expect(choice).to_be_visible()
+                    await expect(choice).to_have_attribute("aria-checked", "true")
+                    await page.keyboard.press("Escape")
+                    await page.keyboard.press("Escape")
                 await expect(picker).to_be_enabled()
                 await expect(loading).to_have_count(0)
                 await expect(composer).to_have_value("I can type while configuration loads")
@@ -241,7 +322,7 @@ async def _drive(
                     page.get_by_test_id("new-chat-landing-permission-chip")
                 ).to_be_enabled()
                 await expect(page.get_by_test_id("new-chat-landing-permission-chip")).to_have_text(
-                    "Plan"
+                    expected_permission
                 )
                 await _paint_frames(page)
                 await page.get_by_test_id("new-chat-landing").screenshot(
@@ -260,21 +341,25 @@ async def _drive(
                     cached_samples = samples[1:] if samples[0] == "loading" else samples
                     assert cached_label in cached_samples[0], samples
                     assert all(
-                        (cached_label in label or live_label in label) and "Max" in label
+                        any(model in label for model in (cached_label, expected_model))
+                        and any(effort in label for effort in (cached_effort, expected_effort))
                         for label in cached_samples
                     ), samples
-                for samples_name, expected_label in (
-                    ("directoryLoadingSamples", "repo"),
-                    ("permissionLoadingSamples", "Plan"),
+                for samples_name, allowed_labels in (
+                    ("directoryLoadingSamples", {"repo"}),
+                    ("permissionLoadingSamples", {cached_permission, expected_permission}),
                 ):
                     control_samples = await page.evaluate(f"window.{samples_name}")
                     labels = (
                         control_samples[1:] if control_samples[0] == "loading" else control_samples
                     )
-                    assert labels and all(label == expected_label for label in labels), (
+                    assert labels and all(label in allowed_labels for label in labels), (
                         control_samples
                     )
-                cached_label = live_label
+                cached_label = expected_model
+                cached_effort = expected_effort
+                cached_permission = expected_permission
+                assert not creates
         finally:
             for gate in gates.values():
                 gate.set()

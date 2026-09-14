@@ -141,6 +141,36 @@ describe("shared composer controls", () => {
     expect(screen.queryByRole("menu")).toBeNull();
     expect(onSelect).not.toHaveBeenCalled();
   });
+
+  it.each([false, true])(
+    "allows cached permission choices while refreshing unless explicitly disabled (%s)",
+    (disabled) => {
+      const onSelect = vi.fn();
+      render(
+        <ComposerPermissionPicker
+          label="Permission mode"
+          value="Default"
+          options={[{ value: "plan", label: "Plan" }]}
+          loading
+          interactiveWhileLoading
+          disabled={disabled}
+          onSelect={onSelect}
+        />,
+      );
+      const trigger = screen.getByRole("button", { name: "Permission mode: Default" });
+      expect(trigger).toHaveAttribute("aria-busy", "true");
+      if (disabled) {
+        expect(trigger).toBeDisabled();
+        fireEvent.pointerDown(trigger, { button: 0 });
+        expect(screen.queryByRole("menu")).toBeNull();
+      } else {
+        expect(trigger).toBeEnabled();
+        fireEvent.keyDown(trigger, { key: "ArrowDown" });
+        fireEvent.click(screen.getByRole("menuitem", { name: "Plan" }));
+        expect(onSelect).toHaveBeenCalledWith("plan");
+      }
+    },
+  );
 });
 
 describe("workspace bar label collapse", () => {

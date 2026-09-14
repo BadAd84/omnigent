@@ -114,6 +114,7 @@ export function ComposerPermissionPicker({
   options,
   disabled = false,
   loading = false,
+  interactiveWhileLoading = false,
   onSelect,
   testIdPrefix = "composer",
 }: {
@@ -122,15 +123,16 @@ export function ComposerPermissionPicker({
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
   loading?: boolean;
+  interactiveWhileLoading?: boolean;
   onSelect: (value: string) => void;
   testIdPrefix?: string;
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild disabled={disabled || loading}>
+      <DropdownMenuTrigger asChild disabled={disabled || (loading && !interactiveWhileLoading)}>
         <button
           type="button"
-          disabled={disabled || loading}
+          disabled={disabled || (loading && !interactiveWhileLoading)}
           aria-busy={loading || undefined}
           className={cn(
             "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",

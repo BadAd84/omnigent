@@ -9,11 +9,14 @@ import {
   getNewChatPickerCacheKey,
   readNewChatPermissionCache,
   readNewChatPickerCache,
+  readNewChatPickerOptionsCache,
   readNewChatWorkspaceCache,
   writeNewChatPermissionCache,
   writeNewChatPickerCache,
+  writeNewChatPickerOptionsCache,
   writeNewChatWorkspaceCache,
   type NewChatPickerPreview,
+  type NewChatPickerOptions,
 } from "./newChatPickerCache";
 
 vi.mock("./host", () => ({ getOmnigentServerIdentity: vi.fn() }));
@@ -27,6 +30,38 @@ const preview: NewChatPickerPreview = {
   model: "Fable 5.1",
   effort: "Max",
   smartRouting: false,
+};
+const menuAgent = {
+  ...preview.agent,
+  id: "a1",
+  display_name: "Claude Code",
+  description: null,
+  skills: [],
+};
+const options: NewChatPickerOptions = {
+  agent: menuAgent,
+  agents: [menuAgent],
+  hostId: "host_1",
+  sandboxSelected: false,
+  model: "fable",
+  models: {
+    claude: [
+      {
+        id: "fable",
+        model: "provider/model-id",
+        displayName: "provider/model-id",
+        isDefault: true,
+      },
+    ],
+    codex: [
+      {
+        id: "coding-model",
+        displayName: "Team coding model",
+        supportedReasoningEfforts: [{ reasoningEffort: "high" }],
+      },
+    ],
+    pi: [],
+  },
 };
 let key: string;
 
@@ -51,6 +86,56 @@ afterEach(() => {
 });
 
 describe("newChatPickerCache", () => {
+  it("caches host-bound menu choices and catalog metadata verbatim", () => {
+    writeNewChatPickerOptionsCache(key, options);
+    expect(readNewChatPickerOptionsCache(key)).toEqual(options);
+  });
+
+  it("isolates and expires cached menu choices just like their labels", () => {
+    writeNewChatPickerOptionsCache(key, options);
+    expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey("another-project"))).toBeNull();
+    expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey("", "another-user"))).toBeNull();
+    vi.mocked(getOmnigentServerIdentity).mockReturnValue("server-b");
+    expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey(""))).toBeNull();
+    vi.setSystemTime(NOW + DAY_MS + 1);
+    expect(readNewChatPickerOptionsCache(key)).toBeNull();
+  });
+
+  it("invalidates cached choices when their target or selection changes", () => {
+    writeNewChatPickerOptionsCache(key, options);
+    writeLastHostChoice("another-host");
+    expect(readNewChatPickerOptionsCache(key)).toBeNull();
+    writeLastHostChoice("host_1");
+    writeHarnessOption("claude-native", { model: "another-model" });
+    expect(readNewChatPickerOptionsCache(key)).toBeNull();
+  });
+
+  it.each([
+    { ...options, agents: null },
+    { ...options, hostId: 42 },
+    { ...options, models: { ...options.models, claude: [{ id: "fable", displayName: false }] } },
+    {
+      ...options,
+      models: {
+        ...options.models,
+        codex: [{ id: "coding-model", supportedReasoningEfforts: ["high"] }],
+      },
+    },
+  ])("ignores malformed menu data", (invalidOptions) => {
+    writeNewChatPickerOptionsCache(key, options);
+    const record = JSON.parse(localStorage.getItem(`${key}:options`)!);
+    localStorage.setItem(`${key}:options`, JSON.stringify({ ...record, preview: invalidOptions }));
+    expect(readNewChatPickerOptionsCache(key)).toBeNull();
+  });
+
+  it("clears menu choices without clearing the display preview", () => {
+    writeNewChatPickerCache(key, preview);
+    writeNewChatPickerOptionsCache(key, options);
+    writeNewChatPickerOptionsCache(key, null);
+    expect(readNewChatPickerOptionsCache(key)).toBeNull();
+    expect(readNewChatPickerCache(key)).toEqual(preview);
+  });
+
   it("persists the display preview without adding launch or catalog data", () => {
     writeNewChatPickerCache(key, preview);
 

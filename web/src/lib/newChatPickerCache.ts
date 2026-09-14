@@ -30,11 +30,50 @@ const workspacePreviewSchema = z.object({
   branchLabel: z.string(),
   branchDescription: z.string(),
 });
+const pickerAgentSchema = agentSchema.extend({
+  id: z.string(),
+  display_name: z.string(),
+  description: z.string().nullable(),
+  skills: z.array(z.object({ name: z.string(), description: z.string() })),
+  builtin: z.boolean().optional(),
+  acpHarness: z.boolean().optional(),
+});
+const modelOptionSchema = z.object({
+  id: z.string(),
+  model: z.string().optional(),
+  displayName: z.string().optional(),
+  isDefault: z.boolean().optional(),
+  defaultReasoningEffort: z.string().optional(),
+  supportedReasoningEfforts: z
+    .array(z.object({ reasoningEffort: z.string(), description: z.string().optional() }))
+    .optional(),
+  source: z
+    .object({
+      kind: z.string(),
+      label: z.string(),
+      name: z.string().optional(),
+      host: z.string().optional(),
+    })
+    .optional(),
+});
+const pickerOptionsSchema = z.object({
+  agent: pickerAgentSchema,
+  agents: z.array(pickerAgentSchema),
+  hostId: z.string().nullable(),
+  sandboxSelected: z.boolean(),
+  model: z.string(),
+  models: z.object({
+    claude: z.array(modelOptionSchema),
+    codex: z.array(modelOptionSchema),
+    pi: z.array(modelOptionSchema),
+  }),
+});
 
-// Presentation only: never hydrate query data, availability, or launch options.
+// Cached menus are editable; live queries still own availability and launch readiness.
 export type NewChatPickerPreview = z.infer<typeof previewSchema>;
 export type NewChatPermissionPreview = z.infer<typeof permissionPreviewSchema>;
 export type NewChatWorkspacePreview = z.infer<typeof workspacePreviewSchema>;
+export type NewChatPickerOptions = z.infer<typeof pickerOptionsSchema>;
 
 export function getNewChatPickerCacheKey(project?: string, userId?: string | null): string | null {
   if (project === undefined) return null;
@@ -114,6 +153,21 @@ export function writeNewChatPickerCache(
   preview: NewChatPickerPreview | null,
 ): void {
   writePreview(key, preview, preferenceSignature);
+}
+
+export function readNewChatPickerOptionsCache(key: string | null): NewChatPickerOptions | null {
+  return readPreview(
+    key === null ? null : `${key}:options`,
+    pickerOptionsSchema,
+    preferenceSignature,
+  );
+}
+
+export function writeNewChatPickerOptionsCache(
+  key: string | null,
+  options: NewChatPickerOptions | null,
+): void {
+  writePreview(key === null ? null : `${key}:options`, options, preferenceSignature);
 }
 
 export function readNewChatPermissionCache(key: string | null): NewChatPermissionPreview | null {

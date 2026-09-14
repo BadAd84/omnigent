@@ -66,6 +66,7 @@ import {
   getNewChatPickerCacheKey,
   readNewChatPermissionCache,
   readNewChatPickerCache,
+  readNewChatPickerOptionsCache,
   readNewChatWorkspaceCache,
 } from "@/lib/newChatPickerCache";
 import { setPendingInitialPrompt } from "@/store/chatStore";
@@ -1671,7 +1672,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
   function expectCachedPicker(snapshot: ReturnType<typeof seedResolvedPicker>) {
     expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
     const picker = screen.getByTestId("new-chat-landing-agent-select");
-    expect(picker).toBeDisabled();
+    expect(picker).toBeEnabled();
     expect(picker).toHaveAttribute("aria-busy", "true");
     expect(picker).toHaveAttribute("aria-label", snapshot.label);
     expect(within(picker).getByTestId("new-chat-landing-agent-model-value").textContent).toBe(
@@ -1698,7 +1699,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(expectCachedPicker(snapshot)).toHaveTextContent("provider/model-id");
   });
 
-  it("shows the saved display on a fresh mount without enabling choices or submission until live settings resolve", () => {
+  it("opens cached choices immediately but waits for live settings before submission", () => {
     const snapshot = seedResolvedPicker();
     mockAgents(undefined);
     mockHosts(undefined);
@@ -1707,8 +1708,8 @@ describe("NewChatLandingScreen cached picker preview", () => {
 
     const picker = expectCachedPicker(snapshot);
     fireEvent.pointerDown(picker, { button: 0 });
-    fireEvent.click(picker);
-    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByRole("menu")).toBeVisible();
+    closeMenu();
     const input = screen.getByTestId("new-chat-landing-input");
     fireEvent.change(input, { target: { value: "Draft while the cached picker is visible" } });
     expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
@@ -1740,6 +1741,301 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
     expect(readNewChatPickerCache(snapshot.key)?.model).toContain("Sonnet 4.7");
   });
+
+  it.each([false, true])(
+    "keeps startup model, effort, and permission edits (storage unavailable: %s)",
+    async (storageUnavailable) => {
+      seedResolvedPicker();
+      mockAgents(undefined);
+      mockHosts(undefined);
+      mockModelQueries(() => pendingModels);
+      renderLanding();
+      const setItem = vi.spyOn(Storage.prototype, "setItem");
+      if (storageUnavailable) {
+        setItem.mockImplementation(() => {
+          throw new DOMException("Quota exceeded", "QuotaExceededError");
+        });
+      }
+
+      openAgentModels("a1");
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-opus"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-max"));
+      closeMenu();
+      pickPermissionOption("plan");
+      const picker = screen.getByTestId("new-chat-landing-agent-select");
+      const permission = screen.getByTestId("new-chat-landing-permission-chip");
+      expect(picker).toHaveTextContent("Opus 4.8");
+      expect(picker).toHaveTextContent("Max");
+      expect(permission).toHaveTextContent("Plan");
+      expect(permission).toBeEnabled();
+      const input = screen.getByTestId("new-chat-landing-input");
+      fireEvent.change(input, { target: { value: "Keep my startup choices" } });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      mockAgents(DEFAULT_LANDING_AGENTS);
+      mockHosts([host("online")]);
+      fireEvent.change(input, { target: { value: "Still waiting for the live models" } });
+      expect(picker).toHaveTextContent("Opus 4.8");
+      expect(permission).toHaveTextContent("Plan");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+      mockClaudeModels([
+        { id: "sonnet", displayName: "Sonnet 4.6" },
+        { id: "opus", displayName: "Opus from the live catalog" },
+      ]);
+      fireEvent.change(input, { target: { value: "The catalogs are now ready" } });
+      expect(picker).toHaveTextContent("Opus from the live catalog");
+      expect(picker).toHaveTextContent("Max");
+      expect(permission).toHaveTextContent("Plan");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+      if (!storageUnavailable) {
+        expect(readHarnessOptions("claude-native")).toMatchObject({
+          model: "opus",
+          effort: "max",
+          mode: "plan",
+        });
+      }
+      setItem.mockRestore();
+      authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "created_1" })));
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      const { body } = await readCreateBody();
+      expect(body).toMatchObject({
+        model_override: "opus",
+        reasoning_effort: "max",
+        terminal_launch_args: ["--permission-mode", "plan"],
+      });
+    },
+  );
+
+  it.each(["sonnet", "default"])(
+    "requires another choice after a cached model disappears, and recovers by selecting %s",
+    (replacement) => {
+      seedResolvedPicker();
+      mockAgents(undefined);
+      mockHosts(undefined);
+      mockModelQueries(() => pendingModels);
+      renderLanding();
+      openAgentModels("a1");
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-opus"));
+      closeMenu();
+
+      mockAgents(DEFAULT_LANDING_AGENTS);
+      mockHosts([host("online")]);
+      mockClaudeModels([{ id: "sonnet", displayName: "Sonnet from the live catalog" }]);
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Do not send with a different model" },
+      });
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "The selected model is no longer available",
+      );
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      openAgentModels("a1");
+      expect(screen.queryByTestId("new-chat-landing-agent-model-opus")).toBeNull();
+      fireEvent.click(screen.getByTestId(`new-chat-landing-agent-model-${replacement}`));
+      closeMenu();
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    },
+  );
+
+  it.each([false, true])(
+    "keeps cached Codex model, effort, and fresh bypass through validation (agent switched: %s)",
+    async (switchAgent) => {
+      localStorage.setItem(LAST_AGENT_KEY, switchAgent ? "a1" : "a2");
+      localStorage.setItem(
+        HARNESS_OPTIONS_KEY,
+        JSON.stringify({
+          "claude-native": { model: "sonnet", effort: "high" },
+          "codex-native": { model: "", effort: "high", mode: "default" },
+        }),
+      );
+      const { unmount } = renderLanding();
+      unmount();
+      resetLandingDraft();
+      mockAgents(undefined);
+      mockHosts(undefined);
+      mockModelQueries(() => pendingModels);
+      renderLanding();
+
+      if (switchAgent) selectAgent("a2");
+      openAgentModels("a2");
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-xhigh"));
+      closeMenu();
+      pickPermissionOption("bypass");
+      const picker = screen.getByTestId("new-chat-landing-agent-select");
+      expect(picker).toHaveTextContent("GPT-5.6");
+      expect(picker).toHaveTextContent("xHigh");
+
+      mockAgents(DEFAULT_LANDING_AGENTS);
+      mockHosts([host("online")]);
+      mockModelQueries((harness) =>
+        harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Keep the Codex settings" },
+      });
+      expect(picker).toHaveTextContent("GPT-5.6");
+      expect(picker).toHaveTextContent("xHigh");
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent(
+        "Bypass approvals & sandbox",
+      );
+      authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "created_1" })));
+      fireEvent.click(screen.getByTestId("new-chat-landing-submit"));
+      const { body } = await readCreateBody();
+      expect(body).toMatchObject({
+        model_override: "databricks-gpt-5-6",
+        reasoning_effort: "xhigh",
+        labels: { "omnigent.codex_native.bypass_sandbox": "1" },
+      });
+    },
+  );
+
+  it.each([false, true])(
+    "does not substitute another agent for a cached agent-only choice (leaving Auto: %s)",
+    (leavingAuto) => {
+      if (leavingAuto)
+        localStorage.setItem(LAST_HARNESS_KEY, JSON.stringify({ a1: "auto-native" }));
+      const { unmount } = renderLanding({ smart_routing_enabled: leavingAuto });
+      unmount();
+      resetLandingDraft();
+      mockAgents(undefined);
+      mockHosts(undefined);
+      mockModelQueries(() => pendingModels);
+      renderLanding({ smart_routing_enabled: leavingAuto });
+      selectAgent(leavingAuto ? "a1" : "a2");
+
+      mockAgents([DEFAULT_LANDING_AGENTS[leavingAuto ? 1 : 0]]);
+      mockHosts([host("online")]);
+      mockModelQueries((harness) =>
+        harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Do not silently choose a different agent" },
+      });
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        "The selected agent is no longer available",
+      );
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      selectAgent(leavingAuto ? "a2" : "a1");
+      expect(screen.queryByRole("alert")).toBeNull();
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    },
+  );
+
+  it("discards cached selection validation when creating a custom agent", async () => {
+    const snapshot = seedResolvedPicker();
+    mockAgents(undefined);
+    mockHosts(undefined);
+    mockModelQueries(() => pendingModels);
+    renderLanding();
+    pickPermissionOption("plan");
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-create-agent"));
+    await waitFor(() => expect(screen.getByTestId("create-agent-dialog")).toBeVisible());
+    fireEvent.change(screen.getByTestId("create-agent-name"), { target: { value: "my-agent" } });
+    fireEvent.change(screen.getByTestId("create-agent-model"), {
+      target: { value: "configured-model" },
+    });
+    fireEvent.click(screen.getByTestId("create-agent-submit"));
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("my-agent"),
+    );
+
+    mockAgents(DEFAULT_LANDING_AGENTS);
+    mockHosts([host("online")]);
+    mockModelQueries((harness) =>
+      harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Use the custom agent instead" },
+    });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    expect(readNewChatPickerOptionsCache(snapshot.key)).toBeNull();
+  });
+
+  it("keeps menu caches usable after editing only effort and permissions on a ready composer", () => {
+    const { unmount } = renderLanding();
+    openAgentModels("a1");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-low"));
+    closeMenu();
+    pickPermissionOption("plan");
+    expect(readNewChatPickerOptionsCache(getNewChatPickerCacheKey(""))).not.toBeNull();
+    unmount();
+    resetLandingDraft();
+    mockAgents(undefined);
+    mockHosts(undefined);
+    mockModelQueries(() => pendingModels);
+    renderLanding();
+    const picker = screen.getByTestId("new-chat-landing-agent-select");
+    expect(picker).toBeEnabled();
+    expect(picker).toHaveTextContent("Low");
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toBeEnabled();
+    expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
+  });
+
+  it.each([false, true])(
+    "late project defaults preserve edited fields without freezing untouched ones (model edited: %s)",
+    (editModel) => {
+      const projectConfig = {
+        ...SUCCESS_QUERY_STATE,
+        data: {
+          host_id: "host_1",
+          workspace: "/Users/corey/repo",
+          agent_id: "a1",
+          model: "sonnet",
+        },
+      };
+      useProjectsMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: [{ id: "proj_alpha", name: "Alpha" }],
+      });
+      useProjectConfigMock.mockReturnValue(projectConfig);
+      const { unmount } = renderLanding({}, "/?project=Alpha");
+      unmount();
+      resetLandingDraft();
+      useProjectConfigMock.mockReturnValue(pendingModels);
+      mockAgents(undefined);
+      mockHosts(undefined);
+      mockModelQueries(() => pendingModels);
+      renderLanding({}, "/?project=Alpha");
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("Sonnet 4.6");
+      if (editModel) {
+        openAgentModels("a1");
+        fireEvent.click(screen.getByTestId("new-chat-landing-agent-model-opus"));
+        closeMenu();
+      }
+      pickPermissionOption("plan");
+
+      useProjectConfigMock.mockReturnValue({
+        ...projectConfig,
+        data: { ...projectConfig.data, model: "haiku" },
+      });
+      mockAgents(DEFAULT_LANDING_AGENTS);
+      mockHosts([host("online")]);
+      mockModelQueries((harness) =>
+        harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Keep my explicit choices" },
+      });
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
+        editModel ? "Opus 4.8" : "Haiku 4.5",
+      );
+      expect(screen.getByTestId("new-chat-landing-permission-chip")).toHaveTextContent("Plan");
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    },
+  );
 
   it("waits for the matching boot identity before restoring the cached display through pending queries", async () => {
     const snapshot = seedResolvedPicker();
@@ -1921,13 +2217,14 @@ describe("NewChatLandingScreen cached picker preview", () => {
     expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
     expect(permission).toHaveTextContent("Plan");
     for (const control of [workspace, permission]) {
-      expect(control).toBeDisabled();
       expect(control).toHaveAttribute("aria-busy", "true");
       expect(control).toHaveClass("disabled:opacity-100");
-      fireEvent.pointerDown(control, { button: 0 });
-      fireEvent.click(control);
     }
-    expect(screen.queryByRole("menu")).toBeNull();
+    expect(workspace).toBeDisabled();
+    expect(permission).toBeEnabled();
+    openPermissions();
+    expect(screen.getByTestId("new-chat-landing-permission-menu")).toBeVisible();
+    closeMenu();
     expect(screen.queryByRole("dialog")).toBeNull();
     const input = screen.getByTestId("new-chat-landing-input");
     fireEvent.change(input, { target: { value: "Draft before live configuration" } });
@@ -1938,7 +2235,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     fireEvent.change(input, { target: { value: "Wait for directory metadata and model catalog" } });
     expect(workspace).toBeDisabled();
     expect(permission).toHaveTextContent("Plan");
-    expect(permission).toBeDisabled();
+    expect(permission).toBeEnabled();
 
     useHostWorktreesMock.mockReturnValue({
       ...SUCCESS_QUERY_STATE,
@@ -1947,7 +2244,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     fireEvent.change(input, { target: { value: "Directory ready; model catalog pending" } });
     expect(workspace).toBeEnabled();
     expect(workspace).not.toHaveAttribute("aria-busy");
-    expect(permission).toBeDisabled();
+    expect(permission).toBeEnabled();
     expect(permission).toHaveTextContent("Plan");
 
     mockClaudeModels([{ id: "sonnet", displayName: "Sonnet 5" }]);
