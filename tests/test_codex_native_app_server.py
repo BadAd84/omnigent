@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 try:
@@ -46,6 +47,55 @@ from omnigent.inner.codex_executor import (
     _populate_codex_home_config,
     _provider_codex_config_overrides,
 )
+
+
+@pytest.mark.parametrize("close_mode", ["normal", "abrupt", "client"])
+async def test_event_iterator_finishes_when_websocket_closes(close_mode: str) -> None:
+    """Socket closure wakes an event consumer, including after reconnection."""
+    finish = asyncio.Event()
+
+    async def handle(websocket: ServerConnection) -> None:
+        async for raw in websocket:
+            message = json.loads(raw)
+            if message["method"] == "initialize":
+                await websocket.send(json.dumps({"id": message["id"], "result": {}}))
+            else:
+                await websocket.send(json.dumps({"method": "test/notification"}))
+                await websocket.send(json.dumps({"method": "test/paused-consumer"}))
+                await finish.wait()
+                if close_mode == "abrupt":
+                    websocket.transport.abort()
+                elif close_mode == "normal":
+                    await websocket.close()
+                else:
+                    await websocket.wait_closed()
+                return
+
+    async with serve(handle, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
+        previous_events = None
+        for _ in range(2):
+            finish.clear()
+            try:
+                await client.connect()
+                if previous_events is not None:
+                    assert await asyncio.wait_for(anext(previous_events, None), 2) is None
+                events = client.iter_events()
+                assert await asyncio.wait_for(anext(events), 2) == {"method": "test/notification"}
+                previous_events = client.iter_events()
+                assert await asyncio.wait_for(anext(previous_events), 2) == {
+                    "method": "test/paused-consumer"
+                }
+                pending = asyncio.create_task(anext(events, None))
+                finish.set()
+                if close_mode == "client":
+                    await client.close()
+                assert await asyncio.wait_for(pending, 2) is None
+                assert await asyncio.wait_for(anext(client.iter_events(), None), 2) is None
+            finally:
+                finish.set()
+                await client.close()
 
 
 @pytest.mark.parametrize(

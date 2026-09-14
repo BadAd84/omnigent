@@ -632,7 +632,7 @@ class CodexAppServerClient:
         self._ws: ClientConnection | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._pending_requests: dict[int, asyncio.Future[CodexMessage]] = {}
-        self._events: asyncio.Queue[CodexMessage] = asyncio.Queue()
+        self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
 
     async def connect(self) -> None:
@@ -654,10 +654,12 @@ class CodexAppServerClient:
                 max_size=_MAX_WEBSOCKET_MESSAGE_SIZE_BYTES,
                 compression=None,
             )
+        events = self._events = asyncio.Queue()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name="codex-native-app-server-reader",
         )
+        self._reader_task.add_done_callback(lambda _: events.put_nowait(None))
         await self.request(
             "initialize",
             {
@@ -769,8 +771,14 @@ class CodexAppServerClient:
 
         :returns: Async iterator of notification envelopes.
         """
+        events = self._events
         while True:
-            yield await self._events.get()
+            event = await events.get()
+            if event is None:
+                # Later consumers must also observe the closed stream.
+                events.put_nowait(None)
+                return
+            yield event
 
     async def _reader_loop(self) -> None:
         """
