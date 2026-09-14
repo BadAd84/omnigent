@@ -237,6 +237,49 @@ async def _kill_and_join(sock: Path, task: asyncio.Task[None]) -> None:
             await task
 
 
+async def _release_burst(sock: Path, target: str) -> None:
+    """Send Enter to the waiting producer once a control client is attached."""
+    tmux = shutil.which("tmux")
+    assert tmux
+    async with asyncio.timeout(20):
+        while True:
+            proc = await asyncio.create_subprocess_exec(
+                tmux,
+                "-S",
+                str(sock),
+                "list-clients",
+                "-F",
+                "#{client_control_mode}",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            out, err = await proc.communicate()
+            assert proc.returncode == 0, err.decode()
+            if b"1" in out.splitlines():
+                break
+            await asyncio.sleep(0.01)
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            str(sock),
+            "send-keys",
+            "-t",
+            target,
+            "Enter",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        assert proc.returncode == 0, err.decode()
+
+
+async def _wait_for_payload(ws: _FakeWebSocket, byte: bytes, count: int) -> None:
+    """Wait for the complete live burst without assuming a drain speed."""
+    async with asyncio.timeout(20):
+        while sum(frame.count(byte) for frame in ws.sent) < count:
+            await asyncio.sleep(0.01)
+
+
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
 @pytest.mark.asyncio
 async def test_control_bridge_outer_cancellation_joins_child_tasks() -> None:
@@ -277,16 +320,13 @@ async def test_control_bridge_streams_large_output_burst() -> None:
     a ~200 KiB live burst reaches the browser fully rather than dropping the
     connection.
     """
-    # Hold the pane quiet for 1s, THEN emit ~200 KiB in one burst — so the
-    # payload arrives as live post-attach %output (the readline path), not via
-    # the capture-pane seed.
+    # Hold the producer until control-client registration, so every byte
+    # arrives as live %output.
     payload_len = 200_000
     sock, target = await _new_private_tmux(
-        f'python3 -c \'import sys,time; time.sleep(1.0); sys.stdout.write("X"*{payload_len}); '
+        f'python3 -c \'import sys,time; sys.stdin.readline(); sys.stdout.write("X"*{payload_len}); '
         "sys.stdout.flush(); time.sleep(30)'"
     )
-    # Attach while the pane is still quiet (before the burst fires).
-    await asyncio.sleep(0.2)
 
     ws = _FakeWebSocket(inbound=[])
 
@@ -296,17 +336,19 @@ async def test_control_bridge_streams_large_output_burst() -> None:
         )
 
     task = asyncio.create_task(_run())
-    # Wait past the burst so the big %output line is read and forwarded.
-    await asyncio.sleep(2.0)
+    try:
+        await _release_burst(sock, target)
+        await _wait_for_payload(ws, b"X", payload_len)
 
-    # The reader must still be alive and the large payload must have reached the
-    # browser via the live stream.
-    total_x = sum(frame.count(b"X") for frame in ws.sent)
-    assert total_x >= payload_len, (
-        f"large output truncated/dropped: got {total_x} X bytes of {payload_len}"
-    )
+        # The reader must still be alive and the large payload must have reached the
+        # browser via the live stream.
+        total_x = sum(frame.count(b"X") for frame in ws.sent)
+        assert total_x >= payload_len, (
+            f"large output truncated/dropped: got {total_x} X bytes of {payload_len}"
+        )
 
-    await _kill_and_join(sock, task)
+    finally:
+        await _kill_and_join(sock, task)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
@@ -324,10 +366,9 @@ async def test_control_bridge_coalesces_burst_when_send_lags() -> None:
     """
     payload_len = 500_000
     sock, target = await _new_private_tmux(
-        f'python3 -c \'import sys,time; time.sleep(1.0); sys.stdout.write("X"*{payload_len}); '
+        f'python3 -c \'import sys,time; sys.stdin.readline(); sys.stdout.write("X"*{payload_len}); '
         "sys.stdout.flush(); time.sleep(30)'"
     )
-    await asyncio.sleep(0.2)
 
     # A per-frame send delay makes the browser lag tmux's firehose so a backlog
     # forms; 5 ms is generous enough that a backlog reliably accrues even under
@@ -338,23 +379,25 @@ async def test_control_bridge_coalesces_burst_when_send_lags() -> None:
             ws, socket_path=str(sock), tmux_target=target, read_only=False
         )
     )
-    # Allow ample time for the full burst to drain through the slow send.
-    await asyncio.sleep(8.0)
+    try:
+        await _release_burst(sock, target)
+        await _wait_for_payload(ws, b"X", payload_len)
 
-    burst_frames = [f for f in ws.sent if b"X" in f]
-    total_x = sum(f.count(b"X") for f in ws.sent)
-    assert total_x >= payload_len, f"burst truncated: got {total_x} X bytes of {payload_len}"
-    # Coalesced frames are far larger than a single ``%output`` line (~1 KB).
-    # Require a comfortably-above-per-line average — proves merging without
-    # depending on the exact (scheduling-dependent) frame count. Without
-    # coalescing this average would be ~1 KB; merged it is many KB.
-    avg_frame = total_x / max(1, len(burst_frames))
-    assert avg_frame > 4000, (
-        f"expected coalesced frames (avg > 4 KB), got avg {avg_frame:.0f}B over "
-        f"{len(burst_frames)} frames — forwarder is not merging the backlog"
-    )
+        burst_frames = [f for f in ws.sent if b"X" in f]
+        total_x = sum(f.count(b"X") for f in ws.sent)
+        assert total_x >= payload_len, f"burst truncated: got {total_x} X bytes of {payload_len}"
+        # Coalesced frames are far larger than a single ``%output`` line (~1 KB).
+        # Require a comfortably-above-per-line average — proves merging without
+        # depending on the exact (scheduling-dependent) frame count. Without
+        # coalescing this average would be ~1 KB; merged it is many KB.
+        avg_frame = total_x / max(1, len(burst_frames))
+        assert avg_frame > 4000, (
+            f"expected coalesced frames (avg > 4 KB), got avg {avg_frame:.0f}B over "
+            f"{len(burst_frames)} frames — forwarder is not merging the backlog"
+        )
 
-    await _kill_and_join(sock, task)
+    finally:
+        await _kill_and_join(sock, task)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
@@ -376,15 +419,11 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
     # pre-fix code (cancel forwarder on reader-done) drops ~35% of it.
     payload_len = 2_000_000
     sock, target = await _new_private_tmux(
-        # Sleep first so the control client attaches BEFORE the burst — the
-        # payload then arrives as live %output. Then burst and exit immediately
-        # (no trailing sleep) so %exit races the still-draining slow send: the
-        # regression window. (A burst emitted before attach is gone at the tmux
-        # layer, not a bridge concern.)
-        f'python3 -c \'import sys,time; time.sleep(1.5); sys.stdout.write("Y"*{payload_len}); '
+        # Wait for control-client registration, then burst and exit while
+        # the slow WebSocket sender is still draining the backlog.
+        f'python3 -c \'import sys,time; sys.stdin.readline(); sys.stdout.write("Y"*{payload_len}); '
         "sys.stdout.flush()'"
     )
-    await asyncio.sleep(0.2)
 
     ws = _FakeWebSocket(inbound=[], send_delay_s=0.005)
     reader_done = asyncio.Event()
@@ -399,19 +438,22 @@ async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
             forward_done=forward_done,
         )
     )
-    # Deterministically wait until the reader has queued the whole backlog plus
-    # the EOF sentinel, then until the forwarder has fully drained it — no
-    # arbitrary wall-clock sleep. Timeouts are generous backstops, not timing.
-    await asyncio.wait_for(reader_done.wait(), timeout=20.0)
-    await asyncio.wait_for(forward_done.wait(), timeout=20.0)
+    try:
+        await _release_burst(sock, target)
+        # Deterministically wait until the reader has queued the whole backlog plus
+        # the EOF sentinel, then until the forwarder has fully drained it — no
+        # arbitrary wall-clock sleep. Timeouts are generous backstops, not timing.
+        await asyncio.wait_for(reader_done.wait(), timeout=20.0)
+        await asyncio.wait_for(forward_done.wait(), timeout=20.0)
 
-    total_y = sum(f.count(b"Y") for f in ws.sent)
-    assert total_y >= payload_len, (
-        f"burst-then-exit dropped the tail: got {total_y} Y bytes of {payload_len} "
-        "— forwarder was cancelled before draining the queued backlog"
-    )
+        total_y = sum(f.count(b"Y") for f in ws.sent)
+        assert total_y >= payload_len, (
+            f"burst-then-exit dropped the tail: got {total_y} Y bytes of {payload_len} "
+            "— forwarder was cancelled before draining the queued backlog"
+        )
 
-    await _kill_and_join(sock, task)
+    finally:
+        await _kill_and_join(sock, task)
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
