@@ -1393,6 +1393,8 @@ async def forward_claude_transcript_to_session(
             except TimeoutError:
                 # Every parent HTTP response pushes the deadline forward, so
                 # this is a true no-progress stall rather than a healthy drain.
+                # A stall leaves failure_streak as-is: it is neither a new
+                # bridge fault nor proof the previous fault cleared.
                 _logger.warning(
                     "Claude transcript forwarder made no live progress for %.0fs; "
                     "cancelled the stalled await and resuming; session=%s",
