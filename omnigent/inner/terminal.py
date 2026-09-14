@@ -302,6 +302,12 @@ _IDLE_POLL_INTERVAL_SECONDS = 1.0
 _IDLE_EXIT_FAILURE_THRESHOLD = 3
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
+# Wall-clock/monotonic divergence across one watcher poll that counts as the
+# host having stopped running. CLOCK_MONOTONIC does not advance while a machine
+# is suspended but CLOCK_REALTIME does, so the difference measures a laptop lid
+# closing — the leading benign explanation for a whole tmux server vanishing.
+# Well above any scheduling delay so ordinary load never registers.
+_WATCH_CLOCK_GAP_MIN_SECONDS = 5.0
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -601,6 +607,21 @@ def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
 _ANSI_RE = re.compile(
     r"\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?(?:\x07|\x1b\\)|\x1b[()][AB012]|\x1b\[[\?]?[0-9;]*[hlm]"
 )
+
+
+def _socket_path_exists(path: Path) -> bool:
+    """Whether a tmux socket file is still on disk.
+
+    Used only for exit diagnostics, so an unreadable parent directory reports
+    "gone" rather than raising into the watcher's last log line.
+
+    :param path: The instance's private tmux socket path.
+    :returns: ``True`` when the socket file is present.
+    """
+    try:
+        return path.exists()
+    except OSError:
+        return False
 
 
 def _strip_ansi(text: str) -> str:
@@ -978,6 +999,19 @@ class TerminalInstance:
     # session"). ``None`` until such a probe fails.
     _last_capture_probe_error: str | None = field(default=None, repr=False)
     _last_session_probe_error: str | None = field(default=None, repr=False)
+    # Monotonic stamp of a successful :meth:`launch`, so the exit log can say
+    # whether tmux vanished seconds into a launch or hours into a live session.
+    _launched_at: float | None = field(default=None, repr=False)
+    # Capture failures that a following ``has-session`` proved benign. The exit
+    # counter resets on every recovery, so without this the log cannot tell a
+    # first-ever failure from the last of a long flapping streak.
+    _recovered_capture_failures: int = field(default=0, repr=False)
+    # Largest wall-clock-ahead-of-monotonic gap seen across one watcher poll,
+    # and the monotonic time it was seen (see
+    # :data:`_WATCH_CLOCK_GAP_MIN_SECONDS`). ``0.0`` / ``None`` until the host
+    # stops running mid-watch.
+    _watch_clock_gap_s: float = field(default=0.0, repr=False)
+    _watch_clock_gap_at: float | None = field(default=None, repr=False)
 
     @property
     def tmux_target(self) -> str:
@@ -1022,6 +1056,37 @@ class TerminalInstance:
         """Store a pane capture for later exit diagnostics."""
         self._last_pane_snapshot = snapshot
 
+    def _note_poll_clock_gap(self, wall_before: float, monotonic_before: float) -> None:
+        """Record that the host stopped running across a watcher poll.
+
+        A suspended machine (closed laptop lid, hibernate, a paused VM) takes
+        its tmux server down with it, and on wake the watcher's next probes
+        fail against a socket whose server is gone. That reads identically to
+        tmux being killed or the socket directory being reaped, which is a very
+        different bug — so measure it: ``CLOCK_MONOTONIC`` (``time.monotonic``)
+        does not advance while a Linux host is suspended, while
+        ``CLOCK_REALTIME`` (``time.time``) does, so the difference across one
+        poll is roughly how long the host was away.
+
+        A stepped realtime clock (an NTP correction, a manual change) registers
+        the same way, which is why the exit log reports the measurement rather
+        than asserting a suspend. Platforms whose monotonic clock keeps running
+        through sleep simply report no gap.
+
+        :param wall_before: ``time.time()`` sampled before the poll's sleep.
+        :param monotonic_before: ``time.monotonic()`` sampled at the same point.
+        :returns: None.
+        """
+        now = time.monotonic()
+        gap = (time.time() - wall_before) - (now - monotonic_before)
+        if gap < _WATCH_CLOCK_GAP_MIN_SECONDS:
+            return
+        # Keep the largest gap: several short suspends are less telling than
+        # the one long absence that explains the server's death.
+        if gap > self._watch_clock_gap_s:
+            self._watch_clock_gap_s = gap
+        self._watch_clock_gap_at = now
+
     def _tmux_gone_diagnostics(self) -> str:
         """Summarize why tmux vanished, for the "tmux unavailable" exit log.
 
@@ -1029,8 +1094,11 @@ class TerminalInstance:
         web client just detached, the pane already exited cleanly) from a real
         fault (a crash frame left in the pane, a whole-server death). This
         gathers the signals that do: the last capture-pane and has-session
-        stderr, how long since a web client last touched the terminal, any
-        recorded pane exit status, and the tail of the last captured pane.
+        stderr, whether the socket file itself survived, the terminal's age,
+        how many earlier probe failures recovered, whether the host stopped
+        running mid-watch (:meth:`_note_poll_clock_gap`), how long since a web
+        client last touched the terminal, any recorded pane exit status, and
+        the tail of the last captured pane.
 
         :returns: A single-line, ``; ``-joined diagnostic summary.
         """
@@ -1041,6 +1109,26 @@ class TerminalInstance:
             parts.append(f"has-session said: {self._last_session_probe_error}")
         if self._last_exit_status is not None:
             parts.append(f"pane exit status: {self._last_exit_status}")
+        # A whole-server death has two very different shapes: the socket file
+        # is gone (its private directory was removed — our own teardown, or a
+        # /tmp reaper) or still there with nothing listening (the server
+        # process died). The path itself stays out of the log; it names the
+        # person's home or temp directory.
+        parts.append(
+            "socket file still present"
+            if _socket_path_exists(self.socket_path)
+            else "socket file gone"
+        )
+        if self._launched_at is not None:
+            parts.append(f"terminal age: {time.monotonic() - self._launched_at:.0f}s")
+        if self._recovered_capture_failures:
+            parts.append(f"{self._recovered_capture_failures} earlier probe failures recovered")
+        if self._watch_clock_gap_at is not None:
+            since = time.monotonic() - self._watch_clock_gap_at
+            parts.append(
+                f"host stopped running for ~{self._watch_clock_gap_s:.0f}s "
+                f"{since:.0f}s ago (suspend or clock step)"
+            )
         last_interaction = self._last_client_interaction_at
         if last_interaction == float("-inf"):
             parts.append("no web client interaction observed")
@@ -1256,6 +1344,7 @@ class TerminalInstance:
             )
 
         self.running = True
+        self._launched_at = time.monotonic()
         self.launch_cwd = effective_cwd
 
     async def send(
@@ -1504,7 +1593,10 @@ class TerminalInstance:
 
         consecutive_capture_failures = 0
         while self.running:
+            wall_before = time.time()
+            monotonic_before = time.monotonic()
             await asyncio.sleep(_IDLE_POLL_INTERVAL_SECONDS)
+            self._note_poll_clock_gap(wall_before, monotonic_before)
             if not self.running:
                 return
             try:
@@ -1536,6 +1628,7 @@ class TerminalInstance:
                 )
                 session_exists = await self._tmux_session_exists_async()
                 if session_exists is not False:
+                    self._recovered_capture_failures += consecutive_capture_failures + 1
                     consecutive_capture_failures = 0
                     if session_exists is None:
                         await asyncio.sleep(_TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS)
@@ -1719,7 +1812,11 @@ class TerminalInstance:
             # ``Event.wait`` doubles as the poll-interval sleep, so
             # ``stop_event.set()`` from :meth:`close` returns within
             # one tick instead of waiting out the full interval.
-            if stop_event.wait(interval):
+            wall_before = time.time()
+            monotonic_before = time.monotonic()
+            waited = stop_event.wait(interval)
+            self._note_poll_clock_gap(wall_before, monotonic_before)
+            if waited:
                 return
             if not self.running:
                 return
@@ -1740,6 +1837,7 @@ class TerminalInstance:
             if snapshot is None:
                 session_exists = self._tmux_session_exists_sync()
                 if session_exists is not False:
+                    self._recovered_capture_failures += consecutive_capture_failures + 1
                     consecutive_capture_failures = 0
                     if session_exists is None and stop_event.wait(
                         _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS
