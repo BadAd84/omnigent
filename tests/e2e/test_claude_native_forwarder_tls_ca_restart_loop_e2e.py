@@ -35,8 +35,8 @@ Environment fidelity
 --------------------
 The report is against a macOS host talking to a Databricks Apps deployment
 whose dbcert-managed CA bundle went stale. This test is a **stand-in**: a local
-single-user ``omnigent server`` subprocess reached at
-``http://[::ffff:127.0.0.1]:PORT`` — an IPv4-mapped IPv6 literal that
+single-user ``omnigent server`` subprocess bound to ``0.0.0.0`` and reached at
+``http://<primary-ipv4>:PORT`` — the machine's real primary IPv4, which
 ``is_loopback_url`` classifies as NON-loopback (so ``open_server_client`` takes
 the exact production remote-server branch, ``trust_env=True``) while still
 connecting to the local server. The crash itself happens before any network
@@ -131,6 +131,39 @@ def _find_free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def _routable_nonloopback_host() -> str | None:
+    """Return a routable non-loopback IPv4 for this machine, or ``None``.
+
+    The forwarder's server URL must classify as **non**-loopback so
+    ``open_server_client`` takes the production ``trust_env=True`` branch that
+    honors ``SSL_CERT_FILE`` -- the branch the reported crash lives in. A
+    literal like ``::ffff:127.0.0.1`` is fragile: CPython flipped IPv4-mapped
+    IPv6 loopback to classify as loopback across 3.12 patch releases, so the
+    precondition below would silently stop entering the buggy branch. The
+    machine's real primary IPv4 is non-loopback on every interpreter and, with
+    the server bound to ``0.0.0.0``, still reaches the local listener.
+
+    A connected UDP socket picks the default-route source address without
+    sending packets; ``gethostname`` is the fallback.
+
+    :returns: A non-loopback IPv4 that routes to this host, or ``None`` when the
+        environment has only loopback interfaces.
+    """
+    from omnigent_client._http import is_loopback_url
+
+    candidates: list[str] = []
+    with contextlib.suppress(OSError):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect(("8.8.8.8", 80))  # no packets sent; selects the route
+            candidates.append(probe.getsockname()[0])
+    with contextlib.suppress(OSError):
+        candidates.append(socket.gethostbyname(socket.gethostname()))
+    for host in candidates:
+        if host and not is_loopback_url(f"http://{host}"):
+            return host
+    return None
 
 
 def _localhost_env(extra: dict[str, str]) -> dict[str, str]:
@@ -419,16 +452,22 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
 
     port = _find_free_port()
     local_url = f"http://127.0.0.1:{port}"
-    # An IPv4-mapped IPv6 literal connects to the local IPv4 listener but is
-    # classified NON-loopback, so open_server_client takes the production
-    # remote-server branch (trust_env=True) that honors SSL_CERT_FILE.
-    remote_style_url = f"http://[::ffff:127.0.0.1]:{port}"
+    # The machine's real primary IPv4 classifies as non-loopback on every
+    # interpreter, so open_server_client takes the production remote-server
+    # branch (trust_env=True) that honors SSL_CERT_FILE, while still reaching
+    # the server (bound to 0.0.0.0 below) over the loopback path.
+    nonloopback_host = _routable_nonloopback_host()
+    if nonloopback_host is None:
+        pytest.skip(
+            "no routable non-loopback interface here; cannot drive the "
+            "open_server_client trust_env=True branch the reported crash lives in"
+        )
+    remote_style_url = f"http://{nonloopback_host}:{port}"
     assert not is_loopback_url(remote_style_url), (
         "precondition: the remote-style URL must classify as non-loopback so "
         "open_server_client sets trust_env=True (the reported deployment "
-        "branch); is_loopback_url now classifies IPv4-mapped IPv6 loopback as "
-        "loopback on this interpreter -- pick another non-loopback alias for "
-        "the local server"
+        f"branch); {nonloopback_host!r} classified as loopback -- pick another "
+        "non-loopback alias for the local server"
     )
 
     # The in-process forwarder legs must connect directly (trust_env=True
@@ -450,8 +489,10 @@ def test_stale_ssl_cert_file_does_not_kill_transcript_forwarding(
                 "-c",
                 _SERVER_BOOTSTRAP,
                 "server",
+                # Bind all interfaces so the non-loopback URL (the trust_env
+                # branch) and the loopback control-plane calls both reach it.
                 "--host",
-                "127.0.0.1",
+                "0.0.0.0",
                 "--port",
                 str(port),
                 "--database-uri",
