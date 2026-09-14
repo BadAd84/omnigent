@@ -10497,6 +10497,9 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     [
         "New MCP server found in this project: example\nEnter to confirm · Esc to cancel",
         "Managed settings drift detected, applying updates...\nPassword:",
+        # The bridge's own overlay-dismiss Escape probes echo as ``^[`` on a
+        # line-mode prompt, landing after the colon before the gate classifies.
+        "Password: ^[^[^[^[",
         "[sudo] password for example:",
         "Waiting for OAuth callback on port 12345. Please open this URL in your browser:",
         "Logging in via SSO...\nIf the browser does not open automatically, open the URL.",

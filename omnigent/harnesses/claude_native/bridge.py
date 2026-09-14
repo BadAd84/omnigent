@@ -319,8 +319,10 @@ _PENDING_STARTUP_INPUT_HINTS = (
     "logging in via sso...",
     "open this url in your browser to authenticate",
 )
+# ``(?:\s|\^\[)*`` tolerates the bridge's own overlay-dismiss Escape probes,
+# which a line-mode prompt echoes back as literal ``^[`` after the colon.
 _PASSWORD_PROMPT_RE = re.compile(
-    r"(?:^|\n)(?:\[sudo\] )?password(?: for [^:\n]+)?:\s*\Z", re.IGNORECASE
+    r"(?:^|\n)(?:\[sudo\] )?password(?: for [^:\n]+)?:(?:\s|\^\[)*\Z", re.IGNORECASE
 )
 # Seconds to wait for a confirmation dialog before concluding none appears.
 # Bounds the common no-dialog case (a fresh session never pops one) while
