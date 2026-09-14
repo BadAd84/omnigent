@@ -113,6 +113,7 @@ export function ComposerPermissionPicker({
   value,
   options,
   disabled = false,
+  loading = false,
   onSelect,
   testIdPrefix = "composer",
 }: {
@@ -120,16 +121,21 @@ export function ComposerPermissionPicker({
   value: string;
   options: readonly { value: string; label: string }[];
   disabled?: boolean;
+  loading?: boolean;
   onSelect: (value: string) => void;
   testIdPrefix?: string;
 }) {
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
+      <DropdownMenuTrigger asChild disabled={disabled || loading}>
         <button
           type="button"
-          disabled={disabled}
-          className="flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7"
+          disabled={disabled || loading}
+          aria-busy={loading || undefined}
+          className={cn(
+            "flex h-8 min-w-0 w-auto cursor-pointer items-center justify-center gap-1 rounded-lg bg-transparent px-2 text-foreground transition-colors hover:bg-muted/70 dark:hover:bg-muted/50 disabled:cursor-default disabled:opacity-50 md:h-7",
+            loading && "disabled:opacity-100",
+          )}
           aria-label={`${label}: ${value}`}
           title={`${label}: ${value}`}
           data-testid={`${testIdPrefix}-permission-chip`}

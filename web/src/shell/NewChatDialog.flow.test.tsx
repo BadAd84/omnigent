@@ -82,7 +82,11 @@ vi.mock("@/lib/sessionUpdatesSocket", () => ({
   },
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/hooks/useHosts", () => ({
   useHosts: vi.fn(),
   useHostModelOptions: vi.fn(() => ({

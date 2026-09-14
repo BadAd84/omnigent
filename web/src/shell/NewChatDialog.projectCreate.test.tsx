@@ -46,7 +46,11 @@ vi.mock("@/store/chatStore", () => ({
   setPendingInitialPrompt: vi.fn(),
 }));
 
-vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+vi.mock("@/lib/identity", () => ({
+  authenticatedFetch: vi.fn(),
+  getCurrentUserId: vi.fn(() => null),
+  resolveIdentity: vi.fn(async () => null),
+}));
 vi.mock("@/components/ui/toast", async (importOriginal) => ({
   ...(await importOriginal<typeof ToastModule>()),
   showToast: vi.fn(),

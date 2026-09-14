@@ -66,6 +66,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Spinner } from "@/components/ui/spinner";
 import { iconForAgent } from "@/components/AgentCard";
 import { showToast } from "@/components/ui/toast";
 import {
@@ -91,7 +92,7 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
-import { authenticatedFetch } from "@/lib/identity";
+import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
 import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { randomUUID } from "@/lib/randomUUID";
@@ -165,6 +166,18 @@ import {
   writeLastSandboxRepos,
 } from "@/lib/repoPreferences";
 import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
+import {
+  getNewChatPickerCacheKey,
+  readNewChatPermissionCache,
+  readNewChatPickerCache,
+  readNewChatWorkspaceCache,
+  writeNewChatPermissionCache,
+  writeNewChatPickerCache,
+  writeNewChatWorkspaceCache,
+  type NewChatPermissionPreview,
+  type NewChatPickerPreview,
+  type NewChatWorkspacePreview,
+} from "@/lib/newChatPickerCache";
 import {
   AUTO_HARNESS_DESCRIPTION,
   AUTO_HARNESS_ID,
@@ -1289,6 +1302,28 @@ function agentHasAdvancedSettings(
   );
 }
 
+function NewChatPickerLoading({
+  label,
+  testId,
+  className,
+}: {
+  label: string;
+  testId: string;
+  className?: string;
+}) {
+  return (
+    <span
+      role="status"
+      aria-label={label}
+      aria-busy="true"
+      data-testid={testId}
+      className={cn("flex h-8 items-center px-2 text-muted-foreground md:h-7", className)}
+    >
+      <Spinner className="size-4" aria-hidden="true" />
+    </span>
+  );
+}
+
 /**
  * Unified two-level agent/harness picker for the landing composer.
  *
@@ -1304,6 +1339,8 @@ export function AgentHarnessPicker({
   effectiveAgentId,
   agentLabel,
   hasAgents,
+  loading = false,
+  cacheKey = null,
   host,
   onSelectAgent,
   pendingAgent,
@@ -1334,6 +1371,8 @@ export function AgentHarnessPicker({
   effectiveAgentId: string | null;
   agentLabel: string;
   hasAgents: boolean;
+  loading?: boolean;
+  cacheKey?: string | null;
   host: Host | undefined | null;
   onSelectAgent: (agent: AvailableAgent) => void;
   pendingAgent: AgentBundleInput | null;
@@ -1413,6 +1452,36 @@ export function AgentHarnessPicker({
   const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerAccessibleDetails]
     .filter(Boolean)
     .join(", ");
+  const triggerText =
+    visibleModelText || (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "");
+  const selectedEntry = [...harnessEntries, ...agentEntries].find(
+    (agent) => agent.id === effectiveAgentId,
+  );
+  const cachedPreview = loading ? readNewChatPickerCache(cacheKey) : null;
+  const resolvedPreview = useMemo<NewChatPickerPreview | null>(
+    () =>
+      selectedEntry && hasAgents && visibleModelText !== "Models unavailable"
+        ? {
+            agent: { name: selectedEntry.name, harness: selectedEntry.harness },
+            label: triggerAccessibleName,
+            model: triggerText,
+            effort: visibleEffortText,
+            smartRouting: autoHarnessActive,
+          }
+        : null,
+    [
+      selectedEntry,
+      hasAgents,
+      visibleModelText,
+      triggerAccessibleName,
+      triggerText,
+      visibleEffortText,
+      autoHarnessActive,
+    ],
+  );
+  useEffect(() => {
+    if (!loading) writeNewChatPickerCache(cacheKey, resolvedPreview);
+  }, [cacheKey, loading, resolvedPreview]);
 
   const isMobile = useIsMobileViewport();
   const [menuPage, setMenuPage] = useState<"more" | "custom" | "config" | null>(null);
@@ -1592,6 +1661,15 @@ export function AgentHarnessPicker({
     triggerTooltip || null
   );
 
+  if (loading && cachedPreview === null) {
+    return (
+      <NewChatPickerLoading
+        label="Loading session configuration"
+        testId="new-chat-landing-picker-loading"
+      />
+    );
+  }
+
   return (
     <HarnessPicker
       modal={dropdownModal}
@@ -1608,19 +1686,31 @@ export function AgentHarnessPicker({
         }
       }}
       trigger={{
-        disabled: !hasAgents,
-        label: triggerAccessibleName,
-        model:
-          visibleModelText ||
-          (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : ""),
-        effort: visibleEffortText,
-        icon: triggerIcon,
-        className: triggerClassName,
+        disabled: loading || !hasAgents,
+        "aria-busy": loading || undefined,
+        label: cachedPreview?.label ?? triggerAccessibleName,
+        model: cachedPreview?.model ?? triggerText,
+        effort: cachedPreview?.effort ?? visibleEffortText,
+        icon: cachedPreview ? (
+          <span
+            className="flex size-4 shrink-0 items-center justify-center"
+            data-testid="new-chat-landing-agent-icon"
+          >
+            {cachedPreview.smartRouting ? (
+              <WandSparklesIcon className="size-4" aria-hidden="true" />
+            ) : (
+              <ComposerAgentIcon agent={cachedPreview.agent} />
+            )}
+          </span>
+        ) : (
+          triggerIcon
+        ),
+        className: cn(triggerClassName, loading && "disabled:opacity-100"),
         labelClassName: triggerLabelClassName,
         testIdPrefix: "new-chat-landing",
         "data-testid": "new-chat-landing-agent-select",
       }}
-      tooltip={triggerTooltipContent}
+      tooltip={cachedPreview?.label ?? triggerTooltipContent}
       tooltipTestId="new-chat-landing-agent-tooltip"
       contentAlign={contentAlign}
       contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
@@ -2013,6 +2103,19 @@ export function NewChatLandingScreen() {
   // Project driving this visit, when the sidebar's per-project "new session"
   // pencil landed here with a `?project=` query param. Empty otherwise.
   const projectParam = searchParams.get("project") ?? "";
+  const [cacheUser, setCacheUser] = useState(getCurrentUserId);
+  useEffect(() => {
+    if (cacheUser !== null) return;
+    let cancelled = false;
+    // Share the boot identity probe; never read another account's preview.
+    void resolveIdentity().then((user) => {
+      if (!cancelled) setCacheUser(user);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [cacheUser]);
+  const pickerCacheKey = getNewChatPickerCacheKey(projectParam, cacheUser);
   // Project prefill source: a project-driven visit seeds the composer from the
   // project's stored defaults (host / working directory / agent / worktree).
   // `?project=` carries the project NAME, so resolve it to the first-class id
@@ -2059,12 +2162,20 @@ export function NewChatLandingScreen() {
   // Pin the configured project agent into discovery so the recency-bounded
   // session scan (or its same-name dedup) can't drop or id-swap it out of
   // the picker — the config must seed the agent the project actually pinned.
-  const { data: agents } = useAvailableAgents({
+  const {
+    data: agents,
+    isLoading: agentsLoading,
+    isError: agentsError,
+  } = useAvailableAgents({
     pinnedAgentIds: prefillConfig?.agentId != null ? [prefillConfig.agentId] : [],
   });
   // refetchOnFocus: returning from a terminal `omni setup` must clear the
   // readiness badge even if the live push was missed while the tab was hidden.
-  const { data: hosts, isLoading: hostsLoading } = useHosts({ refetchOnFocus: true });
+  const {
+    data: hosts,
+    isLoading: hostsLoading,
+    isError: hostsError,
+  } = useHosts({ refetchOnFocus: true });
 
   // Offer an import affordance on the empty landing: a brand-new user with no
   // Omnigent sessions can pull in their existing local CLI history. Same query
@@ -2739,10 +2850,11 @@ export function NewChatLandingScreen() {
   // click. Derived from the same home listing the picker uses (entries carry
   // absolute paths); only fetched when there's no recent to fall back to.
   const needsHomeFallback = selectedHostId !== null && recent.length === 0;
-  const { data: homeListing, isPlaceholderData: homeListingIsPlaceholder } = useHostFilesystem(
-    selectedHostId,
-    needsHomeFallback ? "" : null,
-  );
+  const {
+    data: homeListing,
+    isLoading: homeListingLoading,
+    isPlaceholderData: homeListingIsPlaceholder,
+  } = useHostFilesystem(selectedHostId, needsHomeFallback ? "" : null);
   // The hook serves the PREVIOUS query's data as a placeholder while a new
   // fetch is in flight (an anti-flicker nicety for the picker), so right
   // after a host switch the listing briefly belongs to the old host.
@@ -3126,6 +3238,42 @@ export function NewChatLandingScreen() {
       : selectedNativeHarness === "codex-native"
         ? hostCodexModelsError
         : null;
+  const pickerDataLoading =
+    agentsLoading ||
+    (projectParam !== "" &&
+      (projectListLoading ||
+        projectConfigLoading ||
+        ((!prefillDone(prefill) || prefill.project !== projectParam) &&
+          !agentsError &&
+          !hostsError))) ||
+    (!sandboxSelected &&
+      !autoRoutingSelected &&
+      !routingOn &&
+      harnessTriggerDetails.some((row) => row.label === "Model") &&
+      (hostsLoading || info === "loading" || pickerModelsLoading));
+  const pickerTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
+  const [pickerReadyTarget, setPickerReadyTarget] = useState<string | null>(null);
+  // Keep one placeholder through host selection and saved-model restoration.
+  // Cached background refreshes have data, so they never reset this readiness.
+  useEffect(() => {
+    setPickerReadyTarget(pickerDataLoading ? null : pickerTarget);
+  }, [pickerDataLoading, pickerTarget]);
+  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget;
+  const cachedPermission = pickerLoading ? readNewChatPermissionCache(pickerCacheKey) : null;
+  const permissionPreview = useMemo<NewChatPermissionPreview | null>(
+    () =>
+      selectedAgent
+        ? {
+            agent: { name: selectedAgent.name, harness: selectedAgent.harness },
+            row: permissionConfigRow ?? null,
+          }
+        : null,
+    [selectedAgent, permissionConfigRow],
+  );
+  useEffect(() => {
+    if (!pickerLoading) writeNewChatPermissionCache(pickerCacheKey, permissionPreview);
+  }, [pickerCacheKey, pickerLoading, permissionPreview]);
+  const visiblePermissionRow = pickerLoading ? cachedPermission?.row : permissionConfigRow;
   useEffect(() => setPickerModelSearch(""), [selectedNativeHarness]);
   const pickerEffortOptions = supportsPermissionMode
     ? CLAUDE_NATIVE_EFFORTS
@@ -3708,7 +3856,11 @@ export function NewChatLandingScreen() {
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
   const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
-  const { data: hostWorktrees, isPlaceholderData: hostWorktreesArePlaceholder } = useHostWorktrees(
+  const {
+    data: hostWorktrees,
+    isLoading: hostWorktreesLoading,
+    isPlaceholderData: hostWorktreesArePlaceholder,
+  } = useHostWorktrees(
     worktreesEnabled ? selectedHostId : null,
     worktreesEnabled ? workspaceTrimmed : null,
   );
@@ -4031,8 +4183,79 @@ export function NewChatLandingScreen() {
     textareaRef,
   });
 
+  const workspaceTarget = JSON.stringify([projectParam, selectedHostId, sandboxSelected]);
+  const [workspaceReadyTarget, setWorkspaceReadyTarget] = useState<string | null>(null);
+  const workspaceDataLoading =
+    !sandboxSelected &&
+    (hostsLoading ||
+      info === "loading" ||
+      (projectParam !== "" &&
+        (projectListLoading ||
+          projectConfigLoading ||
+          ((!prefillSettled || prefill.project !== projectParam) && !hostsError))) ||
+      (workspaceReadyTarget !== workspaceTarget &&
+        ((selectedHostId !== null &&
+          workspaceTrimmed === "" &&
+          (autoSeedCandidate !== null ||
+            (needsHomeFallback && (homeListingLoading || homeListingIsPlaceholder)))) ||
+          (worktreesEnabled && (hostWorktreesLoading || hostWorktreesArePlaceholder)))));
+  // Directory and worktree defaults settle independently of the model catalog.
+  useEffect(() => {
+    setWorkspaceReadyTarget(workspaceDataLoading ? null : workspaceTarget);
+  }, [workspaceDataLoading, workspaceTarget]);
+  const workspaceLoading = workspaceDataLoading || workspaceReadyTarget !== workspaceTarget;
+  const worktreeHeader = composerWorktreeHeaderState({
+    workspace: workspaceTrimmed,
+    worktrees: hostWorktrees ?? [],
+    worktreesResolved: !hostWorktreesArePlaceholder && hostWorktrees !== undefined,
+    branchName,
+    autoSeededBranch,
+    prefilledBranch,
+  });
+  const workspacePreview = useMemo<NewChatWorkspacePreview | null>(
+    () =>
+      !sandboxSelected && selectedHostId !== null && workspaceValid
+        ? {
+            hostId: selectedHostId,
+            workspace: workspaceTrimmed,
+            repositoryLabel: worktreeHeader.repositoryLabel,
+            branchLabel: worktreeHeader.branchLabel,
+            branchDescription: worktreeHeader.branchDescription,
+          }
+        : null,
+    [
+      sandboxSelected,
+      selectedHostId,
+      workspaceValid,
+      workspaceTrimmed,
+      worktreeHeader.repositoryLabel,
+      worktreeHeader.branchLabel,
+      worktreeHeader.branchDescription,
+    ],
+  );
+  const workspaceMetadataReady =
+    !worktreesEnabled || (!hostWorktreesArePlaceholder && hostWorktrees !== undefined);
+  useEffect(() => {
+    if (!workspaceLoading && workspaceMetadataReady) {
+      writeNewChatWorkspaceCache(pickerCacheKey, workspacePreview);
+    }
+  }, [pickerCacheKey, workspaceLoading, workspaceMetadataReady, workspacePreview]);
+  const storedWorkspacePreview = workspaceLoading
+    ? readNewChatWorkspaceCache(pickerCacheKey)
+    : null;
+  const cachedWorkspace =
+    storedWorkspacePreview &&
+    (selectedHostId === null || selectedHostId === storedWorkspacePreview.hostId) &&
+    (workspaceTrimmed === "" || workspaceTrimmed === storedWorkspacePreview.workspace)
+      ? storedWorkspacePreview
+      : null;
+  const visibleWorkspace = cachedWorkspace?.workspace ?? workspaceTrimmed;
+  const visibleWorktreeHeader = cachedWorkspace ?? worktreeHeader;
+
   const canSubmit =
     message.trim().length > 0 &&
+    !pickerLoading &&
+    !workspaceLoading &&
     selectedAgent != null &&
     (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
     !creating;
@@ -4043,31 +4266,24 @@ export function NewChatLandingScreen() {
   // actionable (submitting, or mid-create).
   const submitDisabledReason = canSubmit
     ? null
-    : sandboxSelected && sandboxRepoOverCap
-      ? `This sandbox provider clones at most ${maxSandboxRepos} ${
-          maxSandboxRepos === 1 ? "repository" : "repositories"
-        } — remove the extras`
-      : sandboxSelected && !sandboxRepoValid
-        ? "Please enter a valid repository URL"
-        : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
-          ? "Selected host is unavailable. Reconnect it or choose another host."
-          : !sandboxSelected && (!selectedHostId || !workspaceValid)
-            ? "Please choose a host and working directory"
-            : configuredAgentUnavailable && selectedAgent == null
-              ? "This project's configured agent is unavailable — pick an agent to continue"
-              : message.trim().length === 0
-                ? "Enter a message to get started"
-                : null;
+    : pickerLoading || workspaceLoading
+      ? "Loading session configuration…"
+      : sandboxSelected && sandboxRepoOverCap
+        ? `This sandbox provider clones at most ${maxSandboxRepos} ${
+            maxSandboxRepos === 1 ? "repository" : "repositories"
+          } — remove the extras`
+        : sandboxSelected && !sandboxRepoValid
+          ? "Please enter a valid repository URL"
+          : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
+            ? "Selected host is unavailable. Reconnect it or choose another host."
+            : !sandboxSelected && (!selectedHostId || !workspaceValid)
+              ? "Please choose a host and working directory"
+              : configuredAgentUnavailable && selectedAgent == null
+                ? "This project's configured agent is unavailable — pick an agent to continue"
+                : message.trim().length === 0
+                  ? "Enter a message to get started"
+                  : null;
 
-  // Chip display labels.
-  const worktreeHeader = composerWorktreeHeaderState({
-    workspace: workspaceTrimmed,
-    worktrees: hostWorktrees ?? [],
-    worktreesResolved: !hostWorktreesArePlaceholder && hostWorktrees !== undefined,
-    branchName,
-    autoSeededBranch,
-    prefilledBranch,
-  });
   // Names the picked provider, else the server's default label.
   const selectedSandboxLabel =
     sandboxProvider !== null ? sandboxOptionLabel(sandboxProvider) : sandboxLabel;
@@ -4926,9 +5142,12 @@ export function NewChatLandingScreen() {
   const workspaceChip = (
     <ComposerWorkspaceTrigger
       kind="directory"
-      label={worktreeHeader.repositoryLabel}
-      aria-label={`Working directory: ${workspaceTrimmed || "Not selected"}`}
-      title={workspaceTrimmed || "Working directory not selected"}
+      label={visibleWorktreeHeader.repositoryLabel}
+      aria-label={`Working directory: ${visibleWorkspace || "Not selected"}`}
+      title={visibleWorkspace || "Working directory not selected"}
+      disabled={workspaceLoading}
+      aria-busy={workspaceLoading || undefined}
+      className={workspaceLoading ? "disabled:opacity-100" : undefined}
       data-testid="new-chat-landing-workspace-chip"
     />
   );
@@ -4981,8 +5200,17 @@ export function NewChatLandingScreen() {
         >
           {!sandboxSelected && (
             <ComposerWorkspaceBar data-testid="new-chat-landing-workspace-controls">
+              {workspaceLoading && cachedWorkspace === null && (
+                <NewChatPickerLoading
+                  label="Loading working directory"
+                  testId="new-chat-landing-workspace-loading"
+                  className="h-6 md:h-6"
+                />
+              )}
               <Popover open={workspacePopoverOpen} onOpenChange={setWorkspacePopoverOpen}>
-                <PopoverTrigger asChild>{workspaceChip}</PopoverTrigger>
+                {(!workspaceLoading || cachedWorkspace !== null) && (
+                  <PopoverTrigger asChild>{workspaceChip}</PopoverTrigger>
+                )}
                 <PopoverContent
                   align="start"
                   sideOffset={4}
@@ -5001,6 +5229,7 @@ export function NewChatLandingScreen() {
                           onClick={() => {
                             workspaceFromConfigRef.current = false;
                             setWorkspace(path);
+                            addRecent(path);
                             setWorkspacePopoverOpen(false);
                           }}
                           data-testid={`new-chat-landing-workspace-recent-${index}`}
@@ -5027,19 +5256,21 @@ export function NewChatLandingScreen() {
                 </PopoverContent>
               </Popover>
               {/* Worktree selection stays a separate real action from the directory picker. */}
-              {!sandboxSelected && (
+              {(!workspaceLoading || cachedWorkspace !== null) && (
                 <Popover open={worktreePopoverOpen} onOpenChange={setWorktreePopoverOpen}>
                   <PopoverTrigger asChild>
                     <ComposerWorkspaceTrigger
                       kind="worktree"
-                      label={worktreeHeader.branchLabel}
-                      aria-label={worktreeHeader.branchDescription}
+                      label={visibleWorktreeHeader.branchLabel}
+                      aria-label={visibleWorktreeHeader.branchDescription}
                       title={
-                        worktreeControlAvailable
-                          ? worktreeHeader.branchDescription
+                        workspaceLoading || worktreeControlAvailable
+                          ? visibleWorktreeHeader.branchDescription
                           : "Choose a Git working directory to use worktrees"
                       }
-                      disabled={!worktreeControlAvailable}
+                      disabled={workspaceLoading || !worktreeControlAvailable}
+                      aria-busy={workspaceLoading || undefined}
+                      className={workspaceLoading ? "disabled:opacity-100" : undefined}
                       data-testid="new-chat-landing-branch-chip"
                     />
                   </PopoverTrigger>
@@ -5133,6 +5364,7 @@ export function NewChatLandingScreen() {
                                         e.preventDefault();
                                         workspaceFromConfigRef.current = false;
                                         setWorkspace(w.path);
+                                        addRecent(w.path);
                                         setBranchInputFocused(false);
                                         setWorktreePopoverOpen(false);
                                       }}
@@ -5618,15 +5850,21 @@ export function NewChatLandingScreen() {
                       </DropdownMenuContent>
                     </DropdownMenu>
 
-                    {selectedAgent && permissionConfigRow && (
+                    {pickerLoading && cachedPermission === null ? (
+                      <NewChatPickerLoading
+                        label="Loading permissions"
+                        testId="new-chat-landing-permission-loading"
+                      />
+                    ) : visiblePermissionRow ? (
                       <ComposerPermissionPicker
-                        label={permissionConfigRow.label}
-                        value={permissionConfigRow.value}
+                        label={visiblePermissionRow.label}
+                        value={visiblePermissionRow.value}
+                        loading={pickerLoading}
                         options={directModeOptions}
                         onSelect={selectDirectMode}
                         testIdPrefix="new-chat-landing"
                       />
-                    )}
+                    ) : null}
 
                     {/* Sandbox repository chip — the sandbox counterpart of the
                 working-directory chip. There is no filesystem to browse
@@ -5854,6 +6092,8 @@ export function NewChatLandingScreen() {
                         effectiveAgentId={effectiveAgentId}
                         agentLabel={agentLabel}
                         hasAgents={agentList.length > 0}
+                        loading={pickerLoading}
+                        cacheKey={pickerCacheKey}
                         host={harnessWarningHost}
                         onSelectAgent={handleSelectAgent}
                         pendingAgent={pendingAgentAllowedOnTarget ? pendingAgent : null}
