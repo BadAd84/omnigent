@@ -75,6 +75,7 @@ from omnigent.inner.hook_scripts.subagent_router import (
 )
 from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.pane_diagnostics import diagnose_pane
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 _logger = logging.getLogger(__name__)
@@ -424,13 +425,30 @@ class ClaudePromptTimeout(RuntimeError):
     :param args: Standard exception args; ``args[0]`` is the message.
     :param blocked_on: Slug naming what the pane was showing instead of the
         input box (see :func:`_classify_unready_pane`), e.g.
-        ``"launch-preamble"``. Callers log it as a structured attribute so the
-        unrelated causes behind this one timeout can be counted apart.
+        ``"launch-preamble"``. ``"unknown"`` for a screen no marker matched.
+    :param pane_shape: Structural flags from
+        :func:`omnigent.util.pane_diagnostics.pane_shape`. Meaningful even when
+        *blocked_on* is ``"unknown"``.
+    :param pane_fingerprint: Stable hash from
+        :func:`omnigent.util.pane_diagnostics.pane_fingerprint`, so screens
+        nobody has classified still group by volume.
+
+    Callers log all three as structured attributes, so the unrelated causes
+    behind this one timeout can be counted apart whether or not a marker for
+    them exists yet.
     """
 
-    def __init__(self, *args: object, blocked_on: str = "unknown") -> None:
+    def __init__(
+        self,
+        *args: object,
+        blocked_on: str = "unknown",
+        pane_shape: tuple[str, ...] = (),
+        pane_fingerprint: str = "",
+    ) -> None:
         super().__init__(*args)
         self.blocked_on = blocked_on
+        self.pane_shape = pane_shape
+        self.pane_fingerprint = pane_fingerprint
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -5156,8 +5174,10 @@ def _wait_for_claude_prompt_ready(
         *timeout_s* (Claude failed to boot). The message carries a poll
         count, how many of those polls saw an empty capture, a cause slug
         for what the pane showed instead (:func:`_classify_unready_pane`,
-        also on the exception's ``blocked_on``), and the tail of the last
-        non-empty capture the loop actually observed (see
+        also on the exception's ``blocked_on``), the pane's structural shape
+        and fingerprint (:func:`diagnose_pane`, which describe an
+        unrecognized screen too), and the tail of the last non-empty capture
+        the loop actually observed (see
         :func:`_format_terminal_failure_tail`) so the true failure mode —
         a blocked credential prompt, a startup crash, a torn/empty capture
         under a mid-turn repaint, or a box that never appeared — is
@@ -5192,14 +5212,20 @@ def _wait_for_claude_prompt_ready(
     # session is alive but capture-pane came back blank); non-empty captures
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces). The
-    # cause slug names which of those it was without re-parsing the tail.
+    # cause slug names which of those it was without re-parsing the tail. The
+    # shape and fingerprint are cause-independent, so a screen no marker matched
+    # is still diagnosable and still groups with its own kind.
     blocked_on = _classify_unready_pane(last_nonempty)
+    diagnosis = diagnose_pane(last_nonempty)
     raise ClaudePromptTimeout(
         f"Claude Code terminal did not become ready within {timeout_s}s "
         f"(input prompt never rendered in {polls} polls, "
-        f"{empty_polls} empty captures, blocked_on={blocked_on}). "
+        f"{empty_polls} empty captures, blocked_on={blocked_on} "
+        f"{diagnosis.describe()}). "
         "The message was not delivered." + _format_terminal_failure_tail(last_nonempty),
         blocked_on=blocked_on,
+        pane_shape=diagnosis.shape,
+        pane_fingerprint=diagnosis.fingerprint,
     )
 
 

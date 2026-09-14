@@ -8289,6 +8289,44 @@ def test_wait_for_claude_prompt_ready_reports_the_blocking_cause(
     assert "Last terminal output:" in message
 
 
+def test_unrecognized_screen_is_still_diagnosable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A screen no marker matches must not be a dead end.
+
+    The cause table can only name failures somebody already investigated. The
+    shape and fingerprint are cause-independent, so a novel screen still says
+    what kind of thing it was and still groups with other reports of itself.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    novel = (
+        "Some future setup step nobody has written a marker for\n"
+        "Continue with the migration? [y/N]\n"
+    )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._capture_pane",
+        lambda socket_path, tmux_target: novel,
+    )
+    with pytest.raises(claude_native_bridge.ClaudePromptTimeout) as excinfo:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=0.0,
+        )
+    error = excinfo.value
+    assert error.blocked_on == "unknown"
+    # Cause unknown, but the screen still describes itself: the CLI never drew
+    # its UI and something is waiting on a keypress.
+    assert "no-tui-frame" in error.pane_shape
+    assert "awaiting-input" in error.pane_shape
+    assert error.pane_fingerprint not in ("", "blank")
+    message = str(error)
+    assert "blocked_on=unknown" in message
+    assert f"pane={error.pane_fingerprint}" in message
+
+
 def test_empty_capture_timeout_reports_no_output_cause(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

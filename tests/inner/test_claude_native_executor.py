@@ -1383,7 +1383,12 @@ async def test_prompt_timeout_log_carries_the_blocking_cause(
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise ClaudePromptTimeout("terminal did not become ready", blocked_on="password-prompt")
+        raise ClaudePromptTimeout(
+            "terminal did not become ready",
+            blocked_on="password-prompt",
+            pane_shape=("no-tui-frame", "awaiting-input"),
+            pane_fingerprint="ab12cd34",
+        )
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", lambda *args, **kwargs: None)
@@ -1406,8 +1411,13 @@ async def test_prompt_timeout_log_carries_the_blocking_cause(
         if "prompt delivery to harness timed out" in record.getMessage()
     ]
     assert len(timeouts) == 1
-    assert "blocked_on=password-prompt" in timeouts[0].getMessage()
+    message = timeouts[0].getMessage()
+    assert "blocked_on=password-prompt" in message
+    assert "shape=no-tui-frame,awaiting-input" in message
+    assert "pane=ab12cd34" in message
     assert timeouts[0].attributes["blocked_on"] == "password-prompt"
+    assert timeouts[0].attributes["pane_shape"] == "no-tui-frame,awaiting-input"
+    assert timeouts[0].attributes["pane_fingerprint"] == "ab12cd34"
     assert timeouts[0].event_name == "claude_native_prompt_timeout"
 
 
