@@ -180,6 +180,17 @@ describe("newChatPickerCache", () => {
     expect(readNewChatPickerCache(key)).toBeNull();
   });
 
+  it("drops expired or malformed records instead of leaving them in storage", () => {
+    writeNewChatPickerCache(key, preview);
+    vi.setSystemTime(NOW + DAY_MS + 1);
+    expect(readNewChatPickerCache(key)).toBeNull();
+    expect(localStorage.getItem(key)).toBeNull();
+
+    localStorage.setItem(key, "not json");
+    expect(readNewChatPickerCache(key)).toBeNull();
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+
   it("isolates records by server, user, and project", () => {
     writeNewChatPickerCache(key, preview);
     const projectKey = getNewChatPickerCacheKey("Alpha")!;

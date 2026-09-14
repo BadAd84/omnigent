@@ -112,12 +112,31 @@ function readPreview<T>(
 ): T | null {
   if (key === null || typeof window === "undefined") return null;
   try {
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return null;
+    let record: unknown = null;
+    try {
+      record = JSON.parse(raw);
+    } catch {
+      // Malformed JSON is dropped below like any other rejected record.
+    }
     const cacheSchema = z.object({ preview: schema, preferences: z.string(), savedAt: z.number() });
-    const parsed = cacheSchema.safeParse(JSON.parse(window.localStorage.getItem(key) ?? "null"));
-    if (!parsed.success) return null;
+    const parsed = cacheSchema.safeParse(record);
+    if (!parsed.success) {
+      // Unparseable records never become valid again; drop them so dead
+      // entries don't accumulate toward the storage quota.
+      window.localStorage.removeItem(key);
+      return null;
+    }
     const { preview, savedAt, preferences } = parsed.data;
     const age = Date.now() - savedAt;
-    if (age < 0 || age > MAX_AGE_MS || preferences !== signature(preview)) return null;
+    if (age > MAX_AGE_MS) {
+      window.localStorage.removeItem(key);
+      return null;
+    }
+    // Future timestamps (clock skew) and preference mismatches can become
+    // valid again, so those records stay in place.
+    if (age < 0 || preferences !== signature(preview)) return null;
     return preview;
   } catch {
     return null;

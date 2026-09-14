@@ -33,10 +33,28 @@ export function getSessionModelLabelCacheKey(
 export function readSessionModelLabelCache(key: string | null): string | null {
   if (key === null || typeof window === "undefined") return null;
   try {
-    const parsed = cacheSchema.safeParse(JSON.parse(window.localStorage.getItem(key) ?? "null"));
-    if (!parsed.success) return null;
+    const raw = window.localStorage.getItem(key);
+    if (raw === null) return null;
+    let record: unknown = null;
+    try {
+      record = JSON.parse(raw);
+    } catch {
+      // Malformed JSON is dropped below like any other rejected record.
+    }
+    const parsed = cacheSchema.safeParse(record);
+    if (!parsed.success) {
+      // Unparseable records never become valid again; drop them so dead
+      // entries don't accumulate toward the storage quota.
+      window.localStorage.removeItem(key);
+      return null;
+    }
     const age = Date.now() - parsed.data.savedAt;
-    return age >= 0 && age <= MAX_AGE_MS ? parsed.data.displayName : null;
+    if (age > MAX_AGE_MS) {
+      window.localStorage.removeItem(key);
+      return null;
+    }
+    // A future timestamp (clock skew) can become valid again; leave it.
+    return age >= 0 ? parsed.data.displayName : null;
   } catch {
     return null;
   }

@@ -105,6 +105,17 @@ describe("session model display-name cache", () => {
     },
   );
 
+  it("drops expired or malformed records instead of leaving them in storage", () => {
+    writeSessionModelLabelCache(key, "Team model");
+    vi.setSystemTime(NOW + 24 * 60 * 60 * 1000 + 1);
+    expect(readSessionModelLabelCache(key)).toBeNull();
+    expect(localStorage.getItem(key)).toBeNull();
+
+    localStorage.setItem(key, "not json");
+    expect(readSessionModelLabelCache(key)).toBeNull();
+    expect(localStorage.getItem(key)).toBeNull();
+  });
+
   it("removes a cached name when live metadata no longer advertises it", () => {
     writeSessionModelLabelCache(key, "Team model");
     writeSessionModelLabelCache(key, null);
