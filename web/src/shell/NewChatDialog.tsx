@@ -30,7 +30,6 @@ import {
 } from "@/components/composer/ChatComposer";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  MonitorIcon,
   MonitorCloudIcon,
   CircleHelpIcon,
   ChevronDownIcon,
@@ -52,17 +51,9 @@ import {
   Dialog,
   DialogContent,
   DialogDescription,
-  DialogFooter,
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -72,7 +63,6 @@ import { showToast } from "@/components/ui/toast";
 import {
   CLAUDE_NATIVE_EFFORTS,
   PI_NATIVE_EFFORTS,
-  ConfigRow,
   EFFORT_UNAVAILABLE_PLACEHOLDER,
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
@@ -371,13 +361,18 @@ export function displayNameForHost(
   userAgent: string,
 ): string {
   if (thisMachineHostId === null || host.host_id !== thisMachineHostId) return host.name;
+  return localMachineLabel(userAgent, host.name);
+}
+
+/** Name the current device without claiming a platform the browser cannot identify. */
+export function localMachineLabel(userAgent: string, fallback = "This machine"): string {
   if (/iPhone/i.test(userAgent)) return "This iPhone";
   if (/iPad/i.test(userAgent)) return "This iPad";
   if (/Android/i.test(userAgent)) return "This Android";
   if (/Windows/i.test(userAgent)) return "This Windows";
   if (/Macintosh|Mac OS X/i.test(userAgent)) return "This Mac";
   if (/Linux|X11/i.test(userAgent)) return "This machine";
-  return host.name;
+  return fallback;
 }
 
 /** Resolve this machine exactly from Electron, or conservatively from a local single-host server. */
@@ -394,16 +389,18 @@ function HostOption({
   host,
   displayName = host.name,
   subtitle,
+  action,
   cloud = false,
 }: {
   host: Host;
   displayName?: string;
   subtitle?: string;
+  action?: ReactNode;
   cloud?: boolean;
 }) {
   const isOnline = host.status === "online";
   return (
-    <span className="flex min-w-0 items-center gap-1">
+    <span className="flex w-full min-w-0 items-center gap-1">
       <span className="flex size-4 shrink-0 items-center justify-center">
         {cloud ? (
           <MonitorCloudIcon className="size-3.5 text-muted-foreground" />
@@ -417,14 +414,23 @@ function HostOption({
           />
         )}
       </span>
-      <span className="min-w-0 truncate">
+      <span className="min-w-0 flex-1 truncate">
         {displayName}
         {displayName !== host.name && (
           <span className="text-xs text-muted-foreground"> • {host.name}</span>
         )}
         {subtitle && <span className="text-xs text-muted-foreground"> • {subtitle}</span>}
       </span>
+      {action}
       <span className="sr-only">{host.status}</span>
+    </span>
+  );
+}
+
+function ConnectingText({ className }: { className?: string }) {
+  return (
+    <span className={className}>
+      Connecting<span className="animate-pulse">…</span>
     </span>
   );
 }
@@ -1330,11 +1336,9 @@ function NewChatPickerLoading({
 /**
  * Unified two-level agent/harness picker for the landing composer.
  *
- * Groups harnesses and agents, with model/effort submenus and advanced
- * brain-harness selection where supported. Entries without those settings
- * are plain selectable rows; permissions live in the composer's hand menu.
- * Selecting an editable entry opens its submenu and selects it first, keeping
- * the shared configuration state in {@link NewChatLandingScreen} coherent.
+ * Groups harnesses and agents, with Edit flyouts for model, effort, and SDK
+ * selection where supported. Entries without those settings are plain
+ * selectable rows; permissions live in the composer's hand menu.
  */
 export function AgentHarnessPicker({
   agentEntries,
@@ -1442,6 +1446,7 @@ export function AgentHarnessPicker({
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
   const collapsedBadge = isFeatureEnabled(info, "harness_install");
+  const triggerSdk = triggerDetails.find((detail) => detail.label === "SDK");
   const triggerModel = triggerDetails.find((detail) => detail.label === "Model");
   const triggerEffort = triggerDetails.find(
     (detail) => detail.label === "Effort" || detail.label === "Thinking level",
@@ -1457,8 +1462,13 @@ export function AgentHarnessPicker({
   const triggerAccessibleName = [hasAgents ? agentLabel : "No agents", triggerAccessibleDetails]
     .filter(Boolean)
     .join(", ");
-  const triggerText =
-    visibleModelText || (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "");
+  const triggerText = triggerSdk
+    ? agentLabel
+    : visibleModelText ||
+      (triggerModel === undefined ? (hasAgents ? agentLabel : "No agents") : "");
+  const triggerSecondaryText = triggerSdk
+    ? compactModelTriggerLabel(triggerSdk.value)
+    : visibleEffortText;
   const selectedEntry = [...harnessEntries, ...agentEntries].find(
     (agent) => agent.id === effectiveAgentId,
   );
@@ -1471,7 +1481,7 @@ export function AgentHarnessPicker({
             agent: { name: selectedEntry.name, harness: selectedEntry.harness },
             label: triggerAccessibleName,
             model: triggerText,
-            effort: visibleEffortText,
+            effort: triggerSecondaryText,
             smartRouting: autoHarnessActive,
           }
         : null,
@@ -1481,7 +1491,7 @@ export function AgentHarnessPicker({
       visibleModelText,
       triggerAccessibleName,
       triggerText,
-      visibleEffortText,
+      triggerSecondaryText,
       autoHarnessActive,
     ],
   );
@@ -1530,7 +1540,10 @@ export function AgentHarnessPicker({
             setConfigAgentId((current) => (current === agent.id ? null : current));
           }
         }}
-        onSelect={editable ? undefined : () => onSelectAgent(agent)}
+        onSelect={() => {
+          onSelectAgent(agent);
+          setOpen(false);
+        }}
         configContent={active ? selectedConfigContent : null}
         testId={`new-chat-landing-agent-${agent.id}`}
         icon={<ComposerAgentIcon agent={agent} />}
@@ -1696,7 +1709,7 @@ export function AgentHarnessPicker({
         "aria-busy": loading || undefined,
         label: cachedPreview?.label ?? triggerAccessibleName,
         model: cachedPreview?.model ?? triggerText,
-        effort: cachedPreview?.effort ?? visibleEffortText,
+        effort: cachedPreview?.effort ?? triggerSecondaryText,
         icon: cachedPreview ? (
           <span
             className="flex size-4 shrink-0 items-center justify-center"
@@ -1718,7 +1731,10 @@ export function AgentHarnessPicker({
       }}
       tooltip={cachedPreview?.label ?? triggerTooltipContent}
       tooltipTestId="new-chat-landing-agent-tooltip"
+      tooltipVariant="session-info"
       contentAlign={contentAlign}
+      contentSide="bottom"
+      contentSideOffset={6}
       contentClassName={cn(showConfig && "composer-agent-config-menu", contentClassName)}
       configOpen={configAgentId !== null}
     >
@@ -1840,7 +1856,10 @@ export function AgentHarnessPicker({
                     >
                       <span className="flex-1 text-left">{otherHarnessLabel}</span>
                     </DropdownMenuSubTrigger>
-                    <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
+                    <DropdownMenuSubContent
+                      sideOffset={-4}
+                      className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+                    >
                       {moreHarnessEntries.map(renderEntry)}
                     </DropdownMenuSubContent>
                   </DropdownMenuSub>
@@ -1879,7 +1898,10 @@ export function AgentHarnessPicker({
                 >
                   <span className="flex-1 text-left">Other...</span>
                 </DropdownMenuSubTrigger>
-                <DropdownMenuSubContent className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2">
+                <DropdownMenuSubContent
+                  sideOffset={-4}
+                  className="composer-agent-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[17.5rem] min-w-0 max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
+                >
                   {customAgentsBody}
                 </DropdownMenuSubContent>
               </DropdownMenuSub>
@@ -1890,151 +1912,6 @@ export function AgentHarnessPicker({
         </>
       )}
     </HarnessPicker>
-  );
-}
-
-function HarnessConfigModal({
-  open,
-  onOpenChange,
-  agent,
-  brainHarnessLabels,
-  host,
-  hideUnconfigured,
-  pickedHarness,
-  setPickedHarness,
-}: {
-  open: boolean;
-  onOpenChange: (open: boolean) => void;
-  agent: AvailableAgent;
-  brainHarnessLabels: Record<string, string>;
-  host: Host | undefined | null;
-  hideUnconfigured: boolean;
-  pickedHarness: string | null;
-  setPickedHarness: (harness: string | null, agentId?: string) => void;
-}) {
-  const info = useServerInfo();
-  // Feature ON → single "needs setup" badge; OFF → per-reason original text.
-  const collapsedBadge = isFeatureEnabled(info, "harness_install");
-  const brainDefault =
-    agent.harness != null && agent.harness in brainHarnessLabels ? agent.harness : null;
-
-  // Local draft — seeded from the live state each time the modal opens so
-  // Cancel can discard and re-opening always reflects the committed state.
-  const [draftHarness, setDraftHarness] = useState<string | null>(pickedHarness);
-
-  useEffect(() => {
-    if (!open) return;
-    setDraftHarness(pickedHarness);
-    // Seed once per open from the current live values.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open]);
-
-  const save = () => {
-    if (brainDefault) {
-      // Picking the spec default clears the override so the session tracks it.
-      setPickedHarness(draftHarness === brainDefault ? null : draftHarness, agent.id);
-    }
-    onOpenChange(false);
-  };
-
-  const brainEntries = brainDefault
-    ? Object.entries(brainHarnessLabels).filter(
-        ([id]) =>
-          id === (draftHarness ?? brainDefault) ||
-          !hideUnconfigured ||
-          !harnessUnconfiguredOnHost(id, host),
-      )
-    : [];
-
-  return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="sm:max-w-md" data-testid="new-chat-landing-config-modal">
-        <DialogHeader>
-          <DialogTitle>Configure {agent.display_name}</DialogTitle>
-          <DialogDescription className="sr-only">
-            Configure how {agent.display_name} runs for this session.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="flex flex-col gap-5 py-1">
-          {/* Stays rendered while Smart Routing is the pick: it is the control
-          that selected it, so hiding it would strand the choice with no way to
-          read it back or switch away without cancelling. */}
-          {brainDefault && (
-            <ConfigRow label="Agent Harness" description="Underlying coding harness">
-              <Select
-                value={draftHarness ?? brainDefault}
-                onValueChange={setDraftHarness}
-                componentId="new_chat.config.harness"
-                valueHasNoPii
-              >
-                <SelectTrigger
-                  className="w-full cursor-pointer"
-                  data-testid="new-chat-landing-config-harness"
-                  aria-label="Agent Harness"
-                >
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent
-                  position="popper"
-                  align="start"
-                  className="[&_[data-slot=select-item]]:pl-2.5"
-                >
-                  {brainEntries.map(([id, label]) => (
-                    <SelectItem key={id} value={id} data-testid={`new-chat-landing-harness-${id}`}>
-                      <span className="flex items-center gap-2">
-                        {label}
-                        {/* Only the auto row carries a blurb: "Auto" alone
-                        doesn't say what gets picked. Same muted style the agent
-                        picker uses for its row descriptions. */}
-                        {id === AUTO_HARNESS_ID && (
-                          <span className="truncate text-[11px] text-muted-foreground/70">
-                            {AUTO_HARNESS_DESCRIPTION}
-                          </span>
-                        )}
-                        {harnessUnconfiguredOnHost(id, host) && (
-                          <Badge
-                            variant="outline"
-                            className="border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
-                            data-testid={`new-chat-landing-harness-warning-${id}`}
-                          >
-                            {harnessWarningBadgeText(
-                              harnessUnavailableReasonOnHost(id, host),
-                              collapsedBadge,
-                            )}
-                          </Badge>
-                        )}
-                      </span>
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </ConfigRow>
-          )}
-        </div>
-
-        <DialogFooter className="border-t-0 bg-transparent">
-          <Button
-            type="button"
-            size="lg"
-            variant="outline"
-            onClick={() => onOpenChange(false)}
-            data-testid="new-chat-landing-config-cancel"
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
-            onClick={save}
-            data-testid="new-chat-landing-config-save"
-            size="lg"
-            componentId="new_chat.save_config"
-          >
-            Save
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
   );
 }
 
@@ -2650,8 +2527,6 @@ export function NewChatLandingScreen() {
     harness: string | null;
     host: Host | undefined | null;
   } | null>(null);
-  // Advanced settings for agents with a configurable brain harness.
-  const [configOpen, setConfigOpen] = useState(false);
 
   // Mirror the current draft fields into a ref every render so the unmount
   // cleanup below can snapshot the latest values without re-subscribing.
@@ -2719,12 +2594,13 @@ export function NewChatLandingScreen() {
     onlineHosts.map((host) => host.host_id),
   );
   // When it's already in the host list (online or offline) we connect via that
-  // row; only when it's absent do we show a standalone "Run on this machine"
-  // item, so the machine never appears twice.
+  // row. With another live host there is already a valid place to run, so do
+  // not add a competing local-machine action.
   const thisMachineInList =
     thisMachineHostId != null && allHosts.some((h) => h.host_id === thisMachineHostId);
   const canConnectThisMachine = Boolean(desktopHost?.cliInstalled);
-  const showConnectThisMachine = canConnectThisMachine && !thisMachineInList;
+  const showConnectThisMachine =
+    canConnectThisMachine && !thisMachineInList && onlineHosts.length === 0;
 
   // Track this machine's host status from the desktop shell (no-op in a browser).
   useEffect(() => {
@@ -3113,6 +2989,19 @@ export function NewChatLandingScreen() {
     selectedAgent,
     brainHarnessLabelsAll,
   );
+  const brainRoutable = SMART_ROUTING_ARMS.every(
+    (harness) =>
+      smartRoutingSourceFor({
+        externalConfigured: externalRoutingConfigured,
+        ossConfigured: ossRoutingConfigured,
+        gatewayBacked: hostBacksHarnessWithGateway(harnessWarningHost, harness),
+      }) !== null,
+  );
+  const brainHarnessLabels = useMemo(() => {
+    if (brainRoutable) return brainHarnessLabelsAll;
+    const { [AUTO_HARNESS_ID]: _dropped, ...rest } = brainHarnessLabelsAll;
+    return rest;
+  }, [brainHarnessLabelsAll, brainRoutable]);
   const isEntryConfigurable = (agent: AvailableAgent) =>
     agentHasModelSettings(agent) || agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
   // Only an eligible harness can display active per-turn Smart Routing.
@@ -3226,10 +3115,7 @@ export function NewChatLandingScreen() {
     }
     if (selectedAgent?.harness != null && selectedAgent.harness in brainHarnessLabelsAll) {
       const active = pickedHarness ?? selectedAgent.harness;
-      return [
-        { label: "Agent Harness", value: brainHarnessLabelsAll[active] ?? active },
-        ...routingRow,
-      ];
+      return [{ label: "SDK", value: brainHarnessLabelsAll[active] ?? active }, ...routingRow];
     }
     return routingRow;
   }, [
@@ -3256,7 +3142,11 @@ export function NewChatLandingScreen() {
     selectedNativeHarness,
   ]);
   const harnessTriggerDetails = configSummary.filter(
-    (row) => row.label === "Model" || row.label === "Effort" || row.label === "Thinking level",
+    (row) =>
+      row.label === "SDK" ||
+      row.label === "Model" ||
+      row.label === "Effort" ||
+      row.label === "Thinking level",
   );
   const permissionConfigRow = configSummary.find(
     (row) => row.label === "Permission mode" || row.label === "Mode",
@@ -3432,6 +3322,27 @@ export function NewChatLandingScreen() {
     setPickedEffort(effort);
     rememberPickerOptions(selectedNativeHarness, { effort });
   };
+  const handleSetPickedHarness = useCallback(
+    (harness: string | null, agentId?: string) => {
+      setSmartRoutingDropped(null);
+      setPickerEdits(null);
+      setPickedHarness(harness);
+      writeLastHarness(agentId ?? effectiveAgentId, harness);
+      _setCostControlMode(isAutoHarness(harness) ? "on" : null);
+    },
+    [effectiveAgentId],
+  );
+  const activeSdk = selectedAgentHasAdvancedSettings
+    ? (pickedHarness ?? selectedAgent?.harness ?? null)
+    : null;
+  const sdkEntries = selectedAgentHasAdvancedSettings
+    ? Object.entries(brainHarnessLabels).filter(
+        ([id]) =>
+          id === activeSdk ||
+          !hideUnconfiguredHarnesses ||
+          !harnessUnconfiguredOnHost(id, harnessWarningHost),
+      )
+    : [];
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
       <>
@@ -3450,6 +3361,47 @@ export function NewChatLandingScreen() {
           </>
         )}
         <ComposerConfigSections
+          sdk={
+            selectedAgentHasAdvancedSettings && selectedAgent
+              ? {
+                  testId: "new-chat-landing-config-harness",
+                  header: "Agent SDK",
+                  choices: sdkEntries.map(([id, label]) => ({
+                    key: id,
+                    label: (
+                      <span className="flex min-w-0 items-center gap-2">
+                        <span className="truncate">{label}</span>
+                        {id === AUTO_HARNESS_ID && (
+                          <span className="truncate text-[11px] text-muted-foreground/70">
+                            {AUTO_HARNESS_DESCRIPTION}
+                          </span>
+                        )}
+                        {harnessUnconfiguredOnHost(id, harnessWarningHost) && (
+                          <Badge
+                            variant="outline"
+                            className="border-amber-300 bg-amber-50 text-sm text-amber-700 dark:border-amber-500/30 dark:bg-amber-500/10 dark:text-amber-400"
+                            data-testid={`new-chat-landing-harness-warning-${id}`}
+                          >
+                            {harnessWarningBadgeText(
+                              harnessUnavailableReasonOnHost(id, harnessWarningHost),
+                              harnessInstallEnabled,
+                            )}
+                          </Badge>
+                        )}
+                      </span>
+                    ),
+                    checked: id === activeSdk,
+                    onSelect: () =>
+                      handleSetPickedHarness(
+                        id === selectedAgent.harness ? null : id,
+                        selectedAgent.id,
+                      ),
+                    testId: `new-chat-landing-harness-${id}`,
+                    className: "whitespace-normal [&>span:last-child]:min-w-0",
+                  })),
+                }
+              : undefined
+          }
           models={
             supportsModelPicker ||
             supportsPermissionMode ||
@@ -3538,17 +3490,6 @@ export function NewChatLandingScreen() {
               : undefined
           }
         />
-        {selectedAgentHasAdvancedSettings && (
-          <>
-            <DropdownMenuSeparator />
-            <DropdownMenuItem
-              data-testid="new-chat-landing-config-gear"
-              onSelect={() => setConfigOpen(true)}
-            >
-              Advanced settings
-            </DropdownMenuItem>
-          </>
-        )}
       </>
     ) : null;
   const pickerEntrySummaries = Object.fromEntries(
@@ -3889,19 +3830,6 @@ export function NewChatLandingScreen() {
   // are deliberately not required here. Gates the OPTIONS map only — membership
   // checks and the summary label for an existing pick keep reading
   // `brainHarnessLabelsAll`.
-  const brainRoutable = SMART_ROUTING_ARMS.every(
-    (harness) =>
-      smartRoutingSourceFor({
-        externalConfigured: externalRoutingConfigured,
-        ossConfigured: ossRoutingConfigured,
-        gatewayBacked: hostBacksHarnessWithGateway(harnessWarningHost, harness),
-      }) !== null,
-  );
-  const brainHarnessLabels = useMemo(() => {
-    if (brainRoutable) return brainHarnessLabelsAll;
-    const { [AUTO_HARNESS_ID]: _dropped, ...rest } = brainHarnessLabelsAll;
-    return rest;
-  }, [brainHarnessLabelsAll, brainRoutable]);
   // Whether we know enough to judge availability: before the agent list, the
   // server flags, and the target (host or sandbox) land, "unavailable" only
   // means "not loaded yet". The target matters as much as the rest — with no
@@ -4507,28 +4435,10 @@ export function NewChatLandingScreen() {
   // tooltip shows. Rows only render for native-harness picks (a Model/Effort
   // detail exists), where the agent label names the harness.
   const harnessTriggerTooltipRows = [
-    { label: "Harness", value: agentLabel },
+    { label: selectedAgentHasAdvancedSettings ? "Agent" : "Harness", value: agentLabel },
     ...harnessTriggerDetails,
     ...configSummary.filter((detail) => detail.label === "Connection"),
   ];
-
-  // Wrap the harness setter so every explicit pick is persisted to
-  // localStorage. The caller can pass an explicit `agentId` for the
-  // switch-via-submenu path where `effectiveAgentId` still reflects the
-  // previously selected agent (the state update from `onSelectAgent` hasn't
-  // applied yet).
-  const handleSetPickedHarness = useCallback(
-    (harness: string | null, agentId?: string) => {
-      setSmartRoutingDropped(null);
-      setPickerEdits(null);
-      setPickedHarness(harness);
-      writeLastHarness(agentId ?? effectiveAgentId, harness);
-      // Light up routing when either Auto Harness flavor is picked (both route
-      // harness + model); off otherwise.
-      _setCostControlMode(isAutoHarness(harness) ? "on" : null);
-    },
-    [effectiveAgentId],
-  );
 
   // Pick top-level Smart Routing. The create call needs a concrete agent_id, so
   // bind the Claude wrapper as a placeholder — the server routes from the first
@@ -5284,19 +5194,22 @@ export function NewChatLandingScreen() {
         }
         data-active={!sandboxSelected && host.host_id === selectedHostId ? "true" : undefined}
         title={`${host.name} — ${host.status}`}
+        className={reconnect ? "group" : undefined}
       >
         <HostOption
           host={host}
           cloud={isCloudHostEntry(host)}
           displayName={displayNameForHost(host, thisMachineHostId, navigator.userAgent)}
-          subtitle={
-            reconnect
-              ? connectingThisMachine
-                ? "connecting…"
-                : "select to connect"
-              : host.host_id === arcaHostId
-                ? "Arca instance"
-                : undefined
+          subtitle={host.host_id === arcaHostId ? "Arca instance" : undefined}
+          action={
+            reconnect ? (
+              <span
+                className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
+                data-testid="new-chat-landing-use-this-machine"
+              >
+                {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
+              </span>
+            ) : undefined
           }
         />
       </DropdownMenuItem>
@@ -5878,6 +5791,10 @@ export function NewChatLandingScreen() {
                               : "offline"
                           }
                           cloud={isCloudHost}
+                          className={cn(
+                            connectingThisMachine &&
+                              "w-auto gap-1 pr-2 after:animate-pulse after:text-xs after:font-normal after:content-['Connecting…']",
+                          )}
                           testIdPrefix="new-chat-landing"
                           data-testid="new-chat-landing-host-chip"
                         />
@@ -5982,8 +5899,8 @@ export function NewChatLandingScreen() {
                           </div>
                         )}
                         {localHosts.map(renderHostMenuItem)}
-                        {/* Desktop shell, machine not in the list yet: offer to connect
-                    it in one click. */}
+                        {/* Desktop shell, no active host and machine not listed:
+                    show the disconnected local-machine state inline. */}
                         {showConnectThisMachine && (
                           <DropdownMenuItem
                             onSelect={() => {
@@ -5991,13 +5908,22 @@ export function NewChatLandingScreen() {
                             }}
                             disabled={connectingThisMachine}
                             data-testid="new-chat-landing-run-on-this-machine"
-                            className="gap-2 text-sm"
+                            className="group gap-1 text-sm"
                           >
-                            <MonitorIcon className="size-4 shrink-0 text-muted-foreground" />
-                            <span className="text-sm">
-                              {connectingThisMachine
-                                ? "Connecting this machine…"
-                                : "Run on this machine"}
+                            <span className="flex size-4 shrink-0 items-center justify-center">
+                              <span
+                                aria-hidden
+                                className="size-2 rounded-full border-[1.5px] border-muted-foreground"
+                              />
+                            </span>
+                            <span className="min-w-0 flex-1 truncate text-sm">
+                              {localMachineLabel(navigator.userAgent)}
+                            </span>
+                            <span
+                              className="inline-flex h-6 shrink-0 items-center rounded-md px-2 text-xs font-medium text-muted-foreground group-hover:text-foreground"
+                              data-testid="new-chat-landing-use-this-machine"
+                            >
+                              {connectingThisMachine ? <ConnectingText /> : "Use this machine"}
                             </span>
                           </DropdownMenuItem>
                         )}
@@ -6302,18 +6228,6 @@ export function NewChatLandingScreen() {
                         triggerClassName="text-[13px] leading-5"
                       />
                     </div>
-                    {selectedAgent && selectedAgentHasAdvancedSettings && (
-                      <HarnessConfigModal
-                        open={configOpen}
-                        onOpenChange={setConfigOpen}
-                        agent={selectedAgent}
-                        brainHarnessLabels={brainHarnessLabels}
-                        host={harnessWarningHost}
-                        hideUnconfigured={hideUnconfiguredHarnesses}
-                        pickedHarness={pickedHarness}
-                        setPickedHarness={handleSetPickedHarness}
-                      />
-                    )}
                     <ComposerMicButton
                       className="size-8 md:size-7"
                       enableHotkey

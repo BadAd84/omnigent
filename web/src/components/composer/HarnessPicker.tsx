@@ -29,8 +29,11 @@ export function HarnessPicker({
   trigger,
   tooltip,
   tooltipTestId,
+  tooltipVariant = "default",
   contentClassName,
   contentAlign = "end",
+  contentSide = "top",
+  contentSideOffset,
   testId,
   configOpen = false,
   children,
@@ -41,8 +44,11 @@ export function HarnessPicker({
   trigger: TriggerProps;
   tooltip?: ReactNode;
   tooltipTestId?: string;
+  tooltipVariant?: "default" | "session-info";
   contentClassName?: string;
   contentAlign?: "start" | "center" | "end";
+  contentSide?: "top" | "bottom";
+  contentSideOffset?: number;
   testId?: string;
   configOpen?: boolean;
   children: ReactNode;
@@ -73,7 +79,11 @@ export function HarnessPicker({
             </TooltipTrigger>
             <TooltipContent
               side="top"
-              className="max-w-80 flex-col items-start gap-0.5 px-3 py-2"
+              className={cn(
+                "max-w-80 flex-col items-start gap-0.5 px-3 py-2",
+                tooltipVariant === "session-info" &&
+                  "w-64 max-w-[calc(100vw-2rem)] items-stretch rounded-lg bg-popover p-2.5 text-popover-foreground whitespace-normal shadow-menu ring-1 ring-foreground/10",
+              )}
               data-testid={tooltipTestId}
             >
               {tooltip}
@@ -82,7 +92,8 @@ export function HarnessPicker({
         </TooltipProvider>
       )}
       <DropdownMenuContent
-        side="top"
+        side={contentSide}
+        sideOffset={contentSideOffset}
         align={contentAlign}
         collisionPadding={12}
         avoidCollisions
@@ -119,7 +130,17 @@ export function HarnessPickerEntry({
   testId?: string;
   configTestId?: string;
 }) {
-  const rowContent = <HarnessMenuRowContent {...row} editable={editable} isMobile={isMobile} />;
+  const editRequestedRef = useRef(false);
+  const rowContent = (
+    <HarnessMenuRowContent
+      {...row}
+      editable={editable}
+      isMobile={isMobile}
+      onEditPointerDown={() => {
+        editRequestedRef.current = true;
+      }}
+    />
+  );
   const rowProps = {
     className: cn(HARNESS_MENU_ROW_CLASS_NAME, row.active && "bg-muted"),
     "data-harness-menu-row": "",
@@ -134,9 +155,14 @@ export function HarnessPickerEntry({
           {...rowProps}
           onPointerMove={(event) => event.preventDefault()}
           onClick={(event) => {
-            // Pointer-move is suppressed on this trigger to keep the flyout
-            // stable, which also blocks hover-out close; a second click on an
-            // open row is the explicit pointer dismissal.
+            const editRequested =
+              event.target instanceof Element && event.target.closest("[data-harness-edit]");
+            if (!editRequested) {
+              event.preventDefault();
+              event.stopPropagation();
+              onSelect?.();
+              return;
+            }
             if (open) {
               event.preventDefault();
               onOpenChange(false);
@@ -147,7 +173,7 @@ export function HarnessPickerEntry({
         </DropdownMenuSubTrigger>
         <DropdownMenuSubContent
           className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
-          sideOffset={16}
+          sideOffset={-4}
           collisionPadding={12}
           data-testid={configTestId}
           onFocusOutside={(event) => {
@@ -164,11 +190,13 @@ export function HarnessPickerEntry({
     <DropdownMenuItem
       {...rowProps}
       onSelect={(event) => {
-        onSelect?.();
-        if (editable) {
+        if (editable && editRequestedRef.current) {
           event.preventDefault();
           onOpenChange(true);
+        } else {
+          onSelect?.();
         }
+        editRequestedRef.current = false;
       }}
     >
       {rowContent}

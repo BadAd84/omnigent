@@ -60,16 +60,26 @@ function ConfigChoices({ choices }: { choices: readonly ComposerConfigChoice[] }
  * separate page-local copies. Pass a section as undefined to omit it.
  */
 export function ComposerConfigSections({
+  sdk,
   models,
   efforts,
 }: {
+  sdk?: ComposerConfigSection;
   models?: ComposerConfigSection;
   efforts?: ComposerConfigSection;
 }) {
   return (
     <>
+      {sdk && (
+        <div data-testid={sdk.testId}>
+          <PickerSectionHeader>{sdk.header}</PickerSectionHeader>
+          {sdk.leading}
+          <ConfigChoices choices={sdk.choices} />
+        </div>
+      )}
       {models && (
         <div data-testid={models.testId}>
+          {sdk && <DropdownMenuSeparator />}
           <PickerSectionHeader>{models.header}</PickerSectionHeader>
           {models.leading}
           <ConfigChoices choices={models.choices} />
