@@ -34,6 +34,9 @@ def _conv(
     labels: dict[str, str] | None = None,
     title: str | None = None,
     live_status: str | None = None,
+    parent_conversation_id: str | None = None,
+    root_conversation_id: str | None = None,
+    harness_override: str | None = None,
 ) -> Any:
     """Build a conversation-shaped row exposing the fields adoption reads."""
     return SimpleNamespace(
@@ -46,36 +49,66 @@ def _conv(
         labels=labels or {},
         title=title,
         live_status=live_status,
+        parent_conversation_id=parent_conversation_id,
+        root_conversation_id=root_conversation_id or session_id,
+        harness_override=harness_override,
     )
 
 
 class _AdoptionStore:
     """Minimal conversation store recording re-binds for the adoption path."""
 
-    def __init__(self, conv: Any = None, owner: str | None = None) -> None:
+    def __init__(
+        self,
+        conv: Any = None,
+        owner: str | None = None,
+        *,
+        owners: dict[str, str | None] | None = None,
+        convs: dict[str, Any] | None = None,
+        runner_bound: dict[str, list[Any]] | None = None,
+    ) -> None:
         self.conv = conv
         self.owner = owner
+        self.owners = owners
+        self.convs = convs
+        self.runner_bound = runner_bound or {}
         self.rebinds: list[tuple[str, str]] = []
+
+    def _lookup(self, conversation_id: str) -> Any:
+        if self.convs is not None:
+            return self.convs.get(conversation_id)
+        return self.conv
 
     def replace_runner_id(self, conversation_id: str, runner_id: str) -> Any:
         self.rebinds.append((conversation_id, runner_id))
-        if self.conv is None:
+        conv = self._lookup(conversation_id)
+        if conv is None:
             raise ConversationNotFoundError(conversation_id)
-        self.conv.runner_id = runner_id
-        return self.conv
+        conv.runner_id = runner_id
+        return conv
 
     def get_session_owner(self, conversation_id: str) -> str | None:
+        if self.owners is not None:
+            return self.owners.get(conversation_id)
         return self.owner
 
     def get_conversation(self, conversation_id: str) -> Any:
-        return self.conv
+        return self._lookup(conversation_id)
+
+    def list_conversations_by_runner_id(self, runner_id: str) -> list[Any]:
+        return self.runner_bound.get(runner_id, [])
 
 
 class _FakeTunnelRegistry:
     """Registry stub mapping online runner ids to their owners."""
 
-    def __init__(self, online: dict[str, str | None]) -> None:
+    def __init__(
+        self,
+        online: dict[str, str | None],
+        harnesses: dict[str, list[str]] | None = None,
+    ) -> None:
         self._online = online
+        self._harnesses = harnesses or {}
 
     def online_runner_ids(self) -> list[str]:
         return list(self._online)
@@ -84,7 +117,9 @@ class _FakeTunnelRegistry:
         return self._online.get(runner_id)
 
     def get(self, runner_id: str) -> Any:
-        return object() if runner_id in self._online else None
+        if runner_id not in self._online:
+            return None
+        return SimpleNamespace(hello=SimpleNamespace(harnesses=self._harnesses.get(runner_id, [])))
 
 
 class _FakeRunnerRouter:
@@ -388,4 +423,267 @@ async def test_archive_stop_settles_leftover_mid_turn_status(
         sessions_module._session_status_cache.pop(session_id, None)
         session_stream.close(session_id)
         # The settle publish is synchronous, but give any stray task a tick.
+        await asyncio.sleep(0)
+
+
+@pytest.mark.asyncio
+async def test_child_without_direct_grant_uses_root_owner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A sub-agent child with no direct grant matches via the root's owner.
+
+    In authenticated deployments only the root session carries an owner
+    grant; the direct lookup returns None for the child. The owner gate must
+    fall back to the root session's owner, or adoption never fires exactly
+    where multiple runners exist.
+    """
+    relays = _capture_relays(monkeypatch)
+    child = _conv("c_granted", root_conversation_id="c_root", live_status="running")
+    root = _conv("c_root", kind="default", runner_id="runner_dead")
+    store = _AdoptionStore(
+        owners={"c_root": "alice@example.com"},
+        convs={"c_granted": child, "c_root": root},
+    )
+
+    await orch._adopt_or_park_orphaned_subagents(
+        [child],
+        "runner_dead",
+        conversation_store=store,  # type: ignore[arg-type]
+        runner_router=_FakeRunnerRouter(),  # type: ignore[arg-type]
+        tunnel_registry=_FakeTunnelRegistry(  # type: ignore[arg-type]
+            {"runner_live": "alice@example.com"}
+        ),
+        initialize_session=None,
+    )
+
+    assert store.rebinds == [("c_granted", "runner_live")]
+    assert relays == [("c_granted", "runner_live")]
+    assert "c_granted" not in orch._orphaned_subagent_sessions
+
+
+@pytest.mark.asyncio
+async def test_rejected_session_init_rolls_back_and_parks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed resume handshake is not an adoption.
+
+    The re-bind is rolled back to the dead runner and the orphan parked, so
+    the next candidate or connecting runner retries instead of the turn
+    being silently lost.
+    """
+    relays = _capture_relays(monkeypatch)
+    conv = _conv("c_init_fail", live_status="running")
+    store = _AdoptionStore(conv=conv, owner=None)
+
+    async def _rejecting_init(adopted: Any, client: Any) -> None:
+        raise RuntimeError("runner rejected the session init")
+
+    await orch._adopt_or_park_orphaned_subagents(
+        [conv],
+        "runner_dead",
+        conversation_store=store,  # type: ignore[arg-type]
+        runner_router=_FakeRunnerRouter(),  # type: ignore[arg-type]
+        tunnel_registry=_FakeTunnelRegistry({"runner_live": None}),  # type: ignore[arg-type]
+        initialize_session=_rejecting_init,
+    )
+
+    assert store.rebinds == [("c_init_fail", "runner_live"), ("c_init_fail", "runner_dead")]
+    assert relays == []
+    assert "c_init_fail" in orch._orphaned_subagent_sessions
+
+
+@pytest.mark.asyncio
+async def test_unresolvable_client_rolls_back_and_parks(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No client for the new runner means the orphan stays recoverable.
+
+    A re-bound session that was never initialized or relayed would wait for
+    a message that never comes (the parent shares the dead runner), so the
+    binding is rolled back and the orphan parked for retry.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+
+    relays = _capture_relays(monkeypatch)
+    conv = _conv("c_no_client", live_status="running")
+    store = _AdoptionStore(conv=conv, owner=None)
+
+    class _UnroutableRouter:
+        def client_for_session_resources(self, conversation_id: str) -> Any:
+            raise OmnigentError("runner is offline", code=ErrorCode.RUNNER_UNAVAILABLE)
+
+    await orch._adopt_or_park_orphaned_subagents(
+        [conv],
+        "runner_dead",
+        conversation_store=store,  # type: ignore[arg-type]
+        runner_router=_UnroutableRouter(),  # type: ignore[arg-type]
+        tunnel_registry=_FakeTunnelRegistry({"runner_live": None}),  # type: ignore[arg-type]
+        initialize_session=None,
+    )
+
+    assert store.rebinds == [("c_no_client", "runner_live"), ("c_no_client", "runner_dead")]
+    assert relays == []
+    assert "c_no_client" in orch._orphaned_subagent_sessions
+
+
+@pytest.mark.asyncio
+async def test_dedicated_runner_is_never_an_adoption_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A host-bound session's dedicated runner must not receive orphans.
+
+    Host-launched and managed-sandbox runners serve one session's workspace;
+    resuming a foreign orphan inside that sandbox would be an isolation
+    break, so the orphan parks instead.
+    """
+    _capture_relays(monkeypatch)
+    conv = _conv("c_sandboxed", live_status="running")
+    store = _AdoptionStore(
+        conv=conv,
+        owner=None,
+        runner_bound={"runner_dedicated": [_conv("c_host", host_id="host_1")]},
+    )
+
+    await orch._adopt_or_park_orphaned_subagents(
+        [conv],
+        "runner_dead",
+        conversation_store=store,  # type: ignore[arg-type]
+        runner_router=_FakeRunnerRouter(),  # type: ignore[arg-type]
+        tunnel_registry=_FakeTunnelRegistry({"runner_dedicated": None}),  # type: ignore[arg-type]
+        initialize_session=None,
+    )
+
+    assert store.rebinds == []
+    assert "c_sandboxed" in orch._orphaned_subagent_sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("advertised", "adopted"),
+    [(["codex"], False), (["claude-native"], True)],
+)
+async def test_candidate_must_advertise_orphans_harness(
+    monkeypatch: pytest.MonkeyPatch,
+    advertised: list[str],
+    adopted: bool,
+) -> None:
+    """Adoption applies the same capability gate as pinned-runner dispatch.
+
+    A runner that cannot spawn the orphan's harness would accept the re-bind
+    and then fail the resume, so it is filtered out up front.
+    """
+    _capture_relays(monkeypatch)
+    conv = _conv("c_harness", live_status="running", harness_override="claude-native")
+    store = _AdoptionStore(conv=conv, owner=None)
+
+    await orch._adopt_or_park_orphaned_subagents(
+        [conv],
+        "runner_dead",
+        conversation_store=store,  # type: ignore[arg-type]
+        runner_router=_FakeRunnerRouter(),  # type: ignore[arg-type]
+        tunnel_registry=_FakeTunnelRegistry(  # type: ignore[arg-type]
+            {"runner_live": None}, harnesses={"runner_live": advertised}
+        ),
+        initialize_session=None,
+    )
+
+    if adopted:
+        assert store.rebinds == [("c_harness", "runner_live")]
+        assert "c_harness" not in orch._orphaned_subagent_sessions
+    else:
+        assert store.rebinds == []
+        assert "c_harness" in orch._orphaned_subagent_sessions
+
+
+@pytest.mark.asyncio
+async def test_live_ancestor_runner_is_preferred_over_other_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parent's current runner wins over an arbitrary same-owner runner.
+
+    Mirrors the reactive heal's target choice: the ancestor's runner shares
+    the child's user and workspace context, so it is tried before generic
+    registry order decides.
+    """
+    relays = _capture_relays(monkeypatch)
+    child = _conv("c_child", parent_conversation_id="c_parent", live_status="running")
+    parent = _conv("c_parent", kind="default", runner_id="runner_parent")
+    store = _AdoptionStore(convs={"c_child": child, "c_parent": parent})
+
+    await orch._adopt_or_park_orphaned_subagents(
+        [child],
+        "runner_dead",
+        conversation_store=store,  # type: ignore[arg-type]
+        runner_router=_FakeRunnerRouter(),  # type: ignore[arg-type]
+        tunnel_registry=_FakeTunnelRegistry(  # type: ignore[arg-type]
+            {"runner_other": None, "runner_parent": None}
+        ),
+        initialize_session=None,
+    )
+
+    assert store.rebinds == [("c_child", "runner_parent")]
+    assert relays == [("c_child", "runner_parent")]
+
+
+@pytest.mark.asyncio
+async def test_connected_dedicated_runner_does_not_drain_parked_orphans(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The parked-orphan drain applies the same target filters.
+
+    A dedicated runner connecting (e.g. a fresh host-bound session's runner)
+    must leave parked orphans parked rather than pull them into its sandbox.
+    """
+    _capture_relays(monkeypatch)
+    conv = _conv("c_waiting", runner_id="runner_dead")
+    store = _AdoptionStore(
+        conv=conv,
+        owner=None,
+        runner_bound={"runner_dedicated": [_conv("c_host", host_id="host_1")]},
+    )
+    orch._orphaned_subagent_sessions["c_waiting"] = orch._OrphanedSubagent(
+        dead_runner_id="runner_dead", owner=None
+    )
+
+    await orch._adopt_parked_orphans_onto_connected_runner(
+        "runner_dedicated",
+        conversation_store=store,  # type: ignore[arg-type]
+        runner_router=_FakeRunnerRouter(),  # type: ignore[arg-type]
+        tunnel_registry=_FakeTunnelRegistry({"runner_dedicated": None}),  # type: ignore[arg-type]
+        initialize_session=None,
+    )
+
+    assert store.rebinds == []
+    assert "c_waiting" in orch._orphaned_subagent_sessions
+
+
+@pytest.mark.asyncio
+async def test_archive_stop_settles_status_even_when_row_lookup_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient row-lookup error must not leave the tombstone "running".
+
+    The settle reads the status cache, so it works even when the store read
+    fails and the host-runner teardown is skipped.
+    """
+    from omnigent.runtime import session_stream
+
+    session_id = "a1b2c3d4e5f60718293a4b5c6d7e8f90"
+
+    async def _noop_stop(*args: Any, **kwargs: Any) -> None:
+        return None
+
+    class _RaisingStore:
+        def get_conversation(self, conversation_id: str) -> Any:
+            raise RuntimeError("store unavailable")
+
+    monkeypatch.setattr(sessions_module, "_best_effort_stop", _noop_stop)
+    sessions_module._session_status_cache[session_id] = "running"
+
+    try:
+        await orch._archive_stop(session_id, _RaisingStore(), None, None)  # type: ignore[arg-type]
+        assert sessions_module._session_status_cache.get(session_id) == "idle"
+    finally:
+        sessions_module._session_status_cache.pop(session_id, None)
+        session_stream.close(session_id)
         await asyncio.sleep(0)

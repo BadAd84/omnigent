@@ -127,10 +127,10 @@ def _spawn_server(
         "--config",
         str(cfg),
     ]
-    log_handle = open(log_path, "w")
-    proc = subprocess.Popen(
-        args, env=env, cwd=compat_server_cwd(), stdout=log_handle, stderr=subprocess.STDOUT
-    )
+    with open(log_path, "w") as log_handle:
+        proc = subprocess.Popen(
+            args, env=env, cwd=compat_server_cwd(), stdout=log_handle, stderr=subprocess.STDOUT
+        )
     base = f"http://localhost:{port}"
     deadline = time.monotonic() + HEALTH_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -165,14 +165,14 @@ def _spawn_runner(
             "RUNNER_SERVER_URL": base,
         }
     )
-    log_handle = open(log_path, "w")
-    return subprocess.Popen(
-        [runner_executable(), "-m", "omnigent.runner._entry"],
-        env=runner_env,
-        cwd=compat_runner_cwd(),
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-    )
+    with open(log_path, "w") as log_handle:
+        return subprocess.Popen(
+            [runner_executable(), "-m", "omnigent.runner._entry"],
+            env=runner_env,
+            cwd=compat_runner_cwd(),
+            stdout=log_handle,
+            stderr=subprocess.STDOUT,
+        )
 
 
 def _online(client: httpx.Client, runner_id: str) -> bool:
@@ -316,9 +316,9 @@ def test_orphaned_mid_turn_child_recovers_on_live_runner(
             [{"text": "HOLD", "block": True}, {"text": "ADOPTED_AND_RESUMED"}],
         )
         send_user_message_to_session(client, session_id=child, content="Reply HOLD only.")
-        assert _wait_gate_pending(
-            mock_llm_server_url, timeout=40
-        ), "child turn never reached the mock-LLM gate"
+        assert _wait_gate_pending(mock_llm_server_url, timeout=40), (
+            "child turn never reached the mock-LLM gate"
+        )
         assert _snap(client, child).get("status") in (
             "running",
             "waiting",
@@ -434,9 +434,9 @@ def test_tombstoned_child_on_dead_runner_not_running(
         )
         configure_mock_llm(mock_llm_server_url, [{"text": "HOLD", "block": True}])
         send_user_message_to_session(client, session_id=child, content="Reply HOLD only.")
-        assert _wait_gate_pending(
-            mock_llm_server_url, timeout=40
-        ), "child turn never reached the mock-LLM gate"
+        assert _wait_gate_pending(mock_llm_server_url, timeout=40), (
+            "child turn never reached the mock-LLM gate"
+        )
         for _ in range(30):
             if _snap(client, child).get("status") in ("running", "waiting"):
                 break

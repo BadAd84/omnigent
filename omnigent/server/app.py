@@ -2850,12 +2850,17 @@ def create_app(
 
         The handshake's crash-recovery scan restarts a turn the persisted
         history shows as interrupted, so adoption resumes the orphan's
-        in-flight work the same way a managed relaunch does.
+        in-flight work the same way a managed relaunch does. The initializer
+        returns rejected (4xx/5xx) handshakes instead of raising, so raise
+        here — the adoption path counts only a landed resume as adopted and
+        keeps the orphan parked otherwise.
 
         :param conv: The adopted (re-bound) conversation row.
         :param client: HTTP client for the adopting runner.
+        :raises httpx.HTTPStatusError: When the runner rejects the handshake.
         """
-        await runner_session_initializer.initialize(conv, client, timeout=10.0)
+        response = await runner_session_initializer.initialize(conv, client, timeout=10.0)
+        response.raise_for_status()
 
     async def _mark_disconnected_runner_failed(runner_id: str) -> None:
         """Reconcile a dropped runner's sessions once the grace expires.
@@ -2927,6 +2932,7 @@ def create_app(
             runner_router=runner_router,
             tunnel_registry=tunnel_registry,
             initialize_session=_initialize_adopted_session,
+            agent_store=agent_store,
         )
 
     async def _on_runner_disconnect(runner_id: str) -> None:
@@ -3045,6 +3051,7 @@ def create_app(
             runner_router=runner_router,
             tunnel_registry=tunnel_registry,
             initialize_session=_initialize_adopted_session,
+            agent_store=agent_store,
         )
 
     async def _on_runner_connect(runner_id: str) -> None:
@@ -3178,6 +3185,7 @@ def create_app(
             runner_router=runner_router,
             tunnel_registry=tunnel_registry,
             initialize_session=_initialize_adopted_session,
+            agent_store=agent_store,
         )
 
     def _resolve_managed_runner_owner(runner_id: str) -> str | None:
