@@ -1088,6 +1088,8 @@ async def forward_claude_transcript_to_session(
         ) as subagent_client,
     ):
         while True:
+            iteration_started_at = time.monotonic()
+            phase = "child_history"
             try:
                 if subagent_task is not None and subagent_task.done():
                     try:
@@ -1104,6 +1106,7 @@ async def forward_claude_transcript_to_session(
                         )
                     subagent_task = None
                 async with _forward_progress_timeout(client, _FORWARD_LOOP_STALL_DEADLINE_S):
+                    phase = "hook_state"
                     current_session_id = read_active_session_id(bridge_dir) or session_id
                     observer_stderr_offset = _log_new_observer_hook_stderr(
                         bridge_dir=bridge_dir,
@@ -1116,6 +1119,7 @@ async def forward_claude_transcript_to_session(
                             start_at_end=start_at_end,
                             session_id=current_session_id,
                         )
+                    phase = "clear_rotation"
                     rotation = await _maybe_rotate_session_on_clear(
                         client=client,
                         session_id=current_session_id,
@@ -1175,6 +1179,7 @@ async def forward_claude_transcript_to_session(
                         cost_cache = {}
                         await asyncio.sleep(poll_interval_s)
                         continue
+                    phase = "fork_rotation"
                     rotation = await _maybe_rotate_session_on_fork(
                         client=client,
                         session_id=current_session_id,
@@ -1219,6 +1224,7 @@ async def forward_claude_transcript_to_session(
                         await asyncio.sleep(poll_interval_s)
                         continue
                     if not external_session_id_mirrored:
+                        phase = "external_session_id"
                         external_session_id_mirrored = await _maybe_mirror_external_session_id(
                             client=client,
                             session_id=current_session_id,
@@ -1226,6 +1232,7 @@ async def forward_claude_transcript_to_session(
                         )
                     # Normalize the statusLine shim's raw capture into
                     # context.json (one stat when nothing changed).
+                    phase = "transcript_discovery"
                     status_raw_sig = sync_raw_status_context(bridge_dir, status_raw_sig)
                     transcript_path = read_transcript_path(bridge_dir)
                     _observe_transcript_discovery(
@@ -1235,6 +1242,7 @@ async def forward_claude_transcript_to_session(
                         diagnostics=transcript_diagnostics,
                     )
                     if transcript_path is not None:
+                        phase = "transcript_state"
                         state = await _ensure_state_for_transcript(
                             bridge_dir=bridge_dir,
                             state=state,
@@ -1245,6 +1253,7 @@ async def forward_claude_transcript_to_session(
                         )
                         # Read deltas first for the lowest-latency preview. The
                         # runtime reconciler handles either delta/item order.
+                        phase = "deltas"
                         delta_state = await _forward_available_deltas(
                             client=client,
                             session_id=current_session_id,
@@ -1258,7 +1267,9 @@ async def forward_claude_transcript_to_session(
                         # record) runs — else a PreCompact + summary landing in
                         # the same poll would lose the boundary. Cursor-keyed, so
                         # the main hook phase below does not re-mint.
+                        phase = "compaction_prescan"
                         await _prescan_precompact_edges(bridge_dir, hook_state)
+                        phase = "transcript_items"
                         state = await _forward_available_items(
                             client=client,
                             session_id=current_session_id,
@@ -1269,6 +1280,7 @@ async def forward_claude_transcript_to_session(
                             skip_user_messages=skip_user_messages,
                             dedupe=dedupe,
                         )
+                        phase = "status_events"
                         hook_state = await _forward_available_status_events(
                             client=client,
                             session_id=current_session_id,
@@ -1297,6 +1309,7 @@ async def forward_claude_transcript_to_session(
                         # never dismiss a later genuine compaction's spinner or
                         # discard its boundary token.
                         if dedupe.pending_compaction_dismiss_seq is not None:
+                            phase = "compaction_dismissal"
                             dismiss_seq = dedupe.pending_compaction_dismiss_seq
                             dedupe.pending_compaction_dismiss_seq = None
                             await _maybe_dismiss_stranded_compaction_spinner(
@@ -1308,6 +1321,7 @@ async def forward_claude_transcript_to_session(
                         # Child history is an independent lane: a large backlog
                         # must never delay the next parent delta/transcript poll.
                         if subagent_task is None:
+                            phase = "child_history"
                             subagent_state = await asyncio.to_thread(
                                 _read_subagent_forward_state, bridge_dir
                             )
@@ -1331,6 +1345,7 @@ async def forward_claude_transcript_to_session(
                             )
                         # Cost uses the latest completed child scan. A running
                         # history scan checkpoints its cursor independently.
+                        phase = "session_cost"
                         await _forward_session_cost(
                             client=client,
                             session_id=current_session_id,
@@ -1346,6 +1361,7 @@ async def forward_claude_transcript_to_session(
                         # propagates an in-pane /model switch to model_override
                         # before the user's next message, so model-gated policies
                         # (cost-budget hard cap) no longer lag a switch by one turn.
+                        phase = "model"
                         await _forward_model_from_status(
                             client=client,
                             session_id=current_session_id,
@@ -1357,6 +1373,7 @@ async def forward_claude_transcript_to_session(
                         # throttled capture feeds both, so a shift+tab switch and
                         # a settled /btw exchange both reach the web view without
                         # spawning a capture-pane subprocess per signal.
+                        phase = "pane_signals"
                         await _forward_pane_signals(
                             client=client,
                             session_id=current_session_id,
@@ -1375,13 +1392,32 @@ async def forward_claude_transcript_to_session(
                     _FORWARD_LOOP_STALL_DEADLINE_S,
                     session_id,
                     exc_info=True,
-                    extra={"session_id": session_id},
+                    extra={
+                        "session_id": session_id,
+                        "event_name": "claude_forwarder_stalled",
+                        "attributes": {
+                            "forwarder_phase": phase,
+                            "iteration_elapsed_ms": int(
+                                (time.monotonic() - iteration_started_at) * 1000
+                            ),
+                        },
+                    },
                 )
-            except Exception:
+            except Exception as exc:
                 _logger.exception(
                     "Claude transcript forwarder loop failed; session=%s",
                     session_id,
-                    extra={"session_id": session_id},
+                    extra={
+                        "session_id": session_id,
+                        "event_name": "claude_forwarder_loop_failed",
+                        "attributes": {
+                            "forwarder_phase": phase,
+                            "exception_type": type(exc).__name__,
+                            "iteration_elapsed_ms": int(
+                                (time.monotonic() - iteration_started_at) * 1000
+                            ),
+                        },
+                    },
                 )
             try:
                 await asyncio.sleep(poll_interval_s)

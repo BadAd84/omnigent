@@ -3137,6 +3137,12 @@ async def test_forwarder_survives_unhandled_loop_exceptions(
     assert "Claude transcript forwarder loop failed" in caplog.text
     assert "session=conv_abc" in caplog.text
     assert str(bridge_dir) not in caplog.text
+    failure = next(r for r in caplog.records if "loop failed" in r.getMessage())
+    assert failure.event_name == "claude_forwarder_loop_failed"
+    assert failure.attributes["forwarder_phase"] == "transcript_items"
+    assert failure.attributes["exception_type"] == "PermissionError"
+    assert failure.attributes["iteration_elapsed_ms"] >= 0
+    assert str(bridge_dir) not in str(failure.attributes)
     assert request["body"]["type"] == "external_conversation_item"
     assert request["body"]["data"]["item_data"] == {
         "role": "assistant",
@@ -10258,6 +10264,10 @@ async def test_forward_loop_deadline_unsticks_a_stalled_iteration(
     assert stall_warnings, "the deadline trip must be loudly logged, never silent"
     # The warning's traceback names the stalled await for next-time forensics.
     assert stall_warnings[0].exc_info is not None
+    assert stall_warnings[0].event_name == "claude_forwarder_stalled"
+    assert stall_warnings[0].attributes["forwarder_phase"] == "hook_state"
+    assert stall_warnings[0].attributes["iteration_elapsed_ms"] >= 0
+    assert str(bridge_dir) not in str(stall_warnings[0].attributes)
 
 
 # ── /btw side-chat overlay relay ───────────────────────────────────
