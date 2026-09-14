@@ -95,6 +95,29 @@ describe("shared composer controls", () => {
     );
   });
 
+  it("keeps the model trigger clickable with an accessible, mobile-visible loading spinner", () => {
+    const onClick = vi.fn();
+    render(
+      <ComposerHarnessTrigger
+        label="Configure session"
+        model=""
+        icon={<span>Harness</span>}
+        loading
+        pending
+        onClick={onClick}
+      />,
+    );
+    const trigger = screen.getByRole("button", { name: "Configure session" });
+    const spinner = screen.getByRole("status", { name: "Loading model" });
+    expect(trigger).toBeEnabled();
+    expect(trigger).toHaveAttribute("aria-busy", "true");
+    expect(spinner.parentElement).toBe(trigger);
+    expect(screen.getByTestId("composer-agent-config-value")).not.toContainElement(spinner);
+    expect(screen.queryByLabelText("Model change pending")).toBeNull();
+    fireEvent.click(trigger);
+    expect(onClick).toHaveBeenCalledOnce();
+  });
+
   it("dispatches permission selections through the caller's handler", () => {
     const onSelect = vi.fn();
     render(
