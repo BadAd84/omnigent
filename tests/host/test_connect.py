@@ -1817,9 +1817,7 @@ async def test_sweep_bounds_a_wedged_codex_registry_reconcile(
     assert host._owned_subprocess_ops == 0
 
 
-def _classify_live_child_with_argv(
-    monkeypatch: pytest.MonkeyPatch, argv: list[str]
-) -> bool:
+def _classify_live_child_with_argv(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> bool:
     """Classify one live adopted child whose /proc argv reads *argv*.
 
     Stubs the psutil cmdline read so the verdict reflects classification
