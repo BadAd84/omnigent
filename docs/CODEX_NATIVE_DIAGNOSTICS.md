@@ -93,8 +93,10 @@ the discovery reasons above, and `forwarder_returned` / `forwarder_failed` /
 
 New breadcrumbs are INFO; existing warning/error levels and messages remain
 unchanged. New structured fields do not include prompts, pane contents,
-stderr, command arguments, paths, credentials, or endpoint URLs. Existing
-unstructured diagnostics are not expanded or sanitized by this change.
+stderr, command arguments, paths, credentials, or endpoint URLs. Free-form
+terminal names and session keys are omitted; use `terminal_instance_id` for
+correlation. Existing unstructured diagnostics are not expanded or sanitized
+by this change.
 
 ## Inspect one bounded session timeline
 

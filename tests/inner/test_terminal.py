@@ -97,14 +97,41 @@ def test_terminal_diagnostic_identity_is_private_and_copied(
 
     assert instance.diagnostic_attributes() == {
         "terminal_instance_id": hashlib.sha256(str(instance.socket_path).encode()).hexdigest(),
-        "terminal_name": "codex",
-        "terminal_session_key": "main",
         "terminal_lifecycle": "auxiliary",
         "app_server_instance_id": "server_instance_1",
         "app_server_pid": 123,
         "runner_id": "runner_safe_id",
     }
     assert "secret" not in str(instance._exit_diagnostic_attributes())
+
+
+def test_terminal_lifecycle_omits_free_form_identifiers(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """User-provided terminal identifiers never reach managed lifecycle logs."""
+    instance = TerminalInstance(
+        name="private customer incident notes",
+        session_key="private session context " * 1024,
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+    )
+    instance.bind_diagnostic_context(session_id="child_session")
+
+    with caplog.at_level(logging.INFO, logger=terminal_mod.__name__):
+        instance.note_close_requested()
+
+    assert len(caplog.records) == 1
+    row = record_to_row(caplog.records[0], "runner")
+    attributes = row["attributes"]
+    assert isinstance(attributes, dict)
+    assert (
+        attributes["terminal_instance_id"]
+        == hashlib.sha256(str(instance.socket_path).encode()).hexdigest()
+    )
+    assert "terminal_name" not in attributes
+    assert "terminal_session_key" not in attributes
+    assert instance.name not in str(row)
+    assert "private session context" not in str(row)
 
 
 @pytest.mark.parametrize(

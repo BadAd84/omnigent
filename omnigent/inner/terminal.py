@@ -1087,8 +1087,6 @@ class TerminalInstance:
         """Return bounded identity attributes, never argv, environment or pane text."""
         attributes: dict[str, object] = {
             "terminal_instance_id": _terminal_instance_id(self.socket_path),
-            "terminal_name": self.name,
-            "terminal_session_key": self.session_key,
             "terminal_lifecycle": self._diagnostic_lifecycle,
             **self._diagnostic_context,
         }
