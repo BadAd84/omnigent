@@ -25,6 +25,7 @@ from typing import Any, TypeAlias
 from omnigent._platform import IS_WINDOWS
 from omnigent.cli_invocation import cli_invocation
 from omnigent.runner.identity import strip_runner_auth_secrets
+from omnigent.util.suspend_watch import SUSPEND_GAP_THRESHOLD_S, suspend_gap_s
 from omnigent.util.tmux_compat import MIN_TMUX_VERSION, MIN_TMUX_VERSION_HINT, tmux_version
 
 from . import _proc
@@ -302,12 +303,6 @@ _IDLE_POLL_INTERVAL_SECONDS = 1.0
 _IDLE_EXIT_FAILURE_THRESHOLD = 3
 # Avoid adding probe pressure while the host cannot start another process.
 _TMUX_PROBE_START_FAILURE_BACKOFF_SECONDS = 1.0
-# Wall-clock/monotonic divergence across one watcher poll that counts as the
-# host having stopped running. CLOCK_MONOTONIC does not advance while a machine
-# is suspended but CLOCK_REALTIME does, so the difference measures a laptop lid
-# closing — the leading benign explanation for a whole tmux server vanishing.
-# Well above any scheduling delay so ordinary load never registers.
-_WATCH_CLOCK_GAP_MIN_SECONDS = 5.0
 
 # Process creation can fail temporarily while the host is under resource
 # pressure. Only those errno values leave terminal liveness unknown; permanent
@@ -1009,10 +1004,11 @@ class TerminalInstance:
     _recovered_capture_failures: int = field(default=0, repr=False)
     # The most recent wall-clock-ahead-of-monotonic gap across one watcher poll,
     # the monotonic time it was seen, and how many such gaps this terminal has
-    # seen (see :data:`_WATCH_CLOCK_GAP_MIN_SECONDS`). Deliberately the most
+    # seen. Deliberately the most
     # recent rather than the largest: the absence that matters is the one
     # directly before the exit, and a value and a timestamp taken from
-    # different gaps would describe an event that never happened.
+    # different gaps would describe an event that never happened. Gaps below
+    # :data:`~omnigent.util.suspend_watch.SUSPEND_GAP_THRESHOLD_S` are ignored.
     _watch_clock_gap_s: float = field(default=0.0, repr=False)
     _watch_clock_gap_at: float | None = field(default=None, repr=False)
     _watch_clock_gaps: int = field(default=0, repr=False)
@@ -1064,26 +1060,25 @@ class TerminalInstance:
         """Record that the host stopped running across a watcher poll.
 
         A suspended machine (closed laptop lid, hibernate, a paused VM) takes
-        its tmux server down with it, and on wake the watcher's next probes
-        fail against a socket whose server is gone. That reads identically to
-        tmux being killed or the socket directory being reaped, which is a very
-        different bug — so measure it: ``CLOCK_MONOTONIC`` (``time.monotonic``)
-        does not advance while a Linux host is suspended, while
-        ``CLOCK_REALTIME`` (``time.time``) does, so the difference across one
-        poll is roughly how long the host was away.
+        its tmux server down with it, and on wake the watcher's next probes fail
+        against a socket whose server is gone. That reads identically to tmux
+        being killed or the socket directory being reaped, which is a very
+        different bug — so measure it, using the same clock-divergence primitive
+        the host's resume watcher uses
+        (:func:`omnigent.util.suspend_watch.suspend_gap_s`, whose docstring
+        carries the platform and clock-choice caveats).
 
         A stepped realtime clock (an NTP correction, a manual change) registers
         the same way, which is why the exit log reports the measurement rather
-        than asserting a suspend. Platforms whose monotonic clock keeps running
-        through sleep simply report no gap.
+        than asserting a suspend.
 
         :param wall_before: ``time.time()`` sampled before the poll's sleep.
         :param monotonic_before: ``time.monotonic()`` sampled at the same point.
         :returns: None.
         """
         now = time.monotonic()
-        gap = (time.time() - wall_before) - (now - monotonic_before)
-        if gap < _WATCH_CLOCK_GAP_MIN_SECONDS:
+        gap = suspend_gap_s(wall_before, monotonic_before)
+        if gap < SUSPEND_GAP_THRESHOLD_S:
             return
         self._watch_clock_gap_s = gap
         self._watch_clock_gap_at = now
