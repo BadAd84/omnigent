@@ -17,8 +17,10 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -324,7 +326,8 @@ async def test_control_bridge_streams_large_output_burst() -> None:
     # arrives as live %output.
     payload_len = 200_000
     sock, target = await _new_private_tmux(
-        f'python3 -c \'import sys,time; sys.stdin.readline(); sys.stdout.write("X"*{payload_len}); '
+        "python3 -c 'import sys,time; sys.stdin.readline(); "
+        f'sys.stdout.write("X"*{payload_len}); '
         "sys.stdout.flush(); time.sleep(30)'"
     )
 
@@ -366,7 +369,8 @@ async def test_control_bridge_coalesces_burst_when_send_lags() -> None:
     """
     payload_len = 500_000
     sock, target = await _new_private_tmux(
-        f'python3 -c \'import sys,time; sys.stdin.readline(); sys.stdout.write("X"*{payload_len}); '
+        "python3 -c 'import sys,time; sys.stdin.readline(); "
+        f'sys.stdout.write("X"*{payload_len}); '
         "sys.stdout.flush(); time.sleep(30)'"
     )
 
@@ -400,60 +404,75 @@ async def test_control_bridge_coalesces_burst_when_send_lags() -> None:
         await _kill_and_join(sock, task)
 
 
-@pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+@pytest.mark.parametrize(
+    "ending", [b"%exit\n", b"%window-close @0\n", b""], ids=["exit", "window-close", "eof"]
+)
 @pytest.mark.asyncio
-async def test_control_bridge_burst_then_exit_delivers_full_tail() -> None:
-    """A burst-then-exit program's tail isn't dropped when %exit races the drain.
-
-    The reader and forwarder are separate tasks; shutdown keys on the reader.
-    When a program dumps a big burst and exits immediately (``cat bigfile``,
-    build output), ``%exit`` arrives while the slow browser send is still
-    draining the queued backlog. The bridge must let the forwarder finish
-    draining the sentinel-terminated queue before teardown, or the tail is
-    silently lost. Emit the burst then exit (no trailing sleep) behind a slow
-    send and assert the FULL payload still reaches the browser.
-    """
-    # The backlog must be too big to fully drain before the reader hits %exit,
-    # or the forwarder finishes on its own and the race never triggers. 2 MB
-    # behind a 5 ms/frame send leaves a large queued tail at %exit time — the
-    # pre-fix code (cancel forwarder on reader-done) drops ~35% of it.
+async def test_control_bridge_burst_then_exit_delivers_full_tail(
+    monkeypatch: pytest.MonkeyPatch, ending: bytes
+) -> None:
+    """Drain all queued output when the control stream ends behind a slow send."""
     payload_len = 2_000_000
-    sock, target = await _new_private_tmux(
-        # Wait for control-client registration, then burst and exit while
-        # the slow WebSocket sender is still draining the backlog.
-        f'python3 -c \'import sys,time; sys.stdin.readline(); sys.stdout.write("Y"*{payload_len}); '
-        "sys.stdout.flush()'"
-    )
-
-    ws = _FakeWebSocket(inbound=[], send_delay_s=0.005)
     reader_done = asyncio.Event()
     forward_done = asyncio.Event()
+
+    class _BackloggedWebSocket(_FakeWebSocket):
+        async def send_bytes(self, data: bytes) -> None:
+            # Hold the sender until the reader has queued the full burst and EOF.
+            await reader_done.wait()
+            await super().send_bytes(data)
+
+    ws = _BackloggedWebSocket(inbound=[], send_delay_s=0.005)
+    # tmux 3.4 can lose the PTY's final bytes on pane exit. A complete control
+    # stream isolates the bridge's drain contract from that upstream loss.
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        "-c",
+        "import sys; sys.stdout.buffer.write("
+        f"(b'%output %0 ' + b'Y' * 1000 + b'\\n') * {payload_len // 1000}"
+        f" + {ending!r}); sys.stdout.buffer.flush()",
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.STDOUT,
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", AsyncMock(return_value=proc))
+    real_which = shutil.which
+    monkeypatch.setattr(
+        shutil, "which", lambda name: sys.executable if name == "tmux" else real_which(name)
+    )
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge._run_tmux_capture", AsyncMock(return_value=b"")
+    )
+    monkeypatch.setattr(
+        "omnigent.terminals.control_bridge._check_pane_dead_definitive",
+        AsyncMock(return_value=True),
+    )
     task = asyncio.create_task(
         bridge_tmux_control_to_websocket(
             ws,
-            socket_path=str(sock),
-            tmux_target=target,
+            socket_path="unused",
+            tmux_target="main",
             read_only=False,
             reader_done=reader_done,
             forward_done=forward_done,
         )
     )
     try:
-        await _release_burst(sock, target)
-        # Deterministically wait until the reader has queued the whole backlog plus
-        # the EOF sentinel, then until the forwarder has fully drained it — no
-        # arbitrary wall-clock sleep. Timeouts are generous backstops, not timing.
-        await asyncio.wait_for(reader_done.wait(), timeout=20.0)
-        await asyncio.wait_for(forward_done.wait(), timeout=20.0)
-
-        total_y = sum(f.count(b"Y") for f in ws.sent)
-        assert total_y >= payload_len, (
-            f"burst-then-exit dropped the tail: got {total_y} Y bytes of {payload_len} "
-            "— forwarder was cancelled before draining the queued backlog"
+        await asyncio.wait_for(task, timeout=20.0)
+        assert reader_done.is_set()
+        assert forward_done.is_set()
+        total_y = sum(frame.count(b"Y") for frame in ws.sent)
+        assert total_y == payload_len, (
+            f"control stream ended with a dropped tail: got {total_y} of {payload_len} bytes"
         )
-
+        assert ws.close_code == 4404
     finally:
-        await _kill_and_join(sock, task)
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        if proc.returncode is None:
+            proc.kill()
+        await proc.wait()
 
 
 @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
