@@ -86,8 +86,8 @@ def sync_raw_status_context(
 
     :param bridge_dir: Bridge directory shared with the statusLine shim.
     :param last_sig: Signature returned by the previous call, or ``None``.
-    :returns: The new signature to carry forward (unchanged on a miss or
-        an unparseable file, so the next poll retries).
+    :returns: The new signature to carry forward (unchanged on a miss, an
+        unparseable file or a failed write, so the next poll retries).
     """
     raw_path = bridge_dir / CONTEXT_RAW_FILE
     try:
@@ -105,7 +105,12 @@ def sync_raw_status_context(
         return sig
     record = normalize_status_payload(payload)
     if record is not None:
-        _write_record_atomic(bridge_dir, record)
+        try:
+            _write_record_atomic(bridge_dir, record)
+        except OSError:
+            # An optional context update must not abort transcript forwarding.
+            # Keep the old signature so the next poll retries the write.
+            return last_sig
     return sig
 
 

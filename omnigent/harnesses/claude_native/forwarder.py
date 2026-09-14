@@ -127,6 +127,8 @@ _MAX_SEEN_BTW_KEYS = 64
 # task, so elapsed time here means the latency-sensitive lane stopped making
 # progress rather than that a healthy backlog drain simply took a long time.
 _FORWARD_LOOP_STALL_DEADLINE_S = 300.0
+# Persistent bridge failures back off while keeping recovery within 30 seconds.
+_FORWARD_LOOP_FAILURE_BACKOFF_MAX_S = 30.0
 _POST_TIMEOUT_S = 10.0
 _MAX_SEEN_SOURCE_IDS = 2000
 _SUBAGENT_FORWARD_CONCURRENCY = 8
@@ -987,6 +989,25 @@ async def _forward_progress_timeout(
         response_hooks.remove(_response_received)
 
 
+def _forward_loop_delay(poll_interval_s: float, failure_streak: int) -> float:
+    """
+    Seconds to wait before the forward loop's next iteration.
+
+    A clean iteration keeps the normal poll cadence. A failing one backs off
+    exponentially so a fault that does not clear on its own stops spinning at
+    the poll rate, capped so recovery is still prompt once it clears.
+
+    :param poll_interval_s: Normal spacing between transcript polls.
+    :param failure_streak: Consecutive failed iterations; ``0`` when the last
+        iteration completed.
+    :returns: Delay in seconds.
+    """
+    if failure_streak <= 0:
+        return poll_interval_s
+    backoff = poll_interval_s * 2 ** min(failure_streak - 1, 30)
+    return min(backoff, _FORWARD_LOOP_FAILURE_BACKOFF_MAX_S)
+
+
 async def forward_claude_transcript_to_session(
     *,
     base_url: str,
@@ -1087,6 +1108,7 @@ async def forward_claude_transcript_to_session(
             base_url, headers=headers, auth=auth, timeout=timeout
         ) as subagent_client,
     ):
+        failure_streak = 0
         while True:
             try:
                 if subagent_task is not None and subagent_task.done():
@@ -1173,6 +1195,7 @@ async def forward_claude_transcript_to_session(
                         # subagents/ dir, so prior cost entries are dead; drop
                         # them so cost is recomputed fresh for the new session.
                         cost_cache = {}
+                        failure_streak = 0
                         await asyncio.sleep(poll_interval_s)
                         continue
                     rotation = await _maybe_rotate_session_on_fork(
@@ -1216,6 +1239,7 @@ async def forward_claude_transcript_to_session(
                         # subagents/ dir, so prior cost entries are dead; drop
                         # them so cost is recomputed fresh for the new session.
                         cost_cache = {}
+                        failure_streak = 0
                         await asyncio.sleep(poll_interval_s)
                         continue
                     if not external_session_id_mirrored:
@@ -1378,13 +1402,19 @@ async def forward_claude_transcript_to_session(
                     extra={"session_id": session_id},
                 )
             except Exception:
-                _logger.exception(
-                    "Claude transcript forwarder loop failed; session=%s",
-                    session_id,
-                    extra={"session_id": session_id},
-                )
+                failure_streak += 1
+                # Report at doubling intervals so persistent faults do not flood the logs.
+                if failure_streak & (failure_streak - 1) == 0:
+                    _logger.exception(
+                        "Claude transcript forwarder loop failed (%d consecutive); session=%s",
+                        failure_streak,
+                        session_id,
+                        extra={"session_id": session_id},
+                    )
+            else:
+                failure_streak = 0
             try:
-                await asyncio.sleep(poll_interval_s)
+                await asyncio.sleep(_forward_loop_delay(poll_interval_s, failure_streak))
             except asyncio.CancelledError:
                 await _cancel_subagent_forward_task(subagent_task)
                 raise
