@@ -826,6 +826,11 @@ _BUILTIN_CONTRIBUTION = HarnessContribution(
         # The bare vendor name resolves to the native wrap, mirroring
         # ``opencode`` -> ``opencode-native``. Devin's ACP path keeps its own
         # id (``devin-acp``) so both stay addressable.
+        # Known break (accepted): a session persisted before this cutover with
+        # harness ``devin`` (which meant ACP then) now resolves to the native
+        # wrap on resume. Not fixable by a static alias — bare ``devin`` must
+        # mean native for a fresh launch yet ACP for an old session — and the ACP
+        # harness shipped only recently, so pre-cutover ACP sessions are thin.
         "devin": "devin-native",
         "github-copilot": "copilot",
         "google-antigravity": "antigravity",

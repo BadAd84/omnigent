@@ -1745,12 +1745,11 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "Qwen Code",
         "Goose",
         # Devin's NATIVE row (devin-native) renders in the slot its former builtin
-        # ACP row held, so this ordering is unchanged by that migration. Its ACP
-        # harness is still shipped, now labelled "Devin (ACP)", and joins the
-        # builtin ACP CLI rows (ACP_CLI_HARNESSES) that follow — sorted by id,
-        # before the non-ACP harnesses.
+        # ACP row held. The ACP harness is deprecated: it stays resolvable via
+        # `--harness devin-acp` but is no longer offered here, so native Devin is
+        # the sole "Devin" row. The remaining builtin ACP CLI rows follow, sorted
+        # by id, before the non-ACP harnesses.
         "Devin",
-        "Devin (ACP)",
         "Grok Build",
         "Jcode",
         "Copilot",
@@ -1841,10 +1840,10 @@ def test_overview_shows_one_row_when_acp_agent_shadows_builtin(
     # "Grok Build", so its absence proves the row was dropped rather than
     # rendered alongside the user's.
     assert "Grok Build" not in names, f"builtin grok row should be shadowed, got {names}"
-    # Devin is unaffected by a collision elsewhere: its native row and its
-    # separately-keyed ACP row both stay.
+    # Devin is unaffected by a collision elsewhere: its native row stays. The ACP
+    # row is deprecated, so it is not offered here regardless of this collision.
     assert names.count("Devin") == 1, f"expected the native Devin row, got {names}"
-    assert "Devin (ACP)" in names
+    assert "Devin (ACP)" not in names
     # The surviving row is the user's: its status carries the configured command,
     # not the builtin's "own auth" label.
     # (the status is width-capped, so match its head rather than the full command)
@@ -2153,17 +2152,16 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
         ("8", "_manage_qwen_harness"),
         ("9", "_manage_goose_harness"),
         # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
-        # row used to hold. 11-13 are the builtin ACP CLI rows (Devin (ACP),
-        # Grok Build, Jcode; sorted by id), so every row after them sits one
-        # lower than before devin-native landed.
+        # row used to hold. The ACP path is deprecated (not offered), so 11-12
+        # are the remaining builtin ACP CLI rows (Grok Build, Jcode; sorted by
+        # id); every row after them sits one lower.
         ("10", "_manage_devin_harness"),
         ("11", "_show_acp_cli_harness"),
         ("12", "_show_acp_cli_harness"),
-        ("13", "_show_acp_cli_harness"),
-        ("14", "_manage_copilot_harness"),
-        ("15", "_manage_kiro_harness"),
-        ("16", "_manage_kimi_harness"),
-        ("18", "_add_acp_agent"),
+        ("13", "_manage_copilot_harness"),
+        ("14", "_manage_kiro_harness"),
+        ("15", "_manage_kimi_harness"),
+        ("17", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(

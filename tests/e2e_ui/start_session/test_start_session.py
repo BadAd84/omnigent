@@ -485,6 +485,12 @@ async def _register_common_routes(
             await route.continue_()
 
     await page.route("**/v1/hosts", handle_hosts)
+    # Fake hosts have no backend probes; tests with catalogs or git repos override these.
+    await page.route(
+        "**/v1/hosts/*/harnesses/*/model-options",
+        lambda route: route.fulfill(json={"models": []}),
+    )
+    await page.route(_WORKTREES_RE, lambda route: route.fulfill(json={"data": []}))
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
@@ -1426,10 +1432,12 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
             # NewChat mounts with cached Mac-only data and completes another
             # Mac-only request. Neither snapshot may silently replace the saved
             # VM with the local default.
-            requests_before_open = route_state["requests"]
-            await page.get_by_test_id("new-chat-button").click()
+            async with page.expect_response(
+                lambda response: response.url.endswith("/v1/hosts")
+            ) as landing_hosts:
+                await page.get_by_test_id("new-chat-button").click()
+            await (await landing_hosts.value).finished()
             chip = page.get_by_test_id("new-chat-landing-host-chip")
-            await _wait_until(lambda: route_state["requests"] > requests_before_open)
             await expect(chip).to_have_attribute("aria-label", re.compile("Choose host"))
 
             # A later host refresh reports the continuously preferred VM again.
@@ -1867,7 +1875,10 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
                 '[data-testid^="new-chat-landing-agent-effort-"][aria-checked="true"]'
             )
             await expect(model).to_contain_text("Harness default")
-            await expect(effort).to_contain_text("Default")
+            await expect(effort).to_have_count(0)
+            await expect(
+                page.get_by_role("menuitemcheckbox", name="Default", exact=True)
+            ).to_have_count(0)
 
             # Model and effort picks commit immediately using the live host catalog.
             await page.get_by_role("menuitemcheckbox", name="Opus 4.8", exact=True).click()
@@ -3198,6 +3209,21 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             create_bodies: list[dict[str, Any]] = []
             await _register_common_routes(
                 page, created_session_id=session_id, create_bodies=create_bodies
+            )
+            await page.route(
+                _WORKTREES_RE,
+                lambda route: route.fulfill(
+                    json={
+                        "data": [
+                            {
+                                "path": "/work/repo",
+                                "branch": "main",
+                                "is_main": True,
+                                "detached": False,
+                            }
+                        ]
+                    }
+                ),
             )
             await page.add_init_script(
                 f"""window.localStorage.setItem(

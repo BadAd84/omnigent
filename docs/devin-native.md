@@ -3,17 +3,22 @@
 `omnigent devin` wraps the resident **Devin CLI** TUI (Cognition) in a
 runner-owned tmux pane and mirrors it into an Omnigent conversation.
 
-It sits **alongside** Devin's ACP harness, which is still shipped:
+It **replaces** Devin's ACP harness as the offered Devin. The ACP path
+(`devin-acp`) is **deprecated**: it stays registered and resolvable via
+`--harness devin-acp` (and for existing sessions), but is no longer offered in
+`omnigent config` setup, so native Devin is the sole "Devin" row.
 
 | Harness id | What it is | Notable |
 |---|---|---|
-| `devin-native` | This wrap: the real Devin TUI in a tmux pane, mirrored into Chat | Policy enforcement, approval cards, model + effort, resume, cost |
-| `devin-acp` | `devin acp` through the generic ACP executor + `omnigent.inner.devin` | **Surfaces Devin's sub-agents as child sessions** — the native wrap does not |
+| `devin-native` | This wrap: the real Devin TUI in a tmux pane, mirrored into Chat | Policy enforcement, approval cards, model + effort, resume, cost, sub-agents as child sessions |
+| `devin-acp` (deprecated) | `devin acp` through the generic ACP executor + `omnigent.inner.devin` | Reachable via `--harness devin-acp`; not offered in setup |
 
 The bare spelling `devin` canonicalizes to `devin-native` (as `opencode` does to
 `opencode-native`), so `--harness devin` and `omnigent devin` both land on the
 native wrap; the ACP path keeps its own id, `--harness devin-acp`. A
-user-configured `acp:devin` agent is unaffected.
+user-configured `acp:devin` agent is unaffected. Known break (accepted): a
+session persisted before this cutover with harness `devin` (which meant ACP
+then) resumes on the native wrap, not ACP.
 
     curl -fsSL https://cli.devin.ai/install.sh | bash
     devin auth login
