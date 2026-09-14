@@ -64,10 +64,7 @@ from omnigent.harness_plugins import (
     NativeCodingAgent,
 )
 from omnigent.host.frames import (
-    HARNESS_NOT_CONFIGURED_ERROR_CODE as _HARNESS_NOT_CONFIGURED_ERROR_CODE,
-)
-from omnigent.host.frames import (
-    WORKSPACE_MISSING_ERROR_CODE as _WORKSPACE_MISSING_ERROR_CODE,
+    SAFE_LAUNCH_REFUSAL_CODES as _SAFE_LAUNCH_REFUSAL_CODES,
 )
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
@@ -4448,16 +4445,6 @@ def _require_codex_approval_mode_forward(
         )
 
 
-# Launch refusals a host reports deterministically (the same safe categorical
-# codes as omnigent.host.frames.classify_launch_refusal). The turn still fails
-# with a structured error card, but remediation is user-side (recreate the
-# workspace, run setup), so their failed edge is logged as a categorical
-# WARNING instead of the generic ERROR turn-failure funnel.
-_EXPECTED_LAUNCH_REFUSAL_CODES = frozenset(
-    {_HARNESS_NOT_CONFIGURED_ERROR_CODE, _WORKSPACE_MISSING_ERROR_CODE}
-)
-
-
 def _publish_status(
     session_id: str,
     status: str,
@@ -4562,11 +4549,10 @@ def _publish_status(
         # for <id>: <detail>" shape so existing detail-matching stays valid.
         origin = failure_origin or "unattributed"
         failure_code = error.code if error is not None else "none"
-        if error is not None and error.code in _EXPECTED_LAUNCH_REFUSAL_CODES:
-            # Expected categorical refusal (deleted workspace, unconfigured
-            # harness): the user gets a structured error card and remediation
-            # is theirs, so keep it out of the ERROR-level turn-failure funnel
-            # that error dashboards attribute to server defects.
+        if error is not None and error.code in _SAFE_LAUNCH_REFUSAL_CODES:
+            # Expected user-remediable refusal (deleted workspace, unconfigured
+            # harness) — keep it out of the ERROR turn-failure funnel. Keys off
+            # the classified ErrorDetail.code, covering older hosts' fallback.
             _logger.warning(
                 "session turn refused for %s (%s): %s",
                 session_id,
