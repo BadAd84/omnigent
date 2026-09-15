@@ -187,7 +187,13 @@ vi.mock("@/hooks/useHostFilesystem", () => ({
 }));
 // Mocked so it doesn't hit authenticatedFetch (which would pollute the
 // call list the create-flow assertions index into positionally).
-vi.mock("@/hooks/useHostWorktrees", () => ({ useHostWorktrees: vi.fn() }));
+vi.mock("@/hooks/useHostWorktrees", () => ({
+  useHostWorktrees: vi.fn(),
+  hostWorktreesQueryOptions: (hostId: string, repoPath: string) => ({
+    queryKey: ["host-worktrees", hostId, repoPath],
+    queryFn: async () => [],
+  }),
+}));
 vi.mock("@/hooks/useDirectorySessions", () => ({
   useDirectorySessions: vi.fn(),
 }));
@@ -1123,9 +1129,23 @@ function setupLandingMocks() {
     error: null,
     isPlaceholderData: false,
   } as unknown as ReturnType<typeof useHostFilesystem>);
-  useHostWorktreesMock.mockReturnValue({
-    data: undefined,
-  } as unknown as ReturnType<typeof useHostWorktrees>);
+  useHostWorktreesMock.mockImplementation(
+    (_hostId, repoPath) =>
+      (repoPath === null
+        ? DISABLED_QUERY_RESULT
+        : {
+            ...SUCCESS_QUERY_STATE,
+            data: [
+              {
+                path: repoPath,
+                branch: "main",
+                is_main: true,
+                detached: false,
+                remote_provider: "github",
+              },
+            ],
+          }) as ReturnType<typeof useHostWorktrees>,
+  );
   mockHosts([host("online")]);
   mockModelQueries((harness) =>
     harness === "codex-native" ? CODEX_MODEL_OPTIONS_RESULT : CLAUDE_MODEL_OPTIONS_RESULT,
@@ -2351,7 +2371,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     const { unmount } = renderLanding();
     fireEvent.pointerDown(screen.getByTestId("new-chat-landing-workspace-chip"), { button: 0 });
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
-    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-recent-1"));
+    fireEvent.click(screen.getByTestId("recent-workspace-select-1"));
     expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveAttribute(
       "title",
       "/work/second",
@@ -2383,7 +2403,7 @@ describe("NewChatLandingScreen cached picker preview", () => {
     const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
     fireEvent.pointerDown(workspace, { button: 0 });
     fireEvent.click(workspace);
-    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-recent-1"));
+    fireEvent.click(screen.getByTestId("recent-workspace-select-1"));
     expect(workspace).toBeEnabled();
     expect(workspace).toHaveTextContent("second");
     expect(readNewChatWorkspaceCache(key)).toBeNull();
@@ -2838,7 +2858,15 @@ describe("NewChatLandingScreen", () => {
       },
     );
     useHostWorktreesMock.mockReturnValue({
-      data: [{ path: "/Users/corey/repo", branch: "main", is_main: true, detached: false }],
+      data: [
+        {
+          path: "/Users/corey/repo",
+          branch: "main",
+          is_main: true,
+          detached: false,
+          remote_provider: "github",
+        },
+      ],
     } as unknown as ReturnType<typeof useHostWorktrees>);
     renderLanding();
 
@@ -3033,7 +3061,7 @@ describe("NewChatLandingScreen", () => {
     expect(notices.parentElement).toBe(composerSurface.parentElement);
   });
 
-  it("keeps the worktree selector beside the directory for a non-git workspace", () => {
+  it("hides the worktree selector for a non-git workspace", () => {
     useHostWorktreesMock.mockReturnValue({
       data: [],
       isPlaceholderData: false,
@@ -3041,11 +3069,31 @@ describe("NewChatLandingScreen", () => {
     renderLanding();
 
     const header = screen.getByTestId("new-chat-landing-workspace-controls");
-    const worktree = screen.getByTestId("new-chat-landing-branch-chip");
     expect(header).toContainElement(screen.getByTestId("new-chat-landing-workspace-chip"));
-    expect(header).toContainElement(worktree);
-    expect(worktree).toBeDisabled();
+    expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
   });
+
+  it.each([undefined, null, "other"] as const)(
+    "hides the worktree selector without verified GitHub metadata (%s)",
+    (remoteProvider) => {
+      useHostWorktreesMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: [
+          {
+            path: "/Users/corey/repo",
+            branch: "main",
+            is_main: true,
+            detached: false,
+            ...(remoteProvider === undefined ? {} : { remote_provider: remoteProvider }),
+          },
+        ],
+      } as unknown as ReturnType<typeof useHostWorktrees>);
+      renderLanding();
+
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toBeVisible();
+      expect(screen.queryByTestId("new-chat-landing-branch-chip")).toBeNull();
+    },
+  );
 
   it("uses the host's advertised display name in the landing picker", () => {
     mockClaudeModels([
@@ -3442,8 +3490,8 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(workspace);
     const recentsMenu = screen.getByRole("dialog");
     expect(recentsMenu).toHaveClass("w-[31rem]", "p-1.5");
-    const firstRecent = screen.getByTestId("new-chat-landing-workspace-recent-0");
-    const secondRecent = screen.getByTestId("new-chat-landing-workspace-recent-1");
+    const firstRecent = screen.getByTestId("recent-workspace-select-0");
+    const secondRecent = screen.getByTestId("recent-workspace-select-1");
     expect(firstRecent).toHaveClass("py-1.5");
     expect(firstRecent).toHaveTextContent("/Users/corey/repo");
     expect(secondRecent).toHaveTextContent("/Users/corey/other");
@@ -3457,6 +3505,7 @@ describe("NewChatLandingScreen", () => {
 
     fireEvent.pointerDown(workspace, { button: 0 });
     fireEvent.click(workspace);
+    expect(screen.getByTestId("new-chat-landing-workspace-open-folder-icon")).toBeVisible();
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
     const workspacePicker = screen.getByTestId("workspace-picker");
     expect(workspacePicker).toBeTruthy();
@@ -3465,6 +3514,26 @@ describe("NewChatLandingScreen", () => {
     );
     expect(screen.getByTestId("workspace-picker-select")).toBeTruthy();
     expect(screen.getByTestId("workspace-picker-cancel")).toBeTruthy();
+  });
+
+  it("browses a recent folder provisionally without selecting it", () => {
+    localStorage.setItem(
+      RECENT_KEY,
+      JSON.stringify({ host_1: ["/Users/corey/repo", "/Users/corey/other"] }),
+    );
+    renderLanding();
+
+    const workspace = screen.getByTestId("new-chat-landing-workspace-chip");
+    fireEvent.click(workspace);
+    fireEvent.click(screen.getByTestId("recent-workspace-browse-1"));
+
+    expect(screen.getByTestId("workspace-picker")).toBeVisible();
+    expect(screen.getByTestId("workspace-picker-path-input")).toHaveValue("/Users/corey/other");
+    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
+
+    fireEvent.click(screen.getByTestId("workspace-picker-cancel"));
+    expect(screen.queryByTestId("workspace-picker")).toBeNull();
+    expect(workspace).toHaveAttribute("title", "/Users/corey/repo");
   });
 
   it("separates the zero-session import action from an empty notice slot", () => {
@@ -3565,7 +3634,15 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByText("legacy")).toBeNull();
 
     worktreeResult = {
-      data: [{ path: "/Users/corey/repo", branch: "main", is_main: true, detached: false }],
+      data: [
+        {
+          path: "/Users/corey/repo",
+          branch: "main",
+          is_main: true,
+          detached: false,
+          remote_provider: "github",
+        },
+      ],
       isPlaceholderData: false,
     } as unknown as ReturnType<typeof useHostWorktrees>;
     fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
@@ -4943,12 +5020,19 @@ describe("NewChatLandingScreen", () => {
     // The seeded repo has one linked worktree; the main tree is filtered out.
     useHostWorktreesMock.mockReturnValue({
       data: [
-        { path: "/Users/corey/repo", branch: "main", is_main: true, detached: false },
+        {
+          path: "/Users/corey/repo",
+          branch: "main",
+          is_main: true,
+          detached: false,
+          remote_provider: "github",
+        },
         {
           path: "/Users/corey/repo-worktrees/feature-x",
           branch: "feature/x",
           is_main: false,
           detached: false,
+          remote_provider: "github",
         },
       ],
     } as unknown as ReturnType<typeof useHostWorktrees>);
@@ -5015,6 +5099,7 @@ describe("NewChatLandingScreen", () => {
           branch: "feature/x",
           is_main: false,
           detached: false,
+          remote_provider: "github",
         },
       ],
     } as unknown as ReturnType<typeof useHostWorktrees>);
@@ -5065,12 +5150,19 @@ describe("NewChatLandingScreen", () => {
     );
     useHostWorktreesMock.mockReturnValue({
       data: [
-        { path: "/Users/corey/repo", branch: "main", is_main: true, detached: false },
+        {
+          path: "/Users/corey/repo",
+          branch: "main",
+          is_main: true,
+          detached: false,
+          remote_provider: "github",
+        },
         {
           path: "/Users/corey/repo-worktrees/review",
           branch: null,
           is_main: false,
           detached: true,
+          remote_provider: "github",
         },
       ],
       isPlaceholderData: false,
@@ -5117,6 +5209,7 @@ describe("NewChatLandingScreen", () => {
           branch: "feature/x",
           is_main: false,
           detached: false,
+          remote_provider: "github",
         },
         {
           path: "/Users/corey/repo-worktrees/bugfix-login",
