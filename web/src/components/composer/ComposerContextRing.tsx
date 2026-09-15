@@ -38,7 +38,7 @@ export function ComposerContextRing({
       <TooltipTrigger asChild>
         <span
           data-testid="composer-context-ring"
-          className={cn("flex shrink-0 items-center gap-1 text-muted-foreground", className)}
+          className={cn("flex shrink-0 items-center text-muted-foreground", className)}
           aria-label={`${usedPct}% of context used`}
         >
           {/* Tight stroke bounds keep the visible icon-to-label gap consistent. */}
@@ -59,13 +59,12 @@ export function ComposerContextRing({
               />
             )}
           </svg>
-          <span className="text-sm tabular-nums" aria-hidden="true">
-            {usedPct}%
-          </span>
         </span>
       </TooltipTrigger>
       <TooltipContent side="top" className="max-w-44 text-center text-sm">
-        <p className="tabular-nums">{usedPct}% of context used.</p>
+        <p className="tabular-nums">
+          {tokensUsed.toLocaleString()} / {contextWindow.toLocaleString()} tokens ({usedPct}% used)
+        </p>
       </TooltipContent>
     </Tooltip>
   );
