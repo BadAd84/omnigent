@@ -230,15 +230,22 @@ def _remote_hostname(remote_url: str) -> str | None:
     if candidate.startswith(("/", "./", "../", "~/")) or _WINDOWS_ABSOLUTE.match(candidate):
         return ""
 
-    parsed = urlsplit(candidate)
+    if candidate.startswith("file:"):
+        return ""
+
+    if "://" not in candidate:
+        scp = _SCP_REMOTE.match(candidate)
+        if scp:
+            return scp.group("host").lower()
+
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return None
     if parsed.scheme == "file":
         return ""
     if parsed.scheme:
         return parsed.hostname.lower() if parsed.hostname else None
-
-    scp = _SCP_REMOTE.match(candidate)
-    if scp:
-        return scp.group("host").lower()
     return None
 
 
@@ -285,7 +292,10 @@ def list_worktrees(*, repo_path: str) -> list[WorktreeInfo]:
         inside a git work tree, or if ``git worktree list`` fails.
     """
     repo_root = _main_work_tree(repo_path)
-    remote_provider = _remote_provider(repo_root)
+    try:
+        remote_provider = _remote_provider(repo_root)
+    except WorktreeError:
+        remote_provider = None
     result = _run_git(["worktree", "list", "--porcelain"], cwd=repo_root)
     if result.returncode != 0:
         raise _git_error("git worktree list failed", result)

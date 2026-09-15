@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+import omnigent.host.git_worktree as git_worktree_module
 from omnigent.host.git_worktree import (
     CreatedWorktree,
     WorktreeError,
@@ -385,6 +386,7 @@ def test_list_worktrees_returns_main_first(git_repo: Path) -> None:
         "https://github.com/omnigent-ai/omnigent.git",
         "ssh://git@github.com/omnigent-ai/omnigent.git",
         "git@github.com:omnigent-ai/omnigent.git",
+        "github.com:omnigent-ai/omnigent.git",
     ],
 )
 def test_list_worktrees_classifies_verified_github_remotes(
@@ -417,6 +419,36 @@ def test_list_worktrees_keeps_unverified_github_like_hosts_unknown(
     _git(git_repo, "remote", "add", "origin", remote_url)
     result = list_worktrees(repo_path=str(git_repo))
     assert {worktree.remote_provider for worktree in result} == {None}
+
+
+def test_list_worktrees_ignores_remote_metadata_read_failure(
+    git_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Optional remote metadata failures do not hide usable worktrees."""
+    original_run_git = git_worktree_module._run_git
+
+    def run_git(args: list[str], *, cwd: str) -> subprocess.CompletedProcess[str]:
+        if args[:2] == ["config", "--get-regexp"]:
+            raise WorktreeError("remote metadata unavailable")
+        return original_run_git(args, cwd=cwd)
+
+    monkeypatch.setattr(git_worktree_module, "_run_git", run_git)
+
+    result = list_worktrees(repo_path=str(git_repo))
+    assert len(result) == 1
+    assert result[0].path == str(git_repo)
+    assert result[0].remote_provider is None
+
+
+def test_list_worktrees_skips_malformed_remote_before_valid_github(
+    git_repo: Path,
+) -> None:
+    """One malformed remote does not prevent classifying later remotes."""
+    _git(git_repo, "remote", "add", "broken", "https://[invalid/repo")
+    _git(git_repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
+
+    result = list_worktrees(repo_path=str(git_repo))
+    assert {worktree.remote_provider for worktree in result} == {"github"}
 
 
 def test_list_worktrees_includes_linked(git_repo: Path) -> None:
