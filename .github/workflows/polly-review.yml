@@ -1,5 +1,5 @@
 name: Polly AI Review
-run-name: Polly empty-output guard and failure-artifact canary
+run-name: Polly failure-stage artifact canary
 'on':
   workflow_dispatch: {}
 permissions:
@@ -15,24 +15,30 @@ jobs:
         scenario:
         - empty
         - narration
+        - secret-scan
+        - posting
     env:
       CANARY_SCENARIO: ${{ matrix.scenario }}
     steps:
     - name: Check out exact candidate
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: 563754a9b3423298d515f8e85992ced34356b10b
+        ref: d7e239f7bbc657d4b23acabb9d69caf3dc35160c
         persist-credentials: false
     - name: Prepare synthetic process output
       run: "python3 <<'SETUP'\nimport os, pathlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'polly-fake-command'\n\
         root.mkdir()\n(root / 'uv').write_text(\"#!/usr/bin/env python3\\nimport os, sys\\nfrom pathlib\
         \ import Path\\nlogs = Path.home() / '.omnigent' / 'logs' / 'runner'\\nlogs.mkdir(parents=True,\
         \ exist_ok=True)\\n(logs / 'canary.log').write_text('Synthetic process log: canary-fake-key https://canary.invalid')\\\
-        nprint('Synthetic stderr: canary-fake-key', file=sys.stderr)\\nif os.environ['CANARY_SCENARIO']\
-        \ == 'narration':\\n    print('Waiting for reviewers. https://canary.invalid')\\n\")\n(root /\
-        \ 'uv').chmod(0o755)\nwith open(os.environ['GITHUB_PATH'], 'a') as path:\n    path.write(str(root)\
-        \ + '\\n')\npathlib.Path('/tmp/review_prompt.txt').write_text('Synthetic test; no model calls\
-        \ or comments.')\nSETUP\n"
+        nprint('Synthetic stderr: canary-fake-key', file=sys.stderr)\\nscenario = os.environ['CANARY_SCENARIO']\\\
+        nif scenario != 'empty':\\n    print('Preamble: canary-fake-key https://canary.invalid')\\nif\
+        \ scenario in {'secret-scan', 'posting'}:\\n    print('<!-- POLLY_REVIEW_START -->')\\n    print('##\
+        \ Summary')\\n    print('Synthetic review.')\\nif scenario == 'secret-scan':\\n    print('canary-fake-key')\\\
+        n\")\n(root / 'gh').write_text(\"#!/usr/bin/env python3\\nimport sys\\nassert sys.argv[1:3] ==\
+        \ ['pr', 'comment'], sys.argv\\nprint('Forced posting failure', file=sys.stderr)\\nsys.exit(42)\\\
+        n\")\nfor name in ('uv', 'gh'):\n    (root / name).chmod(0o755)\nwith open(os.environ['GITHUB_PATH'],\
+        \ 'a') as path:\n    path.write(str(root) + '\\n')\npathlib.Path('/tmp/review_prompt.txt').write_text('Synthetic\
+        \ test; no model calls or comments.')\nSETUP\n"
     - name: Run Polly review
       id: polly
       env:
@@ -43,25 +49,52 @@ jobs:
         \ ephemeral run, no persistent session state.\nuv run omnigent run examples/polly/ \\\n  --harness\
         \ \"$OMNIGENT_POLLY_HARNESS\" --model \"$OMNIGENT_POLLY_MODEL\" \\\n  -p \"$prompt\" \\\n  --no-session\
         \ \\\n  2>polly-stderr.log \\\n  | tee /tmp/polly_output.txt \\\n  || { echo \"::warning::Polly\
-        \ review exited non-zero\"; cat polly-stderr.log; }\n\n# Strip coordination text using a review\
-        \ marker or markdown heading.\n# Missing review content fails the step so diagnostic logs are\
-        \ saved.\npython3 -c \"\nimport re, pathlib\nraw = pathlib.Path('/tmp/polly_output.txt').read_text()\n\
-        sentinel = '<!-- POLLY_REVIEW_START -->'\n# Headless output can include earlier drafts before\
-        \ the final review.\n# Only standalone marker lines separate reviews; inline quotes do not.\n\
-        markers = list(re.finditer(r'^' + re.escape(sentinel) + r'$', raw, re.MULTILINE))\nif markers:\n\
-        \    cleaned = raw[markers[-1].end():].lstrip('\\n')\nelse:\n    m = re.search(r'^#{1,6} ', raw,\
-        \ re.MULTILINE)\n    cleaned = raw[m.start():] if m else ''\nif not cleaned.strip():\n    raise\
-        \ SystemExit('::error::Polly produced no publishable review; see the failure logs artifact.')\n\
-        pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)\n\"\n\n# Use a collision-resistant random\
-        \ delimiter so model output\n# containing \"REVIEW_EOF\" cannot truncate the output.\ndelim=\"\
-        REVIEW_$(openssl rand -hex 8)\"\necho \"review_text<<${delim}\" >> \"$GITHUB_OUTPUT\"\n# Cap at\
-        \ 60 KB \u2014 GitHub comment body limit is ~65 KB.\nhead -c 61440 /tmp/polly_output.txt >> \"\
-        $GITHUB_OUTPUT\"\necho \"${delim}\" >> \"$GITHUB_OUTPUT\"\n"
-    - name: Posting handoff must stay empty
+        \ review exited non-zero\"; cat polly-stderr.log; }\n\n# Keep raw stdout for failures, including\
+        \ secret-scan and posting errors.\n# Write publishable content separately using a review marker\
+        \ or heading.\n# Missing review content fails the step so diagnostic logs are saved.\npython3\
+        \ -c \"\nimport re, pathlib\nraw = pathlib.Path('/tmp/polly_output.txt').read_text()\nsentinel\
+        \ = '<!-- POLLY_REVIEW_START -->'\n# Headless output can include earlier drafts before the final\
+        \ review.\n# Only standalone marker lines separate reviews; inline quotes do not.\nmarkers = list(re.finditer(r'^'\
+        \ + re.escape(sentinel) + r'$', raw, re.MULTILINE))\nif markers:\n    cleaned = raw[markers[-1].end():].lstrip('\\\
+        n')\nelse:\n    m = re.search(r'^#{1,6} ', raw, re.MULTILINE)\n    cleaned = raw[m.start():] if\
+        \ m else ''\nif not cleaned.strip():\n    raise SystemExit('::error::Polly produced no publishable\
+        \ review; see the failure logs artifact.')\npathlib.Path('/tmp/polly_review.txt').write_text(cleaned)\n\
+        \"\n\n# Use a collision-resistant random delimiter so model output\n# containing \"REVIEW_EOF\"\
+        \ cannot truncate the output.\ndelim=\"REVIEW_$(openssl rand -hex 8)\"\necho \"review_text<<${delim}\"\
+        \ >> \"$GITHUB_OUTPUT\"\n# Cap at 60 KB \u2014 GitHub comment body limit is ~65 KB.\nhead -c 61440\
+        \ /tmp/polly_review.txt >> \"$GITHUB_OUTPUT\"\necho \"${delim}\" >> \"$GITHUB_OUTPUT\"\n"
+    - name: Scan review output for secrets before posting
+      env:
+        LLM_API_KEY: canary-fake-key
+      run: "set -euo pipefail\n# Abort if Polly's output contains the literal LLM API key \u2014 this\n\
+        # catches prompt-injection attacks that trick Polly into echoing the\n# secret into the PR comment.\n\
+        if [ -n \"$LLM_API_KEY\" ] && grep -qF \"$LLM_API_KEY\" /tmp/polly_review.txt 2>/dev/null; then\n\
+        \  echo \"::error::Review output contains LLM_API_KEY \u2014 aborting post to prevent secret exfiltration.\"\
+        \n  exit 1\nfi\n"
+    - name: Post review comment
+      if: steps.polly.outputs.review_text != ''
+      env:
+        REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
+        REPO: synthetic/repo
+        PR_NUMBER: '1'
+        HEAD_SHA: d7e239f7bbc657d4b23acabb9d69caf3dc35160c
+        RUN_URL: https://example.test/synthetic
+      run: "set -euo pipefail\n\n# Build the comment body safely \u2014 REVIEW_TEXT is passed via env\n\
+        # (not expression interpolation) to avoid expression injection.\n{\n  echo \"<!-- polly-review-bot\
+        \ -->\"\n  echo \"<!-- polly-reviewed-sha: ${HEAD_SHA} -->\"\n  echo \"## <img src=\\\"https://raw.githubusercontent.com/omnigent-ai/omnigent/main/docs/images/omnigent-logo.svg\\\
+        \" alt=\\\"\\\" height=\\\"20\\\" valign=\\\"middle\\\" /> Polly AI Review\"\n  echo \"\"\n  echo\
+        \ \"$REVIEW_TEXT\"\n  echo \"\"\n  echo \"---\"\n  echo \"<sub>Automated review by Polly \xB7\
+        \ [workflow run](${RUN_URL})</sub>\"\n} > /tmp/comment.md\n\n# Post a fresh comment for every\
+        \ review run, so each trigger (push,\n# `/review` comment, or maintainer approval) is visible\
+        \ in the thread\n# and notifies watchers \u2014 no in-place upsert of a prior comment.\ngh pr\
+        \ comment \"$PR_NUMBER\" --repo \"$REPO\" --body-file /tmp/comment.md\necho \"Created new comment\"\
+        \n"
+    - name: Check posting handoff
       if: always()
       env:
         REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
-      run: test -z "$REVIEW_TEXT"
+      run: "case \"$CANARY_SCENARIO\" in\n  empty|narration) test -z \"$REVIEW_TEXT\" ;;\n  *) test -n\
+        \ \"$REVIEW_TEXT\"; test -f /tmp/polly_review.txt ;;\nesac\n"
     - name: Prepare Polly failure diagnostics
       if: failure()
       env:
@@ -69,18 +102,19 @@ jobs:
         GATEWAY_BASE_URL: https://canary.invalid
       run: "python3 <<'PY'\nimport os, pathlib\ndestination = pathlib.Path('/tmp/polly-diagnostics')\n\
         destination.mkdir(parents=True, exist_ok=True)\nsources = {\n    'polly-stderr.log': pathlib.Path('polly-stderr.log'),\n\
-        \    'polly-output.txt': pathlib.Path('/tmp/polly_output.txt'),\n}\nlogs = pathlib.Path.home()\
-        \ / '.omnigent' / 'logs'\nfor source in logs.rglob('*.log'):\n    sources['process-logs/' + str(source.relative_to(logs))]\
-        \ = source\nfor name, source in sources.items():\n    if not source.is_file():\n        continue\n\
-        \    text = source.read_text(errors='replace')\n    for key in ('LLM_API_KEY', 'GATEWAY_BASE_URL'):\n\
-        \        value = os.environ.get(key)\n        if value:\n            text = text.replace(value,\
-        \ '[REDACTED]')\n    target = destination / name\n    target.parent.mkdir(parents=True, exist_ok=True)\n\
-        \    target.write_text(text)\nPY\n"
+        \    'polly-output.txt': pathlib.Path('/tmp/polly_output.txt'),\n    'polly-review.txt': pathlib.Path('/tmp/polly_review.txt'),\n\
+        }\nlogs = pathlib.Path.home() / '.omnigent' / 'logs'\nfor source in logs.rglob('*.log'):\n   \
+        \ sources['process-logs/' + str(source.relative_to(logs))] = source\nfor name, source in sources.items():\n\
+        \    if not source.is_file():\n        continue\n    text = source.read_text(errors='replace')\n\
+        \    for key in ('LLM_API_KEY', 'GATEWAY_BASE_URL'):\n        value = os.environ.get(key)\n  \
+        \      if value:\n            text = text.replace(value, '[REDACTED]')\n    target = destination\
+        \ / name\n    target.parent.mkdir(parents=True, exist_ok=True)\n    target.write_text(text)\n\
+        PY\n"
     - name: Upload logs on failure
       if: failure()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: polly-empty-output-${{ matrix.scenario }}-${{ github.run_id }}
+        name: polly-failure-${{ matrix.scenario }}-${{ github.run_id }}
         path: /tmp/polly-diagnostics/
         retention-days: 7
         if-no-files-found: ignore
