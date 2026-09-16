@@ -291,7 +291,7 @@ jobs:
         rows = report['sessions']
         checks = report['checks']
         diff = pathlib.Path('/tmp/pr_diff.txt').read_text().strip()
-        handoffs = []
+        handoffs = {}
         for row in rows:
             if row['parent']:
                 continue
@@ -302,8 +302,8 @@ jobs:
                         arguments = json.loads(arguments)
                     payload = arguments.get('args') or {}
                     if isinstance(payload, dict) and payload.get('purpose') == 'review':
-                        handoffs.append(diff in str(payload.get('input', '')))
-        checks['both_reviewers_received_full_diff'] = len(handoffs) == 2 and all(handoffs)
+                        handoffs[(arguments.get('agent'), arguments.get('title'), payload.get('input', ''))] = diff in str(payload.get('input', ''))
+        checks['both_reviewers_received_full_diff'] = len(handoffs) == 2 and all(handoffs.values())
         checks['process_exited_zero'] = report['process'].get('returncode') == 0
         checks['fable_brain_completed'] = any(not row['parent'] and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
         checks['fable_claude_reviewer_completed'] = any(row['worker'] == 'claude_code' and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
