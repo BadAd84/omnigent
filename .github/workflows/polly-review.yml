@@ -79,7 +79,7 @@ jobs:
         # this dir's node_modules empty.
         CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
         mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-        npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.273
+        npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
         node node_modules/@anthropic-ai/claude-code/install.cjs
         echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
     - name: Install Codex CLI
@@ -332,7 +332,7 @@ jobs:
     - uses: ./.github/actions/setup-pnpm
     - name: Update only the requested Claude Code package
       run: |
-        pnpm --filter e2e-ci-deps update @anthropic-ai/claude-code@2.1.273 --save-exact --lockfile-only --ignore-scripts --config.minimumReleaseAge=0
+        pnpm --filter e2e-ci-deps update @anthropic-ai/claude-code@2.1.266 --save-exact --lockfile-only --ignore-scripts
         pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
         git diff --stat
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
