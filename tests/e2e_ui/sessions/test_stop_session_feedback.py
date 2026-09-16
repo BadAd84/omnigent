@@ -85,7 +85,15 @@ def _spawn_host_daemon(tmp_path: Path, live_server: str) -> subprocess.Popen[byt
     import os as _os
 
     env = _os.environ.copy()
-    env["PYTHONPATH"] = f"{_REPO_ROOT}{_os.pathsep}{env.get('PYTHONPATH', '')}"
+    # Absolute repo + sdk paths: the host-spawned runner resolves imports via
+    # this forwarded PYTHONPATH, and relative ambient entries break in its cwd.
+    env["PYTHONPATH"] = _os.pathsep.join(
+        [
+            str(_REPO_ROOT),
+            str(_REPO_ROOT / "sdks" / "python-client"),
+            str(_REPO_ROOT / "sdks" / "ui"),
+        ]
+    )
     env["NO_PROXY"] = "127.0.0.1,localhost"
     env["no_proxy"] = "127.0.0.1,localhost"
     # Isolate the daemon registry/pidfiles from any co-resident daemon.
