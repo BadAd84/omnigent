@@ -49,7 +49,7 @@ jobs:
     - name: Check out repo
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: 6711c90b1bde2c75deef879b4a6d4bb81abd8610
+        ref: a04c292d8462a8ce088f5ea8d878a6afd574de6d
         persist-credentials: false
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -274,7 +274,7 @@ jobs:
                     usage = json.loads(meta.session_usage or '{}') if meta else {}
                     items = [json.loads(item.data) for item in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id == conv.id).order_by(SqlConversationItem.position))]
                     assistant_messages = [item for item in items if item.get('role') == 'assistant' and item.get('content')]
-                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content') if assistant_messages else None}
+                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content') if assistant_messages else None, 'tool_calls': [{'name': item.get('name'), 'call_id': item.get('call_id')} for item in items if item.get('type') == 'function_call'], 'tool_results': [{'call_id': item.get('call_id'), 'output': str(item.get('output', ''))[:2500]} for item in items if item.get('type') == 'function_call_output']}
                     report['sessions'].append(row)
 
         def canonical(model):
@@ -295,8 +295,12 @@ jobs:
         checks['final_review_present'] = '<!-- POLLY_REVIEW_START -->' in stdout and len(stdout.strip()) > 100
         checks['lockfile_unchanged'] = subprocess.run(['git', 'diff', '--quiet', '--', 'uv.lock']).returncode == 0
         report['passed'] = all(checks.values())
-        (out / 'summary.json').write_text(json.dumps(report, indent=2))
-        print(json.dumps(report, indent=2))
+        serialized = json.dumps(report, indent=2)
+        for key in ['LLM_API_KEY', 'GATEWAY_BASE_URL']:
+            if os.environ.get(key):
+                serialized = serialized.replace(os.environ[key], '[REDACTED]')
+        (out / 'summary.json').write_text(serialized)
+        print(serialized)
         for filename in ['stdout.txt', 'stderr.txt']:
             path = out / filename
             if path.exists():
