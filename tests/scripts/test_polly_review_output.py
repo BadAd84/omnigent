@@ -36,7 +36,9 @@ _QUOTED_REVIEW = f"## Blocking issues\nDo not strip inline `{_MARKER}` text.\n"
         pytest.param(f"Will emit `{_MARKER}` later.\n", "", id="narration-with-inline-quote"),
         pytest.param("Waiting for results.\n", "", id="narration-only"),
         pytest.param("", "", id="empty"),
+        pytest.param(" \n\t", "", id="whitespace-only"),
         pytest.param(f"{_MARKER}\n{_REVIEW}{_MARKER}\n", "", id="empty-final-review"),
+        pytest.param(f"{_MARKER}\n \t\n", "", id="whitespace-final-review"),
         pytest.param(_MARKER, "", id="marker-at-eof"),
     ],
 )
@@ -63,6 +65,12 @@ def test_review_output_preserves_final_review(tmp_path: Path, raw: str, expected
         timeout=10,
         check=False,
     )
+    if not expected:
+        assert result.returncode != 0
+        assert "Polly produced no publishable review" in result.stderr
+        assert not github_output.exists()
+        assert not output.read_text().strip()
+        return
     assert result.returncode == 0, result.stdout + result.stderr
     assert output.read_text() == expected
     header, payload = github_output.read_text().split("\n", 1)

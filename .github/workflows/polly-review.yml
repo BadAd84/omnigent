@@ -538,12 +538,8 @@ jobs:
             | tee /tmp/polly_output.txt \
             || { echo "::warning::Polly review exited non-zero"; cat polly-stderr.log; }
 
-          # Strip any sub-agent coordination preamble that leaks before
-          # the actual review.  Primary: look for the sentinel we asked the
-          # model to emit.  Fallback: first markdown heading.  If neither is
-          # found the output is intermediate narration (subagents timed out
-          # before synthesis) — write empty string so the post step is skipped
-          # and raw coordination messages are never posted as a PR comment.
+          # Strip coordination text using a review marker or markdown heading.
+          # Missing review content fails the step so diagnostic logs are saved.
           python3 -c "
           import re, pathlib
           raw = pathlib.Path('/tmp/polly_output.txt').read_text()
@@ -557,6 +553,8 @@ jobs:
               m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
               cleaned = raw[m.start():] if m else ''
           pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)
+          if not cleaned.strip():
+              raise SystemExit('::error::Polly produced no publishable review; see the failure logs artifact.')
           "
 
           # Use a collision-resistant random delimiter so model output
