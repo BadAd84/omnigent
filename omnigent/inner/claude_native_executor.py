@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     REQUEST_SESSION_ID_ENV_VAR,
@@ -225,9 +226,21 @@ class ClaudeNativeExecutor(Executor):
                         partial(inject_user_message, self._bridge_dir, content=text)
                     )
         except ClaudePromptTimeout as exc:
+            # Stable dimensions group known and unrecognized screens without
+            # adding raw pane output to diagnostic attributes.
             _logger.exception(
-                "claude-native: prompt delivery to harness timed out",
-                extra={"session_id": self._request_session_id},
+                "claude-native: prompt delivery to harness timed out "
+                "(blocked_on=%s shape=%s pane=%s)",
+                exc.blocked_on,
+                ",".join(exc.pane_shape),
+                exc.pane_fingerprint,
+                extra=debug_event(
+                    "claude_native_prompt_timeout",
+                    session_id=self._request_session_id,
+                    blocked_on=exc.blocked_on,
+                    pane_shape=",".join(exc.pane_shape),
+                    pane_fingerprint=exc.pane_fingerprint,
+                ),
             )
             cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
