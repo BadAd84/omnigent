@@ -53,7 +53,7 @@ jobs:
     - name: Check out repo
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: a1235a20dad8928fe8d2caebc496e41e8cc73776
+        ref: d0b39093f894e596ea6c8b09c9b11a1c77205ca1
         persist-credentials: false
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -258,17 +258,18 @@ jobs:
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         AUTOMODE_DECISION_LOG: '1'
+        OMNIGENT_POLLY_MODEL: ${{ inputs.openai_model }}
       run: |
         mkdir -p /tmp/polly-canary-evidence
         python3 -u <<'PYRUN'
-        import hashlib, json, pathlib, subprocess, time
+        import hashlib, json, os, pathlib, subprocess, time
         snapshot = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
         pathlib.Path("/tmp/polly-canary-evidence/tested-pr.diff").write_bytes(snapshot)
         pathlib.Path("/tmp/polly-canary-evidence/snapshot.json").write_text(json.dumps({"sha256": hashlib.sha256(snapshot).hexdigest(), "bytes": len(snapshot)}))
         start = time.monotonic()
         with open('/tmp/polly-canary-evidence/stdout.txt', 'w') as stdout, open('/tmp/polly-canary-evidence/stderr.txt', 'w') as stderr:
             try:
-                result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/', '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=1500)
+                result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/', '--harness', 'codex', '--model', os.environ['OMNIGENT_POLLY_MODEL'], '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=1500)
                 code = result.returncode
             except subprocess.TimeoutExpired:
                 code = 124
@@ -283,7 +284,7 @@ jobs:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         EXPECTED_OPUS: ${{ inputs.opus_model }}
-        EXPECTED_REVISION: a1235a20dad8928fe8d2caebc496e41e8cc73776
+        EXPECTED_REVISION: d0b39093f894e596ea6c8b09c9b11a1c77205ca1
       run: |
         uv run --no-sync python <<'PYCHECK'
         import hashlib, json, os, pathlib, subprocess
@@ -350,7 +351,7 @@ jobs:
             )
             checks[worker + '_computed_snapshot_hash'] = any(snapshot['sha256'] in result['output'] for row in worker_rows for result in row['tool_results'])
         checks['process_exited_zero'] = report['process'].get('returncode') == 0
-        checks['fable_brain_completed'] = any(not row['parent'] and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
+        checks['astra_brain_completed'] = any(not row['parent'] and completed_on(row, os.environ['EXPECTED_OPENAI']) for row in rows)
         checks['fable_claude_reviewer_completed'] = any(row['worker'] == 'claude_code' and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
         checks['astra_codex_reviewer_completed'] = any(row['worker'] == 'codex' and completed_on(row, os.environ['EXPECTED_OPENAI']) for row in rows)
         stdout = (out / 'stdout.txt').read_text() if (out / 'stdout.txt').exists() else ''
