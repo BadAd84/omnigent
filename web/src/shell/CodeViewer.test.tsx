@@ -277,7 +277,7 @@ describe("CodeViewer oversized markdown fallback", () => {
   });
 
   it("keeps markdown at the cap on the rich editor path", () => {
-    renderViewer("y".repeat(64), true, "small.md", { viewMode: "editor" });
+    renderViewer("y".repeat(MAX_RICH_MARKDOWN_CHARS), true, "at-cap.md", { viewMode: "editor" });
     expect(screen.queryByTestId("monaco-editor-stub")).toBeNull();
   });
 });

@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 from playwright.sync_api import Page, expect
 
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_REPO_ROOT = Path(__file__).resolve().parents[3]
 
 _FILE_NAME = "large_oneline.md"
 # 11 MiB of a single line: past the runner's 10 MiB read cap, so the server
