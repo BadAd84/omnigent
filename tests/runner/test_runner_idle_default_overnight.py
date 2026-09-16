@@ -46,10 +46,10 @@ def test_default_runner_idle_timeout_survives_overnight(
 
     timeout_s = _load_runner_idle_timeout_s_from_config()
 
-    assert timeout_s >= _ONE_DAY_S, (
+    assert timeout_s == float(_ONE_DAY_S), (
         f"runner idle-timeout default is {timeout_s:.0f}s "
-        f"({timeout_s / 3600:.1f}h); a session left idle overnight loses its "
-        f"runner before the next-day visit (expected >= {_ONE_DAY_S}s / 24h)"
+        f"({timeout_s / 3600:.1f}h); the intended default is exactly "
+        f"{_ONE_DAY_S}s (24h) — long enough to survive overnight, not unbounded"
     )
 
 
@@ -68,10 +68,10 @@ def test_default_runner_idle_timeout_survives_overnight_with_empty_runner_config
 
     timeout_s = _load_runner_idle_timeout_s_from_config()
 
-    assert timeout_s >= _ONE_DAY_S, (
+    assert timeout_s == float(_ONE_DAY_S), (
         f"runner idle-timeout default is {timeout_s:.0f}s "
-        f"({timeout_s / 3600:.1f}h); a session left idle overnight loses its "
-        f"runner before the next-day visit (expected >= {_ONE_DAY_S}s / 24h)"
+        f"({timeout_s / 3600:.1f}h); the intended default is exactly "
+        f"{_ONE_DAY_S}s (24h) — long enough to survive overnight, not unbounded"
     )
 
 
