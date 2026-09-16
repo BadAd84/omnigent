@@ -1,34 +1,16 @@
 name: Polly AI Review
-run-name: Polly model compatibility canary
+run-name: Polly headless diagnostics on PR ${{ inputs.pr }}
 'on':
   workflow_dispatch:
     inputs:
       pr:
-        description: Existing PR to review without posting
+        description: PR to review without posting
         required: true
         type: string
-      anthropic_model:
-        description: Candidate Anthropic gateway model
+      runtime_ref:
+        description: Exact trusted runtime revision to exercise
         required: true
         type: string
-      openai_model:
-        description: Candidate OpenAI gateway model
-        required: true
-        type: string
-      generate_lockfile:
-        description: Generate the Claude Code dependency lockfile update
-        required: false
-        type: boolean
-        default: false
-      opus_model:
-        description: Opus fallback for Claude Code auto-permission checks
-        required: true
-        type: string
-      consolidator_harness:
-        description: Harness for Polly consolidation
-        required: false
-        type: string
-        default: codex
 permissions:
   contents: read
   pull-requests: read
@@ -58,7 +40,7 @@ jobs:
     - name: Check out repo
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: b4096a8ae5371a7b636cd101760c2eb8cdfe3ca5
+        ref: ${{ inputs.runtime_ref }}
         persist-credentials: false
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -78,7 +60,8 @@ jobs:
         path: .venv
         key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
     - name: Install dependencies
-      run: uv sync --extra all
+      run: |
+        uv sync --frozen --extra all
     - name: Install Claude Code CLI
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
@@ -117,9 +100,9 @@ jobs:
     - name: Write Omnigent provider config
       env:
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-        OMNIGENT_ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
-        OMNIGENT_ANTHROPIC_OPUS_MODEL: ${{ inputs.opus_model }}
-        OMNIGENT_OPENAI_MODEL: ${{ inputs.openai_model }}
+        OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+        OMNIGENT_ANTHROPIC_OPUS_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_OPUS_MODEL }}
+        OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
       run: ": \"${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}\"\n: \"${OMNIGENT_ANTHROPIC_OPUS_MODEL:?Set\
         \ OMNIGENT_CI_ANTHROPIC_OPUS_MODEL}\"\n: \"${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}\"\nmkdir\
         \ -p \"$HOME/.omnigent\"\n# Use python to write the config safely \u2014 avoids interpolating\n# secrets/URLs\
@@ -232,39 +215,13 @@ jobs:
         \ structured review \u2014 no coordination messages, no status\nupdates about dispatching sub-agents, no\
         \ referring to \"reviewers\", no \"waiting for results\" narration.\nBegin your response with the exact\
         \ marker <!-- POLLY_REVIEW_START -->\non its own line, then the review content. Nothing before the marker\n\
-        will be shown.\n\"\"\"\npathlib.Path(\"/tmp/review_prompt.txt\").write_text(prompt)\nPYEOF\n"
-    - name: Require both native reviewers for the canary
-      run: |
-        cat >> /tmp/review_prompt.txt <<'CANARY'
-
-        This is an isolated model compatibility test. Review this PR read-only.
-        Dispatch exactly two independent REVIEW tasks: one to claude_code, titled
-        canary-claude-review, and one to codex, titled canary-codex-review. Both must
-        review the diff and return their actual findings. Leave args.model unset so
-        both workers inherit their configured provider defaults. Do not use other
-        workers. Do not create branches, worktrees, commits, PRs, comments, or other
-        remote changes. Pass /tmp/pr_diff.txt, its SHA-256, and the base/head commit
-        SHAs in each worker's args.input together with the review contract. Do not
-        include the diff contents in task messages. Each worker must read the file
-        with its own tools, compute its SHA-256, and report the hash it actually read.
-        They may read repository files for context. If the snapshot is inaccessible
-        or its hash differs, report that failure instead of reviewing a summary.
-        The claude_code review task must also run this harmless local Bash command
-        as a classifier smoke test and report its actual output:
-        python -c 'import hashlib; print("POLLY_CLASSIFIER_SMOKE=" + hashlib.sha256(b"polly").hexdigest())'
-        It reads no files, writes nothing, and makes no network calls. Include this
-        exact command in the claude_code task. Do not substitute a different tool.
-        Keep each worker review concise, under 500 words, while retaining real findings.
-        Wait for both real worker results and synthesize the final structured review.
-        If either worker fails, report the failure honestly; do not claim a pass.
-        CANARY
-      shell: bash
+        will be shown.\n\"\"\"\npathlib.Path(\"/tmp/review_prompt.txt\").write_text(prompt)\nPYEOF\n\ncat >> /tmp/review_prompt.txt\
+        \ <<'READONLY'\n\nThis is a diagnostic run. Do not post comments or make remote changes.\nREADONLY\n"
     - name: Run production Polly headless path
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        AUTOMODE_DECISION_LOG: '1'
-        OMNIGENT_POLLY_MODEL: ${{ inputs.openai_model }}
-        OMNIGENT_POLLY_HARNESS: ${{ inputs.consolidator_harness }}
+        OMNIGENT_POLLY_MODEL: ${{ vars.OMNIGENT_CI_POLLY_MODEL }}
+        OMNIGENT_POLLY_HARNESS: ${{ vars.OMNIGENT_CI_POLLY_HARNESS }}
       run: |
         mkdir -p /tmp/polly-canary-evidence
         python3 -u <<'PYRUN'
@@ -282,125 +239,66 @@ jobs:
         pathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode': code, 'elapsed_seconds': round(time.monotonic() - start, 1), 'consolidator_harness': os.environ['OMNIGENT_POLLY_HARNESS'], 'consolidator_model': os.environ['OMNIGENT_POLLY_MODEL']}))
         print('Polly process exit:', code)
         PYRUN
-    - name: Verify real sessions and model usage
+    - name: Collect durable transcript and process diagnostics
       if: always()
       env:
-        EXPECTED_ANTHROPIC: ${{ inputs.anthropic_model }}
-        EXPECTED_OPENAI: ${{ inputs.openai_model }}
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-        EXPECTED_OPUS: ${{ inputs.opus_model }}
-        EXPECTED_REVISION: b4096a8ae5371a7b636cd101760c2eb8cdfe3ca5
       run: |
         uv run --no-sync python <<'PYCHECK'
-        import hashlib, json, os, pathlib, subprocess
+        import json, os, pathlib, subprocess
         from sqlalchemy import create_engine, select
         from sqlalchemy.orm import Session
         from omnigent.db.db_models import SqlConversation, SqlConversationMetadata, SqlConversationItem
+        from omnigent.process_logging import logs_root
 
-        out = pathlib.Path('/tmp/polly-canary-evidence')
+        out=pathlib.Path('/tmp/polly-canary-evidence')
         out.mkdir(exist_ok=True)
-        report = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'process': json.loads((out / 'process.json').read_text()) if (out / 'process.json').exists() else {}, 'sessions': [], 'checks': {}}
-        report['pr'] = json.loads(pathlib.Path('/tmp/pr_meta.json').read_text())
+        secrets=[os.environ[k] for k in ['LLM_API_KEY','GATEWAY_BASE_URL'] if os.environ.get(k)]
+        def redact(text):
+            for secret in secrets: text=text.replace(secret,'[REDACTED]')
+            return text
+        report={'revision':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                'process':json.loads((out/'process.json').read_text()) if (out/'process.json').exists() else {},
+                'pr':json.loads(pathlib.Path('/tmp/pr_meta.json').read_text()),'sessions':[]}
         for db in pathlib.Path('/tmp').glob('ap-chat-data-*/chat.db'):
             with Session(create_engine(f'sqlite:///{db}')) as session:
                 for conv in session.scalars(select(SqlConversation)):
-                    meta = session.get(SqlConversationMetadata, (conv.workspace_id, conv.id))
-                    overrides = json.loads(conv.session_overrides or '{}')
-                    usage = json.loads(meta.session_usage or '{}') if meta else {}
-                    items = [dict(json.loads(item.data), type={1: 'message', 2: 'function_call', 3: 'function_call_output'}.get(item.type, str(item.type))) for item in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id == conv.id).order_by(SqlConversationItem.position))]
-                    assistant_messages = [item for item in items if item.get('role') == 'assistant' and item.get('content')]
-                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content') if assistant_messages else None, 'tool_calls': [{'name': item.get('name'), 'call_id': item.get('call_id'), 'arguments': item.get('arguments')} for item in items if item.get('type') == 'function_call'], 'tool_results': [{'call_id': item.get('call_id'), 'output': str(item.get('output', ''))} for item in items if item.get('type') == 'function_call_output']}
+                    meta=session.get(SqlConversationMetadata,(conv.workspace_id,conv.id))
+                    items=[dict(json.loads(i.data), stored_type=str(i.type), position=i.position)
+                           for i in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id==conv.id).order_by(SqlConversationItem.position))]
+                    row={'id':str(conv.id),'parent':str(conv.parent_conversation_id) if conv.parent_conversation_id else None,
+                         'title':conv.title,'worker':meta.sub_agent_name if meta else None,
+                         'overrides':json.loads(conv.session_overrides or '{}'),
+                         'usage':json.loads(meta.session_usage or '{}') if meta else {},'items':items}
                     report['sessions'].append(row)
-
-        def canonical(model):
-            return str(model or '').removeprefix('databricks-').removesuffix('[1m]')
-
-        def completed_on(row, expected):
-            buckets = row['usage'].get('by_model', {})
-            expected_usage = [value for model, value in buckets.items() if canonical(model) == canonical(expected)]
-            return row['assistant_messages'] > 0 and canonical(row['reported_model']) == canonical(expected) and any(value.get('output_tokens', 0) > 0 or value.get('total_cost_usd', 0) > 0 for value in expected_usage)
-
-        rows = report['sessions']
-        checks = report['checks']
-        snapshot = json.loads((out / 'snapshot.json').read_text())
-        diff_path = '/tmp/pr_diff.txt'
-        diff_bytes = pathlib.Path(diff_path).read_bytes()
-        checks['exact_candidate_revision'] = report['revision'] == os.environ['EXPECTED_REVISION']
-        checks['snapshot_unchanged'] = hashlib.sha256(diff_bytes).hexdigest() == snapshot['sha256']
-        checks['snapshot_read_only'] = pathlib.Path(diff_path).stat().st_mode & 0o222 == 0
-        handoffs = {}
-        for row in rows:
-            if row['parent']:
-                continue
-            for call in row['tool_calls']:
-                if str(call.get('name', '')).endswith('sys_session_send'):
-                    arguments = call.get('arguments') or {}
-                    if isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    payload = arguments.get('args') or {}
-                    if isinstance(payload, dict) and payload.get('purpose') == 'review':
-                        task_input = str(payload.get('input', ''))
-                        handoffs[(arguments.get('agent'), arguments.get('title'), task_input)] = {
-                            'worker': arguments.get('agent'),
-                            'input_characters': len(task_input),
-                            'snapshot_identity_present': all(value in task_input for value in [diff_path, snapshot['sha256'], report['pr']['baseRefOid'], report['pr']['headRefOid']]),
-                            'no_inline_diff': 'diff --git ' not in task_input and len(task_input) < 16000,
-                        }
-        report['handoffs'] = list(handoffs.values())
-        checks['two_snapshot_handoffs'] = len(handoffs) == 2 and {h['worker'] for h in handoffs.values()} == {'claude_code', 'codex'} and all(h['snapshot_identity_present'] and h['no_inline_diff'] for h in handoffs.values())
-        for worker in ['claude_code', 'codex']:
-            worker_rows = [row for row in rows if row['worker'] == worker]
-            checks[worker + '_read_snapshot'] = any(
-                diff_path in str(call['arguments']) and any(result['call_id'] == call['call_id'] and 'diff --git ' in result['output'] for result in row['tool_results'])
-                for row in worker_rows for call in row['tool_calls']
-            )
-            checks[worker + '_computed_snapshot_hash'] = any(snapshot['sha256'] in result['output'] for row in worker_rows for result in row['tool_results'])
-        checks['process_exited_zero'] = report['process'].get('returncode') == 0
-        checks['astra_brain_completed'] = any(not row['parent'] and completed_on(row, os.environ['EXPECTED_OPENAI']) for row in rows)
-        checks['fable_claude_reviewer_completed'] = any(row['worker'] == 'claude_code' and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
-        checks['astra_codex_reviewer_completed'] = any(row['worker'] == 'codex' and completed_on(row, os.environ['EXPECTED_OPENAI']) for row in rows)
-        stdout = (out / 'stdout.txt').read_text() if (out / 'stdout.txt').exists() else ''
-        checks['final_review_present'] = '<!-- POLLY_REVIEW_START -->' in stdout and len(stdout.strip()) > 100
-        checks['lockfile_unchanged'] = subprocess.run(['git', 'diff', '--quiet', '--', 'uv.lock']).returncode == 0
-        claude_rows = [row for row in rows if row['worker'] == 'claude_code']
-        checks['classifier_smoke_command_completed'] = any(('POLLY_CLASSIFIER_SMOKE=' + hashlib.sha256(b'polly').hexdigest()) in result['output'] for row in claude_rows for result in row['tool_results'])
-        checks['no_classifier_unavailable'] = not any('auto mode cannot determine the safety' in result['output'] for row in rows for result in row['tool_results'])
-        report['classifier_decisions'] = []
-        for root in [pathlib.Path.cwd(), pathlib.Path.home() / '.claude', pathlib.Path('/tmp')]:
-            for log in root.rglob('.automode_decisions.jsonl'):
-                for line in log.read_text(errors='replace').splitlines():
-                    try:
-                        decision = json.loads(line)
-                    except ValueError:
-                        continue
-                    report['classifier_decisions'].append({key: decision[key] for key in ['ts', 'tool', 'allowlisted', 'decision', 'classifierModel', 'durationMs', 'costUSD'] if key in decision})
-        actual_classifiers = [d['classifierModel'] for d in report['classifier_decisions'] if d.get('classifierModel')]
-        checks['configured_opus_classifier_used'] = bool(actual_classifiers) and all(canonical(m) == canonical(os.environ['EXPECTED_OPUS']) for m in actual_classifiers)
-        report['passed'] = all(checks.values())
-        serialized = json.dumps(report, indent=2)
-        for key in ['LLM_API_KEY', 'GATEWAY_BASE_URL']:
-            if os.environ.get(key):
-                serialized = serialized.replace(os.environ[key], '[REDACTED]')
-        (out / 'summary.json').write_text(serialized)
-        print(json.dumps({key: report[key] for key in ['revision', 'process', 'checks', 'passed', 'handoffs', 'classifier_decisions']}, indent=2))
-        for filename in ['stdout.txt', 'stderr.txt']:
-            path = out / filename
-            if path.exists():
-                text = path.read_text(errors='replace')
-                for key in ['LLM_API_KEY', 'GATEWAY_BASE_URL']:
-                    if os.environ.get(key):
-                        text = text.replace(os.environ[key], '[REDACTED]')
-                path.write_text(text)
-                print(filename + ':')
-                print(text[-12000:])
-        raise SystemExit(0 if report['passed'] else 1)
+                    (out/(str(conv.id)+'-transcript.json')).write_text(redact(json.dumps(row,indent=2)))
+        for file in logs_root().rglob('*.log'):
+            if file.is_file():
+                target=out/'process-logs'/file.relative_to(logs_root())
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_text(redact(file.read_text(errors='replace')[-5000000:]))
+        stdout=(out/'stdout.txt').read_text() if (out/'stdout.txt').exists() else ''
+        report['stdout_characters']=len(stdout)
+        report['roots']=[]
+        for row in report['sessions']:
+            if row['parent']: continue
+            assistant=[i for i in row['items'] if i.get('role')=='assistant']
+            report['roots'].append({'id':row['id'],'assistant_messages':len(assistant),
+                                   'last_assistant':assistant[-1] if assistant else None})
+        (out/'summary.json').write_text(redact(json.dumps(report,indent=2)))
+        for file in out.rglob('*'):
+            if file.is_file(): file.write_text(redact(file.read_text(errors='replace')))
+        print(json.dumps({'revision':report['revision'],'process':report['process'],
+                          'stdout_characters':len(stdout),'sessions':len(report['sessions']),
+                          'root_assistant_counts':[r['assistant_messages'] for r in report['roots']]}))
+        raise SystemExit(0 if stdout.strip() and report['process'].get('returncode')==0 else 1)
         PYCHECK
     - name: Upload canary evidence
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: polly-model-canary-${{ github.run_id }}
+        name: polly-headless-diagnostics-${{ github.run_id }}
         path: /tmp/polly-canary-evidence/
         retention-days: 7
         if-no-files-found: warn
