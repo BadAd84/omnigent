@@ -2470,6 +2470,55 @@ async def test_session_snapshot_carries_sandbox_provider_for_managed_host() -> N
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_host_resumable_rides_same_read_as_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With a sandbox config present, one host read yields resumable + identity."""
+    session_id = "aa55bb66cc77dd88ee99ff0011223344"
+    conv = Conversation(
+        id=session_id,
+        created_at=1,
+        updated_at=1,
+        root_conversation_id=session_id,
+        agent_id="ag_test",
+        host_id="66778899aabbccddeeff001122334455",
+    )
+    conv_store = _ConversationStore(
+        [_message_item("item_1", "hi")],
+        conversations={session_id: conv},
+    )
+    host = SimpleNamespace(
+        host_id="66778899aabbccddeeff001122334455",
+        name="managed-66778899",
+        sandbox_provider="modal",
+        sandbox_id="sb-2",
+    )
+    sandbox_config = SimpleNamespace()
+    resume_calls: list[tuple[Any, Any]] = []
+
+    def _resume_supported(candidate: Any, config: Any) -> bool:
+        resume_calls.append((candidate, config))
+        return True
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.host_resume_supported",
+        _resume_supported,
+    )
+
+    snapshot = await _get_session_snapshot(
+        conv_store,  # type: ignore[arg-type]
+        session_id,
+        host_store=SimpleNamespace(get_host=lambda host_id: host),  # type: ignore[arg-type]
+        sandbox_config=sandbox_config,  # type: ignore[arg-type]
+    )
+
+    assert resume_calls == [(host, sandbox_config)]
+    assert snapshot.host_resumable is True
+    assert snapshot.host_name == "managed-66778899"
+    assert snapshot.host_sandbox_provider == "modal"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_host_identity_none_when_unresolvable() -> None:
     """No host binding, or a vanished host row, leaves the identity None."""
     # Not host-bound: the host store must not even be consulted.
