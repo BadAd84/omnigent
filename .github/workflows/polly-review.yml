@@ -8,7 +8,8 @@ name: Polly AI Review
 #
 # Triggers:
 #   - pull_request opened/reopened/ready_for_review (automatic, once per PR)
-#   - `/review` comment on a PR (manual retrigger by write-access users)
+#   - `/review` comment on a PR (manual retrigger by write-access users, or
+#     any login in the REVIEW_ALLOWLIST repo variable, a JSON array of strings)
 #   - workflow_dispatch with a PR number (manual retrigger from Actions tab,
 #     also used by the maintainer-approval relay)
 #
@@ -43,10 +44,10 @@ env:
 
 jobs:
   # Security precondition gate (security-gate.yml): untrusted PRs wait for
-  # the scan; trusted authors pass through. Only runs on pull_request events
-  # — issue_comment and workflow_dispatch are already gated by write-access
-  # (author_association check + GitHub's own dispatch auth) and never check
-  # out PR code, so the scan is not applicable.
+  # the scan; trusted authors pass through. Only runs on pull_request events.
+  # issue_comment and workflow_dispatch are gated by write-access or the
+  # REVIEW_ALLOWLIST (author_association / login check, plus GitHub's dispatch
+  # auth) and never check out PR code, so the scan is not applicable.
   gate:
     if: github.event_name == 'pull_request'
     uses: ./.github/workflows/security-gate.yml
@@ -54,9 +55,10 @@ jobs:
   review:
     name: Polly AI Review
     needs: gate
-    # Fire on non-draft PRs (after gate passes), `/review` comments by
-    # write-access users, or workflow_dispatch. The `!cancelled()` ensures
-    # the job runs when gate is skipped (non-PR events) but not when it fails.
+    # Fire on non-draft PRs (after gate passes), `/review` comments by write-
+    # access users or REVIEW_ALLOWLIST logins, or workflow_dispatch. The
+    # `!cancelled()` ensures the job runs when gate is skipped (non-PR events)
+    # but not when it fails.
     if: >-
       !cancelled() && (
         (
@@ -72,7 +74,8 @@ jobs:
           (
             github.event.comment.author_association == 'OWNER' ||
             github.event.comment.author_association == 'MEMBER' ||
-            github.event.comment.author_association == 'COLLABORATOR'
+            github.event.comment.author_association == 'COLLABORATOR' ||
+            contains(fromJSON(vars.REVIEW_ALLOWLIST || '[]'), github.event.comment.user.login)
           )
         ) ||
         github.event_name == 'workflow_dispatch'
@@ -235,7 +238,7 @@ jobs:
           # this dir's node_modules empty.
           CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
           mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.236
+          npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
           node node_modules/@anthropic-ai/claude-code/install.cjs
           echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
 
@@ -280,9 +283,11 @@ jobs:
         env:
           GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
           OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
+          OMNIGENT_ANTHROPIC_OPUS_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_OPUS_MODEL }}
           OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
         run: |
           : "${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}"
+          : "${OMNIGENT_ANTHROPIC_OPUS_MODEL:?Set OMNIGENT_CI_ANTHROPIC_OPUS_MODEL}"
           : "${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}"
           mkdir -p "$HOME/.omnigent"
           # Use python to write the config safely — avoids interpolating
@@ -301,7 +306,11 @@ jobs:
                       'anthropic': {
                           'base_url': gw + '/anthropic',
                           'api_key_ref': 'env:LLM_API_KEY',
-                          'models': {'default': os.environ['OMNIGENT_ANTHROPIC_MODEL']},
+                          # Fable's auto-permission classifier needs a routable Opus fallback.
+                          'models': {
+                              'default': os.environ['OMNIGENT_ANTHROPIC_MODEL'],
+                              'opus': os.environ['OMNIGENT_ANTHROPIC_OPUS_MODEL'],
+                          },
                       },
                       'openai': {
                           'base_url': host + '/ai-gateway/codex/v1',
@@ -461,7 +470,12 @@ jobs:
           {review_sections}
 
           Do NOT comment on code style, formatting, naming conventions, or other cosmetic issues — omit them entirely.
-          Be concise. Do not restate the diff. Focus on what matters.
+          Do not restate the diff. Focus on what matters.
+
+          **Writing style:**
+          - Keep sentences concise and to the point. Use plain words.
+          - Do not assume the reader has prior knowledge. Explain and provide context when needed.
+          - Format multiple sub-points as a list.
 
           Before labeling anything **blocking**, double-check: does this issue actually exist in the diff? Verify the problem is real and present in the changed code — not inferred, speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade to non-blocking.
 
