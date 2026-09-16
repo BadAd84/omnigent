@@ -49,7 +49,7 @@ jobs:
     - name: Check out repo
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: a04c292d8462a8ce088f5ea8d878a6afd574de6d
+        ref: 264123c72edf77e91b2916d54f3e511be40ee4ea
         persist-credentials: false
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -134,7 +134,7 @@ jobs:
         \ for large PRs).\ngh api \"repos/${REPO}/pulls/${PR_NUMBER}\" \\\n  -H \"Accept: application/vnd.github.v3.diff\"\
         \ \\\n  > /tmp/pr_diff.txt || true\n\n# Extract lockfile pin changes from the diff.\ngrep -E '^[+-]name\
         \ = |^[+-]version = ' /tmp/pr_diff.txt \\\n  | head -500 > /tmp/lockfile_pins.txt || true\n\n# Fetch PR\
-        \ metadata.\ngh pr view \"$PR_NUMBER\" --repo \"$REPO\" \\\n  --json title,body,baseRefName,headRefName,additions,deletions,changedFiles\
+        \ metadata.\ngh pr view \"$PR_NUMBER\" --repo \"$REPO\" \\\n  --json title,body,baseRefName,headRefName,headRefOid,baseRefOid,additions,deletions,changedFiles\
         \ \\\n  > /tmp/pr_meta.json\n\n# author_association isn't exposed by `gh pr view --json`, so read it\n#\
         \ from the REST API. Used to scope the \"missing visual demonstration\"\n# nudge to external contributors\
         \ only. Default to NONE (treated as\n# external) if the field is missing.\ngh api \"repos/${REPO}/pulls/${PR_NUMBER}\"\
@@ -221,7 +221,7 @@ jobs:
       run: |
         cat >> /tmp/review_prompt.txt <<'CANARY'
 
-        This is an isolated model compatibility test. Review this small PR read-only.
+        This is an isolated model compatibility test. Review this PR read-only.
         Dispatch exactly two independent REVIEW tasks: one to claude_code, titled
         canary-claude-review, and one to codex, titled canary-codex-review. Both must
         review the diff and return their actual findings. Leave args.model unset so
@@ -269,6 +269,7 @@ jobs:
         out = pathlib.Path('/tmp/polly-canary-evidence')
         out.mkdir(exist_ok=True)
         report = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'process': json.loads((out / 'process.json').read_text()) if (out / 'process.json').exists() else {}, 'sessions': [], 'checks': {}}
+        report['pr'] = json.loads(pathlib.Path('/tmp/pr_meta.json').read_text())
         for db in pathlib.Path('/tmp').glob('ap-chat-data-*/chat.db'):
             with Session(create_engine(f'sqlite:///{db}')) as session:
                 for conv in session.scalars(select(SqlConversation)):
