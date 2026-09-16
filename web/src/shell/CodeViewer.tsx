@@ -49,6 +49,7 @@ import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
+  fetchWorkspaceFileBlob,
   fileContentToBlob,
   type useFileContent,
 } from "@/hooks/useFileContent";
@@ -334,7 +335,15 @@ const CHECKERBOARD_STYLE: React.CSSProperties = {
   backgroundPosition: "0 0, 0 8px, 8px -8px, -8px 0",
 };
 
-function ImageViewer({ data, path }: { data: FileContentResponse; path: string }) {
+function ImageViewer({
+  conversationId,
+  data,
+  path,
+}: {
+  conversationId: string;
+  data: FileContentResponse;
+  path: string;
+}) {
   const [url, setUrl] = useState<string | null>(null);
   const [errored, setErrored] = useState(false);
   const { open } = useLightbox();
@@ -342,27 +351,38 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
   // Create the object URL in an effect and revoke it on cleanup so the blob is
   // released when the file changes or the viewer unmounts (avoids a leak).
   useEffect(() => {
-    // A truncated image is a partial (corrupt) byte stream — mounting it would
-    // flash a broken-image icon before onError fires. Skip the blob and go
-    // straight to the error/banner UI.
+    setErrored(false);
+    // A truncated envelope holds a partial (corrupt) byte stream that cannot
+    // render, so fetch the complete bytes from the uncapped download route.
     if (data.truncated) {
       setUrl(null);
-      setErrored(true);
-      return;
+      let objectUrl: string | null = null;
+      let cancelled = false;
+      fetchWorkspaceFileBlob(conversationId, path).then(
+        (blob) => {
+          if (cancelled) return;
+          objectUrl = URL.createObjectURL(blob);
+          setUrl(objectUrl);
+        },
+        () => {
+          if (!cancelled) setErrored(true);
+        },
+      );
+      return () => {
+        cancelled = true;
+        if (objectUrl) URL.revokeObjectURL(objectUrl);
+      };
     }
-    setErrored(false);
     const objectUrl = URL.createObjectURL(fileContentToBlob(data));
     setUrl(objectUrl);
     return () => URL.revokeObjectURL(objectUrl);
-  }, [data]);
+  }, [data, conversationId, path]);
 
   const filename = path.split("/").pop() ?? path;
 
   const body = errored ? (
     <div className="flex items-center justify-center p-8 text-muted-foreground text-ui">
-      {data.truncated
-        ? "Image is too large to preview (truncated by the server)."
-        : "Unable to render image."}
+      {data.truncated ? "Unable to load the full image for preview." : "Unable to render image."}
     </div>
   ) : (
     <div className="flex min-h-0 flex-1 items-center justify-center overflow-auto p-4">
@@ -380,7 +400,10 @@ function ImageViewer({ data, path }: { data: FileContentResponse; path: string }
     </div>
   );
 
-  if (!data.truncated) return body;
+  // The banner (with its download guidance) applies only when the viewer is
+  // stuck with the capped envelope — i.e. the full-bytes fetch failed. A
+  // successfully fetched image is complete, so the banner would be wrong.
+  if (!(data.truncated && errored)) return body;
   return (
     <div className="flex h-full flex-col">
       <TruncatedBanner />
@@ -751,7 +774,7 @@ export function CodeViewer({
     );
   }
   if (fileQuery.data && isImageFile(path, fileQuery.data.content_type)) {
-    return <ImageViewer data={fileQuery.data} path={path} />;
+    return <ImageViewer conversationId={conversationId} data={fileQuery.data} path={path} />;
   }
   if (fileQuery.data && isPdfFile(path, fileQuery.data.content_type)) {
     return (

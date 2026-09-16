@@ -114,6 +114,26 @@ function clickDownloadLink(href: string, filename: string): void {
 }
 
 /**
+ * Fetch a workspace file's complete bytes as a ``Blob``.
+ *
+ * Asks the filesystem endpoint for the raw file (`download=true`), which the
+ * server streams with no size cap, rather than the viewer's JSON envelope,
+ * which is truncated past the server's read cap. Goes through
+ * ``authenticatedFetch`` so it works on every transport (browser, managed
+ * embed, mobile shells).
+ *
+ * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
+ * :param path: Workspace-relative or host-absolute file path.
+ */
+export async function fetchWorkspaceFileBlob(conversationId: string, path: string): Promise<Blob> {
+  const res = await authenticatedFetch(
+    workspaceFileUrl(conversationId, path, { download: "true" }),
+  );
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return res.blob();
+}
+
+/**
  * Download a workspace file's complete bytes.
  *
  * Asks the filesystem endpoint for the raw file (`download=true`), which the
@@ -132,15 +152,12 @@ function clickDownloadLink(href: string, filename: string): void {
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
  */
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
-  const url = workspaceFileUrl(conversationId, path, { download: "true" });
   const filename = path.split("/").pop() ?? path;
   if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
-    clickDownloadLink(url, filename);
+    clickDownloadLink(workspaceFileUrl(conversationId, path, { download: "true" }), filename);
     return;
   }
-  const res = await authenticatedFetch(url);
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  triggerBrowserDownload(await res.blob(), filename);
+  triggerBrowserDownload(await fetchWorkspaceFileBlob(conversationId, path), filename);
 }
 
 /**

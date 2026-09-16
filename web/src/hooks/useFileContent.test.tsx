@@ -28,6 +28,7 @@ import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
+  fetchWorkspaceFileBlob,
   fileContentToBlob,
   triggerBrowserDownload,
   useFileContent,
@@ -308,6 +309,35 @@ describe("downloadWorkspaceFile", () => {
     } as Response);
 
     await expect(downloadWorkspaceFile("sess_x", "missing.txt")).rejects.toThrow("404");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fetchWorkspaceFileBlob
+// ---------------------------------------------------------------------------
+
+describe("fetchWorkspaceFileBlob", () => {
+  it("fetches the raw download URL through the app's transport and returns the blob", async () => {
+    const file = new Blob(["raster-bytes"], { type: "image/png" });
+    fetchMock.mockResolvedValueOnce(blobResponse(file));
+
+    const out = await fetchWorkspaceFileBlob("sess_123", "src/main.py");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      DOWNLOAD_URL,
+      expect.objectContaining({ cache: "no-store" }),
+    );
+    expect(out).toBe(file);
+  });
+
+  it("propagates fetch errors to the caller", async () => {
+    fetchMock.mockResolvedValueOnce({
+      ok: false,
+      status: 404,
+      statusText: "Not Found",
+    } as Response);
+
+    await expect(fetchWorkspaceFileBlob("sess_x", "missing.png")).rejects.toThrow("404");
   });
 });
 

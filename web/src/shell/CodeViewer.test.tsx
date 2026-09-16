@@ -565,9 +565,45 @@ describe("CodeViewer image rendering", () => {
     expect(createdBlob?.size).toBe(atob(PNG_BASE64).length);
   });
 
-  it("shows the truncated banner when a binary image was truncated", () => {
+  it("previews a truncated image by fetching the full bytes from the download route", async () => {
+    // The capped JSON envelope cannot render a raster stream, so the viewer
+    // pulls the complete bytes from the uncapped download route instead of
+    // giving up with a truncation error.
+    const fullImage = new Blob(["full-image-bytes"], { type: "image/png" });
+    const fetchStub = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      statusText: "OK",
+      blob: async () => fullImage,
+    } as unknown as Response);
+    vi.stubGlobal("fetch", fetchStub);
+
+    renderImage("image/png", "shots/ui-screenshot.png", true);
+
+    const img = (await screen.findByAltText("ui-screenshot.png")) as HTMLImageElement;
+    expect(img.getAttribute("src")).toBe("blob:mock-object-url");
+    expect(fetchStub.mock.calls[0][0]).toBe(
+      "/v1/sessions/conv_1/resources/environments/default/filesystem/shots/ui-screenshot.png?download=true",
+    );
+    expect(createdBlob).toBe(fullImage);
+    // The image is complete, so no truncation banner or error placeholder.
+    expect(screen.queryByText(/too large to load fully/)).toBeNull();
+    expect(screen.queryByText(/Unable to load the full image/)).toBeNull();
+  });
+
+  it("shows the truncated banner and an error when the full-bytes fetch fails", async () => {
+    const fetchStub = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 502,
+      statusText: "Bad Gateway",
+    } as unknown as Response);
+    vi.stubGlobal("fetch", fetchStub);
+
     renderImage("image/png", "logo.png", true);
-    expect(screen.getByText(/too large to load fully/)).toBeDefined();
+
+    expect(await screen.findByText(/too large to load fully/)).toBeDefined();
+    expect(screen.getByText("Unable to load the full image for preview.")).toBeDefined();
+    expect(screen.queryByAltText("logo.png")).toBeNull();
   });
 
   it("routes by content_type over extension (image MIME on a .txt name)", async () => {
