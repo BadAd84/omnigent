@@ -1,327 +1,86 @@
 name: Polly AI Review
-run-name: Polly headless diagnostics on PR ${{ inputs.pr }}
+run-name: Polly empty-output guard and failure-artifact canary
 'on':
-  workflow_dispatch:
-    inputs:
-      pr:
-        description: PR to review without posting
-        required: true
-        type: string
-      runtime_ref:
-        description: Exact trusted runtime revision to exercise
-        required: true
-        type: string
+  workflow_dispatch: {}
 permissions:
   contents: read
-  pull-requests: read
-env:
-  OMNIGENT_SKIP_WEB_UI: 'true'
-  UV_INDEX_URL: https://pypi.org/simple
-  PIP_INDEX_URL: https://pypi.org/simple
 jobs:
-  review:
-    name: Polly model compatibility canary
+  guard:
+    name: Expected failure (${{ matrix.scenario }})
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        scenario:
+        - empty
+        - narration
+    env:
+      CANARY_SCENARIO: ${{ matrix.scenario }}
     steps:
-    - name: Check LLM credentials available
-      id: creds
-      env:
-        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      run: "if [ -z \"$LLM_API_KEY\" ]; then\n  echo \"::notice::Skipping Polly review \u2014 LLM credentials not\
-        \ available (fork PR or missing secrets).\"\n  echo \"available=false\" >> \"$GITHUB_OUTPUT\"\nelse\n  #\
-        \ Mask the key so the runner redacts it from any log or output that\n  # echoes it literally \u2014 defense-in-depth\
-        \ against prompt injection\n  # that tricks Polly into including the key in its review text.\n  echo \"\
-        ::add-mask::${LLM_API_KEY}\"\n  echo \"available=true\" >> \"$GITHUB_OUTPUT\"\nfi\n"
-    - name: Resolve PR number
-      id: pr
-      run: |
-        echo "pr_number=${{ inputs.pr }}" >> "$GITHUB_OUTPUT"
-    - name: Check out repo
+    - name: Check out exact candidate
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: ${{ inputs.runtime_ref }}
+        ref: 563754a9b3423298d515f8e85992ced34356b10b
         persist-credentials: false
-    - name: Set up Python
-      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
-      with:
-        python-version-file: .python-version
-    - name: Set up uv
-      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
-      with:
-        enable-cache: true
-    - name: Install tmux
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y tmux
-    - name: Cache virtualenv
-      uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
-      with:
-        path: .venv
-        key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
-    - name: Install dependencies
-      run: |
-        uv sync --frozen --extra all
-    - name: Install Claude Code CLI
+    - name: Prepare synthetic process output
+      run: "python3 <<'SETUP'\nimport os, pathlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'polly-fake-command'\n\
+        root.mkdir()\n(root / 'uv').write_text(\"#!/usr/bin/env python3\\nimport os, sys\\nfrom pathlib\
+        \ import Path\\nlogs = Path.home() / '.omnigent' / 'logs' / 'runner'\\nlogs.mkdir(parents=True,\
+        \ exist_ok=True)\\n(logs / 'canary.log').write_text('Synthetic process log: canary-fake-key https://canary.invalid')\\\
+        nprint('Synthetic stderr: canary-fake-key', file=sys.stderr)\\nif os.environ['CANARY_SCENARIO']\
+        \ == 'narration':\\n    print('Waiting for reviewers. https://canary.invalid')\\n\")\n(root /\
+        \ 'uv').chmod(0o755)\nwith open(os.environ['GITHUB_PATH'], 'a') as path:\n    path.write(str(root)\
+        \ + '\\n')\npathlib.Path('/tmp/review_prompt.txt').write_text('Synthetic test; no model calls\
+        \ or comments.')\nSETUP\n"
+    - name: Run Polly review
+      id: polly
       env:
-        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      run: |
-        # Install outside the checked-out tree: a repo-root package.json would
-        # otherwise capture this bare `npm install` and hoist it there, leaving
-        # this dir's node_modules empty.
-        CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-        mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-        npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
-        node node_modules/@anthropic-ai/claude-code/install.cjs
-        echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
-    - name: Install Codex CLI
-      env:
-        NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      run: |
-        # Install outside the checked-out tree so a repo-root package.json
-        # can't capture this bare `npm install` and hoist it away from here.
-        CODEX_CLI_DIR="${RUNNER_TEMP}/omnigent-codex-cli"
-        mkdir -p "$CODEX_CLI_DIR" && cd "$CODEX_CLI_DIR"
-        npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
-        echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
-    - name: Set LLM credentials
-      env:
-        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      run: echo "LLM_API_KEY=${LLM_API_KEY}" >> "$GITHUB_ENV"
-    - name: Write gateway profile (~/.databrickscfg)
-      env:
-        GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      run: "# Use python to write the config safely \u2014 avoids interpolating\n# secrets into a heredoc where\
-        \ special chars could break YAML.\npython3 -c \"\nimport pathlib, os\ncfg = '[default]\\nhost  = {host}\\\
-        ntoken = {token}\\n'.format(\n    host=os.environ['GATEWAY_BASE_URL'].removesuffix('/serving-endpoints'),\n\
-        \    token=os.environ['LLM_API_KEY'],\n)\npathlib.Path.home().joinpath('.databrickscfg').write_text(cfg)\n\
-        \"\necho \"DATABRICKS_BEARER=${LLM_API_KEY}\" >> \"$GITHUB_ENV\"\n"
-    - name: Write Omnigent provider config
-      env:
-        GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-        OMNIGENT_ANTHROPIC_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_MODEL }}
-        OMNIGENT_ANTHROPIC_OPUS_MODEL: ${{ vars.OMNIGENT_CI_ANTHROPIC_OPUS_MODEL }}
-        OMNIGENT_OPENAI_MODEL: ${{ vars.OMNIGENT_CI_OPENAI_MODEL }}
-      run: ": \"${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}\"\n: \"${OMNIGENT_ANTHROPIC_OPUS_MODEL:?Set\
-        \ OMNIGENT_CI_ANTHROPIC_OPUS_MODEL}\"\n: \"${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}\"\nmkdir\
-        \ -p \"$HOME/.omnigent\"\n# Use python to write the config safely \u2014 avoids interpolating\n# secrets/URLs\
-        \ into a heredoc where special chars could break YAML.\n# Uses json (stdlib) instead of yaml to avoid needing\
-        \ PyYAML on\n# the system python; the output is valid YAML (JSON is a subset).\npython3 -c \"\nimport pathlib,\
-        \ os, json\ngw = os.environ['GATEWAY_BASE_URL']\nhost = gw.removesuffix('/serving-endpoints')\ncfg = {\n\
-        \    'providers': {\n        'databricks-gateway': {\n            'kind': 'gateway',\n            'default':\
-        \ ['anthropic', 'openai'],\n            'anthropic': {\n                'base_url': gw + '/anthropic',\n\
-        \                'api_key_ref': 'env:LLM_API_KEY',\n                # Fable's auto-permission classifier\
-        \ needs a routable Opus fallback.\n                'models': {\n                    'default': os.environ['OMNIGENT_ANTHROPIC_MODEL'],\n\
-        \                    'opus': os.environ['OMNIGENT_ANTHROPIC_OPUS_MODEL'],\n                },\n        \
-        \    },\n            'openai': {\n                'base_url': host + '/ai-gateway/codex/v1',\n         \
-        \       'api_key_ref': 'env:LLM_API_KEY',\n                'wire_api': 'responses',\n                'models':\
-        \ {'default': os.environ['OMNIGENT_OPENAI_MODEL']},\n            },\n        }\n    }\n}\npathlib.Path.home().joinpath('.omnigent',\
-        \ 'config.yaml').write_text(\n    json.dumps(cfg, indent=2)\n)\n\"\n"
-    - name: Collect PR context
-      id: ctx
-      env:
-        GH_TOKEN: ${{ github.token }}
-        REPO: ${{ github.repository }}
-        PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-      run: "set -euo pipefail\n\n# Freeze both revisions so the file and review marker describe the same diff.\n\
-        gh pr view \"$PR_NUMBER\" --repo \"$REPO\" \\\n  --json title,body,baseRefName,headRefName,baseRefOid,headRefOid,additions,deletions,changedFiles\
-        \ \\\n  > /tmp/pr_meta.json\nbase_sha=\"$(jq -r .baseRefOid /tmp/pr_meta.json)\"\nhead_sha=\"$(jq -r .headRefOid\
-        \ /tmp/pr_meta.json)\"\ngh api \"repos/${REPO}/compare/${base_sha}...${head_sha}\" \\\n  -H \"Accept: application/vnd.github.v3.diff\"\
-        \ \\\n  > /tmp/pr_diff.txt\nchmod 444 /tmp/pr_diff.txt\necho \"head_sha=${head_sha}\" >> \"$GITHUB_OUTPUT\"\
-        \n\n# Extract lockfile pin changes from the diff.\ngrep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt\
-        \ \\\n  | head -500 > /tmp/lockfile_pins.txt || true\n\n# author_association isn't exposed by `gh pr view\
-        \ --json`, so read it\n# from the REST API. Used to scope the \"missing visual demonstration\"\n# nudge\
-        \ to external contributors only. Default to NONE (treated as\n# external) if the field is missing.\ngh api\
-        \ \"repos/${REPO}/pulls/${PR_NUMBER}\" \\\n  --jq '.author_association // \"NONE\"' > /tmp/pr_author_assoc.txt\
-        \ || echo \"NONE\" > /tmp/pr_author_assoc.txt\n\n# Reviewers read the shared snapshot; Polly passes only\
-        \ its path and identity.\npython3 -u <<'PYEOF'\nimport hashlib, json, pathlib, re\n\nmeta = json.loads(pathlib.Path(\"\
-        /tmp/pr_meta.json\").read_text())\ndiff_sha256 = hashlib.sha256(pathlib.Path(\"/tmp/pr_diff.txt\").read_bytes()).hexdigest()\n\
-        lockfile_pins = pathlib.Path(\"/tmp/lockfile_pins.txt\").read_text(encoding=\"utf-8\", errors=\"replace\"\
-        ).strip()\n\n# The \"missing visual demonstration\" nudge targets external contributors\n# only \u2014 core\
-        \ team members (OWNER / MEMBER / COLLABORATOR) are assumed to\n# know the screenshot convention and shouldn't\
-        \ be nagged. Anything else\n# (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE, or unknown) is\n\
-        # treated as external. When False, the attachment section + visual-demo\n# rule are omitted from the prompt\
-        \ entirely.\nauthor_assoc = pathlib.Path(\"/tmp/pr_author_assoc.txt\").read_text().strip().upper()\nis_external\
-        \ = author_assoc not in {'OWNER', 'MEMBER', 'COLLABORATOR'}\n\nlockfile_section = f\"\"\"\n## Changed lockfile\
-        \ pins (uv.lock / package-lock.json)\nThese are extracted package name + version lines only \u2014 not the\
-        \ full hunk.\n```\n{lockfile_pins if lockfile_pins else \"(no lockfile changes)\"}\n```\n\"\"\" if lockfile_pins\
-        \ else \"\"\n\n# Detect attached images/videos in the PR description. These usually sit\n# at the END of\
-        \ the body, so they would be lost to the 4096-char truncation\n# below \u2014 extract them from the FULL\
-        \ body and surface them separately so\n# the \"visual demonstration\" check is reliable. Only built for\
-        \ external\n# contributors (see is_external above).\nbody_full = meta.get('body') or ''\nattachments = re.findall(\n\
-        \    r'!\\[[^\\]]*\\]\\([^)]+\\)'                       # markdown image\n    r'|<img[^>]+>'           \
-        \                     # html <img>\n    r'|<video[^>]*>.*?</video>|<video[^>]+/?>'    # html <video>\n \
-        \   r'|https?://\\S*(?:user-images\\.githubusercontent\\.com'  # GH image CDN\n    r'|github\\.com/user-attachments)\\\
-        S*',         # GH attachments\n    body_full, flags=re.IGNORECASE | re.DOTALL,\n) if is_external else []\n\
-        attachment_section = f\"\"\"\n## Attached images/videos in PR description\nThe PR description was scanned\
-        \ for embedded screenshots/images/videos.\n```\n{chr(10).join(attachments) if attachments else \"(none found)\"\
-        }\n```\n\"\"\" if is_external else \"\"\n\n# The \"Missing visual demonstration\" report item + rule are\
-        \ only included\n# for external contributors; otherwise the review has just the 5 standard\n# sections.\
-        \ Build the numbered list so the numbering stays contiguous\n# regardless of whether the visual item is\
-        \ present.\nstandard_items = [\n    \"**Blocking issues** \u2014 correctness bugs, broken contracts, missing\
-        \ error handling on failure paths, data loss risks.\",\n    \"**Security vulnerabilities** \u2014 injection\
-        \ (SQL, command, template), authentication/authorization bypasses, secret exposure, unsafe deserialization,\
-        \ path traversal, SSRF, and any change that weakens an existing security boundary. Flag even subtle issues.\"\
-        ,\n    \"**Non-blocking notes** \u2014 design concerns or edge cases worth flagging (brief).\",\n    \"\
-        **Approach** \u2014 is there a materially simpler or more consistent way to reach the PR's stated goal,\
-        \ given existing patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete\
-        \ alternative briefly, or say the approach is sound. Never blocking.\",\n    \"**Summary** \u2014 one-paragraph\
-        \ overall assessment.\",\n]\nvisual_item = [\n    '**Missing visual demonstration** \u2014 see the \"Visual\
-        \ demonstration\" rule below. Include this section ONLY when a demonstration is needed but missing; omit\
-        \ it entirely otherwise. When present, it MUST be the first section so the author sees it.'\n] if is_external\
-        \ else []\n# No leading indent on items \u2014 the YAML block scalar dedents the prompt\n# to column 0,\
-        \ and the `{review_sections}` placeholder supplies the line\n# position, so items must align with the rest\
-        \ of the prompt text.\nreview_sections = \"\\n\".join(\n    f\"{i}. {text}\" for i, text in enumerate(visual_item\
-        \ + standard_items, 1)\n)\n\nvisual_demo_rule = \"\"\"\n**Visual demonstration** \u2014 when the change\
-        \ is UI-related (e.g. touches\nthe CLI/REPL/TUI, terminal rendering, picker/onboarding flows, or any\nuser-visible\
-        \ output) or otherwise warrants a before/after demonstration\n(e.g. a backend bug that was stuck/broken\
-        \ and is fixed by this PR), the\nPR description should include a screenshot, image, or video showing the\n\
-        result. Consult the \"Attached images/videos in PR description\" section\nabove \u2014 it lists every embedded\
-        \ image/video extracted from the full PR\ndescription (so attachments are detected even when the description\
-        \ is\ntruncated). If that section says \"(none found)\" and the change appears\nto need such a demonstration,\
-        \ emit the **Missing visual demonstration**\nsection (item 1 above) as the FIRST section of your review,\
-        \ asking the\nauthor to attach a screenshot or video. Do not flag PRs that are purely\nbackend, refactor,\
-        \ test, or docs changes with no user-visible effect.\n\"\"\" if is_external else \"\"\n\nprompt = f\"\"\"\
-        Review this pull request and provide structured feedback.\n\n## PR Metadata\n- **Title:** {meta['title']}\n\
-        - **Branch:** {meta['headRefName']} \u2192 {meta['baseRefName']}\n- **Diff revisions:** {meta['baseRefOid']}...{meta['headRefOid']}\n\
-        - **Stats:** +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)\n\n## PR\
-        \ Description\n{(meta.get('body') or '')[:4096]}{\"  *(truncated)*\" if len(meta.get('body') or '') > 4096\
-        \ else \"\"}\n{attachment_section}\n{lockfile_section}\n## Instructions\n\n**Step 1 \u2014 use the saved\
-        \ diff.** The full PR diff is at `/tmp/pr_diff.txt`\non this runner's filesystem, shared with the reviewers.\n\
-        Its SHA-256 is `{diff_sha256}`.\nPass that absolute path, checksum, base/head SHAs, and the review contract\n\
-        in each reviewer task. Reviewers must read the file themselves with their\nown tools. Do not paste or regenerate\
-        \ the diff in task messages, and do\nnot modify the snapshot. If a reviewer cannot read it, report the failure.\n\
-        The codebase is checked out at `main` \u2014 read source files freely for\nadditional context when needed.\n\
-        \n**Security:** you are running in a CI environment with access to secrets\n(LLM API keys, gateway tokens).\
-        \ Never include secrets, tokens, or\ncredentials in your output, and never make outbound network calls\n\
-        except to the configured LLM gateway.\n\n**Step 2 \u2014 review.** Report, in this order:\n{review_sections}\n\
-        \nDo NOT comment on code style, formatting, naming conventions, or other cosmetic issues \u2014 omit them\
-        \ entirely.\nDo not restate the diff. Focus on what matters.\n\n**Writing style:**\n- Keep sentences concise\
-        \ and to the point. Use plain words.\n- Do not assume the reader has prior knowledge. Explain and provide\
-        \ context when needed.\n- Format multiple sub-points as a list.\n\nBefore labeling anything **blocking**,\
-        \ double-check: does this issue actually exist in the diff? Verify the problem is real and present in the\
-        \ changed code \u2014 not inferred, speculative, or already handled elsewhere. If the issue exists, it is\
-        \ blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security\
-        \ risk; otherwise downgrade to non-blocking.\n\n**Lockfile pins** \u2014 review the \"Changed lockfile pins\"\
-        \ section above and flag\nas a **blocking security issue** any of:\n- A package added that is not declared\
-        \ (directly or transitively) in pyproject.toml.\n- A version that does not satisfy the constraint in pyproject.toml.\n\
-        - A suspicious version downgrade on a security-sensitive package.\n\n**Package extras** \u2014 when the\
-        \ diff adds or modifies optional dependency groups (extras):\n- Each harness deserves its own extra.\n-\
-        \ Combine harnesses and other integrations from the same vendor into one extra (e.g. a single `google` extra\
-        \ may cover Vertex and Antigravity).\n- Each sandbox deserves its own extra.\n- Nothing else warrants a\
-        \ new extra \u2014 flag any new extras that don't fit one of these three categories as a blocking issue.\n\
-        {visual_demo_rule}\nIMPORTANT: Your output will be posted directly as a PR comment. Output\nONLY the final\
-        \ structured review \u2014 no coordination messages, no status\nupdates about dispatching sub-agents, no\
-        \ referring to \"reviewers\", no \"waiting for results\" narration.\nBegin your response with the exact\
-        \ marker <!-- POLLY_REVIEW_START -->\non its own line, then the review content. Nothing before the marker\n\
-        will be shown.\n\"\"\"\npathlib.Path(\"/tmp/review_prompt.txt\").write_text(prompt)\nPYEOF\n\ncat >> /tmp/review_prompt.txt\
-        \ <<'READONLY'\n\nThis is a diagnostic run. Do not post comments or make remote changes.\nREADONLY\n"
-    - name: Run production Polly headless path
-      env:
-        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        OMNIGENT_POLLY_MODEL: ${{ vars.OMNIGENT_CI_POLLY_MODEL }}
-        OMNIGENT_POLLY_HARNESS: ${{ vars.OMNIGENT_CI_POLLY_HARNESS }}
-      run: |
-        mkdir -p /tmp/polly-canary-evidence
-        python3 -u <<'PYRUN'
-        import hashlib, json, os, pathlib, subprocess, time
-        snapshot = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
-        pathlib.Path("/tmp/polly-canary-evidence/tested-pr.diff").write_bytes(snapshot)
-        pathlib.Path("/tmp/polly-canary-evidence/snapshot.json").write_text(json.dumps({"sha256": hashlib.sha256(snapshot).hexdigest(), "bytes": len(snapshot)}))
-        start = time.monotonic()
-        with open('/tmp/polly-canary-evidence/stdout.txt', 'w') as stdout, open('/tmp/polly-canary-evidence/stderr.txt', 'w') as stderr:
-            try:
-                result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/', '--harness', os.environ['OMNIGENT_POLLY_HARNESS'], '--model', os.environ['OMNIGENT_POLLY_MODEL'], '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=1500)
-                code = result.returncode
-            except subprocess.TimeoutExpired:
-                code = 124
-        pathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode': code, 'elapsed_seconds': round(time.monotonic() - start, 1), 'consolidator_harness': os.environ['OMNIGENT_POLLY_HARNESS'], 'consolidator_model': os.environ['OMNIGENT_POLLY_MODEL']}))
-        print('Polly process exit:', code)
-        PYRUN
-    - name: Collect durable transcript and process diagnostics
+        OMNIGENT_POLLY_HARNESS: unused
+        OMNIGENT_POLLY_MODEL: unused
+      run: "set -euo pipefail\n\nprompt=$(cat /tmp/review_prompt.txt)\n\n# Run Polly headlessly with -p;\
+        \ it starts a local server, sends\n# one turn, prints the assistant response, and exits.\n# --no-session:\
+        \ ephemeral run, no persistent session state.\nuv run omnigent run examples/polly/ \\\n  --harness\
+        \ \"$OMNIGENT_POLLY_HARNESS\" --model \"$OMNIGENT_POLLY_MODEL\" \\\n  -p \"$prompt\" \\\n  --no-session\
+        \ \\\n  2>polly-stderr.log \\\n  | tee /tmp/polly_output.txt \\\n  || { echo \"::warning::Polly\
+        \ review exited non-zero\"; cat polly-stderr.log; }\n\n# Strip coordination text using a review\
+        \ marker or markdown heading.\n# Missing review content fails the step so diagnostic logs are\
+        \ saved.\npython3 -c \"\nimport re, pathlib\nraw = pathlib.Path('/tmp/polly_output.txt').read_text()\n\
+        sentinel = '<!-- POLLY_REVIEW_START -->'\n# Headless output can include earlier drafts before\
+        \ the final review.\n# Only standalone marker lines separate reviews; inline quotes do not.\n\
+        markers = list(re.finditer(r'^' + re.escape(sentinel) + r'$', raw, re.MULTILINE))\nif markers:\n\
+        \    cleaned = raw[markers[-1].end():].lstrip('\\n')\nelse:\n    m = re.search(r'^#{1,6} ', raw,\
+        \ re.MULTILINE)\n    cleaned = raw[m.start():] if m else ''\nif not cleaned.strip():\n    raise\
+        \ SystemExit('::error::Polly produced no publishable review; see the failure logs artifact.')\n\
+        pathlib.Path('/tmp/polly_output.txt').write_text(cleaned)\n\"\n\n# Use a collision-resistant random\
+        \ delimiter so model output\n# containing \"REVIEW_EOF\" cannot truncate the output.\ndelim=\"\
+        REVIEW_$(openssl rand -hex 8)\"\necho \"review_text<<${delim}\" >> \"$GITHUB_OUTPUT\"\n# Cap at\
+        \ 60 KB \u2014 GitHub comment body limit is ~65 KB.\nhead -c 61440 /tmp/polly_output.txt >> \"\
+        $GITHUB_OUTPUT\"\necho \"${delim}\" >> \"$GITHUB_OUTPUT\"\n"
+    - name: Posting handoff must stay empty
       if: always()
       env:
-        LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-        GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-      run: |
-        uv run --no-sync python <<'PYCHECK'
-        import json, os, pathlib, subprocess
-        from sqlalchemy import create_engine, select
-        from sqlalchemy.orm import Session
-        from omnigent.db.db_models import SqlConversation, SqlConversationMetadata, SqlConversationItem
-        from omnigent.process_logging import logs_root
-
-        out=pathlib.Path('/tmp/polly-canary-evidence')
-        out.mkdir(exist_ok=True)
-        secrets=[os.environ[k] for k in ['LLM_API_KEY','GATEWAY_BASE_URL'] if os.environ.get(k)]
-        def redact(text):
-            for secret in secrets: text=text.replace(secret,'[REDACTED]')
-            return text
-        report={'revision':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
-                'process':json.loads((out/'process.json').read_text()) if (out/'process.json').exists() else {},
-                'pr':json.loads(pathlib.Path('/tmp/pr_meta.json').read_text()),'sessions':[]}
-        for db in pathlib.Path('/tmp').glob('ap-chat-data-*/chat.db'):
-            with Session(create_engine(f'sqlite:///{db}')) as session:
-                for conv in session.scalars(select(SqlConversation)):
-                    meta=session.get(SqlConversationMetadata,(conv.workspace_id,conv.id))
-                    items=[dict(json.loads(i.data), stored_type=str(i.type), position=i.position)
-                           for i in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id==conv.id).order_by(SqlConversationItem.position))]
-                    row={'id':str(conv.id),'parent':str(conv.parent_conversation_id) if conv.parent_conversation_id else None,
-                         'title':conv.title,'worker':meta.sub_agent_name if meta else None,
-                         'overrides':json.loads(conv.session_overrides or '{}'),
-                         'usage':json.loads(meta.session_usage or '{}') if meta else {},'items':items}
-                    report['sessions'].append(row)
-                    (out/(str(conv.id)+'-transcript.json')).write_text(redact(json.dumps(row,indent=2)))
-        for file in logs_root().rglob('*.log'):
-            if file.is_file():
-                target=out/'process-logs'/file.relative_to(logs_root())
-                target.parent.mkdir(parents=True,exist_ok=True)
-                target.write_text(redact(file.read_text(errors='replace')[-5000000:]))
-        stdout=(out/'stdout.txt').read_text() if (out/'stdout.txt').exists() else ''
-        report['stdout_characters']=len(stdout)
-        report['roots']=[]
-        for row in report['sessions']:
-            if row['parent']: continue
-            assistant=[i for i in row['items'] if i.get('role')=='assistant']
-            report['roots'].append({'id':row['id'],'assistant_messages':len(assistant),
-                                   'last_assistant':assistant[-1] if assistant else None})
-        (out/'summary.json').write_text(redact(json.dumps(report,indent=2)))
-        for file in out.rglob('*'):
-            if file.is_file(): file.write_text(redact(file.read_text(errors='replace')))
-        print(json.dumps({'revision':report['revision'],'process':report['process'],
-                          'stdout_characters':len(stdout),'sessions':len(report['sessions']),
-                          'root_assistant_counts':[r['assistant_messages'] for r in report['roots']]}))
-        raise SystemExit(0 if stdout.strip() and report['process'].get('returncode')==0 else 1)
-        PYCHECK
-    - name: Upload canary evidence
-      if: always()
+        REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
+      run: test -z "$REVIEW_TEXT"
+    - name: Prepare Polly failure diagnostics
+      if: failure()
+      env:
+        LLM_API_KEY: canary-fake-key
+        GATEWAY_BASE_URL: https://canary.invalid
+      run: "python3 <<'PY'\nimport os, pathlib\ndestination = pathlib.Path('/tmp/polly-diagnostics')\n\
+        destination.mkdir(parents=True, exist_ok=True)\nsources = {\n    'polly-stderr.log': pathlib.Path('polly-stderr.log'),\n\
+        \    'polly-output.txt': pathlib.Path('/tmp/polly_output.txt'),\n}\nlogs = pathlib.Path.home()\
+        \ / '.omnigent' / 'logs'\nfor source in logs.rglob('*.log'):\n    sources['process-logs/' + str(source.relative_to(logs))]\
+        \ = source\nfor name, source in sources.items():\n    if not source.is_file():\n        continue\n\
+        \    text = source.read_text(errors='replace')\n    for key in ('LLM_API_KEY', 'GATEWAY_BASE_URL'):\n\
+        \        value = os.environ.get(key)\n        if value:\n            text = text.replace(value,\
+        \ '[REDACTED]')\n    target = destination / name\n    target.parent.mkdir(parents=True, exist_ok=True)\n\
+        \    target.write_text(text)\nPY\n"
+    - name: Upload logs on failure
+      if: failure()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
-        name: polly-headless-diagnostics-${{ github.run_id }}
-        path: /tmp/polly-canary-evidence/
+        name: polly-empty-output-${{ matrix.scenario }}-${{ github.run_id }}
+        path: /tmp/polly-diagnostics/
         retention-days: 7
-        if-no-files-found: warn
-  lockfile:
-    if: inputs.generate_lockfile
-    name: Generate Claude Code lockfile update
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
-    steps:
-    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      with:
-        ref: 6711c90b1bde2c75deef879b4a6d4bb81abd8610
-        persist-credentials: false
-    - uses: ./.github/actions/setup-pnpm
-    - name: Update only the requested Claude Code package
-      run: |
-        pnpm --filter e2e-ci-deps update @anthropic-ai/claude-code@2.1.266 --save-exact --lockfile-only --ignore-scripts
-        pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
-        git diff --stat
-    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-      with:
-        name: claude-code-lockfile
-        path: pnpm-lock.yaml
-        retention-days: 7
+        if-no-files-found: ignore
