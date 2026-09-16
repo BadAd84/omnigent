@@ -24,6 +24,11 @@ run-name: Polly model compatibility canary
         description: Opus fallback for Claude Code auto-permission checks
         required: true
         type: string
+      consolidator_harness:
+        description: Harness for Polly consolidation
+        required: false
+        type: string
+        default: codex
 permissions:
   contents: read
   pull-requests: read
@@ -53,7 +58,7 @@ jobs:
     - name: Check out repo
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: d0b39093f894e596ea6c8b09c9b11a1c77205ca1
+        ref: b4096a8ae5371a7b636cd101760c2eb8cdfe3ca5
         persist-credentials: false
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -259,6 +264,7 @@ jobs:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         AUTOMODE_DECISION_LOG: '1'
         OMNIGENT_POLLY_MODEL: ${{ inputs.openai_model }}
+        OMNIGENT_POLLY_HARNESS: ${{ inputs.consolidator_harness }}
       run: |
         mkdir -p /tmp/polly-canary-evidence
         python3 -u <<'PYRUN'
@@ -269,11 +275,11 @@ jobs:
         start = time.monotonic()
         with open('/tmp/polly-canary-evidence/stdout.txt', 'w') as stdout, open('/tmp/polly-canary-evidence/stderr.txt', 'w') as stderr:
             try:
-                result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/', '--harness', 'codex', '--model', os.environ['OMNIGENT_POLLY_MODEL'], '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=1500)
+                result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/', '--harness', os.environ['OMNIGENT_POLLY_HARNESS'], '--model', os.environ['OMNIGENT_POLLY_MODEL'], '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=1500)
                 code = result.returncode
             except subprocess.TimeoutExpired:
                 code = 124
-        pathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode': code, 'elapsed_seconds': round(time.monotonic() - start, 1)}))
+        pathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode': code, 'elapsed_seconds': round(time.monotonic() - start, 1), 'consolidator_harness': os.environ['OMNIGENT_POLLY_HARNESS'], 'consolidator_model': os.environ['OMNIGENT_POLLY_MODEL']}))
         print('Polly process exit:', code)
         PYRUN
     - name: Verify real sessions and model usage
@@ -284,7 +290,7 @@ jobs:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         EXPECTED_OPUS: ${{ inputs.opus_model }}
-        EXPECTED_REVISION: d0b39093f894e596ea6c8b09c9b11a1c77205ca1
+        EXPECTED_REVISION: b4096a8ae5371a7b636cd101760c2eb8cdfe3ca5
       run: |
         uv run --no-sync python <<'PYCHECK'
         import hashlib, json, os, pathlib, subprocess
