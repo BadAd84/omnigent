@@ -227,7 +227,10 @@ jobs:
         review the diff and return their actual findings. Leave args.model unset so
         both workers inherit their configured provider defaults. Do not use other
         workers. Do not create branches, worktrees, commits, PRs, comments, or other
-        remote changes. Reviewers may read the supplied diff from /tmp/pr_diff.txt.
+        remote changes. Read /tmp/pr_diff.txt yourself, then include its COMPLETE VERBATIM contents
+        in each worker's args.input together with the review contract. Reviewers must
+        receive the diff as text, as the cross-review skill requires; do not ask them
+        to open /tmp/pr_diff.txt. They may read repository files for context.
         Wait for both real worker results and synthesize the final structured review.
         If either worker fails, report the failure honestly; do not claim a pass.
         CANARY
@@ -272,9 +275,9 @@ jobs:
                     meta = session.get(SqlConversationMetadata, (conv.workspace_id, conv.id))
                     overrides = json.loads(conv.session_overrides or '{}')
                     usage = json.loads(meta.session_usage or '{}') if meta else {}
-                    items = [json.loads(item.data) for item in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id == conv.id).order_by(SqlConversationItem.position))]
+                    items = [dict(json.loads(item.data), type={1: 'message', 2: 'function_call', 3: 'function_call_output'}.get(item.type, str(item.type))) for item in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id == conv.id).order_by(SqlConversationItem.position))]
                     assistant_messages = [item for item in items if item.get('role') == 'assistant' and item.get('content')]
-                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content') if assistant_messages else None, 'tool_calls': [{'name': item.get('name'), 'call_id': item.get('call_id')} for item in items if item.get('type') == 'function_call'], 'tool_results': [{'call_id': item.get('call_id'), 'output': str(item.get('output', ''))[:2500]} for item in items if item.get('type') == 'function_call_output']}
+                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content') if assistant_messages else None, 'tool_calls': [{'name': item.get('name'), 'call_id': item.get('call_id'), 'arguments': item.get('arguments')} for item in items if item.get('type') == 'function_call'], 'tool_results': [{'call_id': item.get('call_id'), 'output': str(item.get('output', ''))[:2500]} for item in items if item.get('type') == 'function_call_output']}
                     report['sessions'].append(row)
 
         def canonical(model):
@@ -287,6 +290,20 @@ jobs:
 
         rows = report['sessions']
         checks = report['checks']
+        diff = pathlib.Path('/tmp/pr_diff.txt').read_text().strip()
+        handoffs = []
+        for row in rows:
+            if row['parent']:
+                continue
+            for call in row['tool_calls']:
+                if str(call.get('name', '')).endswith('sys_session_send'):
+                    arguments = call.get('arguments') or {}
+                    if isinstance(arguments, str):
+                        arguments = json.loads(arguments)
+                    payload = arguments.get('args') or {}
+                    if isinstance(payload, dict) and payload.get('purpose') == 'review':
+                        handoffs.append(diff in str(payload.get('input', '')))
+        checks['both_reviewers_received_full_diff'] = len(handoffs) == 2 and all(handoffs)
         checks['process_exited_zero'] = report['process'].get('returncode') == 0
         checks['fable_brain_completed'] = any(not row['parent'] and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
         checks['fable_claude_reviewer_completed'] = any(row['worker'] == 'claude_code' and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
