@@ -762,7 +762,12 @@ function partitionToolRun(
   return fragments;
 }
 
-/** True when the user expanded this tool card and is presumably reading it. */
+/**
+ * True when the user expanded this tool card and is presumably reading it.
+ * A `native_tool` without an itemId keys by position, which can differ between
+ * the streaming and settled layouts — harmless: those cards sit inside the
+ * already-closed fold.
+ */
 function isUserOpenedTool(
   item: RenderItem,
   index: number,
