@@ -20,6 +20,10 @@ run-name: Polly model compatibility canary
         required: false
         type: boolean
         default: false
+      opus_model:
+        description: Opus fallback for Claude Code auto-permission checks
+        required: true
+        type: string
 permissions:
   contents: read
   pull-requests: read
@@ -37,19 +41,21 @@ jobs:
       id: creds
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      run: "if [ -z \"$LLM_API_KEY\" ]; then\n  echo \"::notice::Skipping Polly review \u2014 LLM credentials not\
-        \ available (fork PR or missing secrets).\"\n  echo \"available=false\" >> \"$GITHUB_OUTPUT\"\nelse\n  #\
-        \ Mask the key so the runner redacts it from any log or output that\n  # echoes it literally \u2014 defense-in-depth\
-        \ against prompt injection\n  # that tricks Polly into including the key in its review text.\n  echo \"\
-        ::add-mask::${LLM_API_KEY}\"\n  echo \"available=true\" >> \"$GITHUB_OUTPUT\"\nfi\n"
+      run: "if [ -z \"$LLM_API_KEY\" ]; then\n  echo \"::notice::Skipping Polly review \u2014 LLM credentials\
+        \ not available (fork PR or missing secrets).\"\n  echo \"available=false\" >> \"$GITHUB_OUTPUT\"\
+        \nelse\n  # Mask the key so the runner redacts it from any log or output that\n  # echoes it literally\
+        \ \u2014 defense-in-depth against prompt injection\n  # that tricks Polly into including the key\
+        \ in its review text.\n  echo \"::add-mask::${LLM_API_KEY}\"\n  echo \"available=true\" >> \"\
+        $GITHUB_OUTPUT\"\nfi\n"
     - name: Resolve PR number
       id: pr
-      run: |
-        echo "pr_number=${{ inputs.pr }}" >> "$GITHUB_OUTPUT"
+      run: 'echo "pr_number=${{ inputs.pr }}" >> "$GITHUB_OUTPUT"
+
+        '
     - name: Check out repo
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: 264123c72edf77e91b2916d54f3e511be40ee4ea
+        ref: eb9937b2e
         persist-credentials: false
     - name: Set up Python
       uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
@@ -60,9 +66,11 @@ jobs:
       with:
         enable-cache: true
     - name: Install tmux
-      run: |
-        sudo apt-get update
+      run: 'sudo apt-get update
+
         sudo apt-get install -y tmux
+
+        '
     - name: Cache virtualenv
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
       with:
@@ -73,25 +81,39 @@ jobs:
     - name: Install Claude Code CLI
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      run: |
-        # Install outside the checked-out tree: a repo-root package.json would
+      run: '# Install outside the checked-out tree: a repo-root package.json would
+
         # otherwise capture this bare `npm install` and hoist it there, leaving
-        # this dir's node_modules empty.
+
+        # this dir''s node_modules empty.
+
         CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
+
         mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
+
         npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
+
         node node_modules/@anthropic-ai/claude-code/install.cjs
+
         echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+
+        '
     - name: Install Codex CLI
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      run: |
-        # Install outside the checked-out tree so a repo-root package.json
-        # can't capture this bare `npm install` and hoist it away from here.
+      run: '# Install outside the checked-out tree so a repo-root package.json
+
+        # can''t capture this bare `npm install` and hoist it away from here.
+
         CODEX_CLI_DIR="${RUNNER_TEMP}/omnigent-codex-cli"
+
         mkdir -p "$CODEX_CLI_DIR" && cd "$CODEX_CLI_DIR"
+
         npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
+
         echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
+
+        '
     - name: Set LLM credentials
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -100,158 +122,193 @@ jobs:
       env:
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      run: "# Use python to write the config safely \u2014 avoids interpolating\n# secrets into a heredoc where\
-        \ special chars could break YAML.\npython3 -c \"\nimport pathlib, os\ncfg = '[default]\\nhost  = {host}\\\
-        ntoken = {token}\\n'.format(\n    host=os.environ['GATEWAY_BASE_URL'].removesuffix('/serving-endpoints'),\n\
+      run: "# Use python to write the config safely \u2014 avoids interpolating\n# secrets into a heredoc\
+        \ where special chars could break YAML.\npython3 -c \"\nimport pathlib, os\ncfg = '[default]\\\
+        nhost  = {host}\\ntoken = {token}\\n'.format(\n    host=os.environ['GATEWAY_BASE_URL'].removesuffix('/serving-endpoints'),\n\
         \    token=os.environ['LLM_API_KEY'],\n)\npathlib.Path.home().joinpath('.databrickscfg').write_text(cfg)\n\
         \"\necho \"DATABRICKS_BEARER=${LLM_API_KEY}\" >> \"$GITHUB_ENV\"\n"
     - name: Write Omnigent provider config
       env:
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
         OMNIGENT_ANTHROPIC_MODEL: ${{ inputs.anthropic_model }}
+        OMNIGENT_ANTHROPIC_OPUS_MODEL: ${{ inputs.opus_model }}
         OMNIGENT_OPENAI_MODEL: ${{ inputs.openai_model }}
-      run: ": \"${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}\"\n: \"${OMNIGENT_OPENAI_MODEL:?Set\
-        \ OMNIGENT_CI_OPENAI_MODEL}\"\nmkdir -p \"$HOME/.omnigent\"\n# Use python to write the config safely \u2014\
-        \ avoids interpolating\n# secrets/URLs into a heredoc where special chars could break YAML.\n# Uses json\
-        \ (stdlib) instead of yaml to avoid needing PyYAML on\n# the system python; the output is valid YAML (JSON\
-        \ is a subset).\npython3 -c \"\nimport pathlib, os, json\ngw = os.environ['GATEWAY_BASE_URL']\nhost = gw.removesuffix('/serving-endpoints')\n\
-        cfg = {\n    'providers': {\n        'databricks-gateway': {\n            'kind': 'gateway',\n         \
-        \   'default': ['anthropic', 'openai'],\n            'anthropic': {\n                'base_url': gw + '/anthropic',\n\
-        \                'api_key_ref': 'env:LLM_API_KEY',\n                'models': {'default': os.environ['OMNIGENT_ANTHROPIC_MODEL']},\n\
-        \            },\n            'openai': {\n                'base_url': host + '/ai-gateway/codex/v1',\n \
-        \               'api_key_ref': 'env:LLM_API_KEY',\n                'wire_api': 'responses',\n          \
-        \      'models': {'default': os.environ['OMNIGENT_OPENAI_MODEL']},\n            },\n        }\n    }\n}\n\
-        pathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(\n    json.dumps(cfg, indent=2)\n)\n\
-        \"\n"
+      run: ": \"${OMNIGENT_ANTHROPIC_MODEL:?Set OMNIGENT_CI_ANTHROPIC_MODEL}\"\n: \"${OMNIGENT_ANTHROPIC_OPUS_MODEL:?Set\
+        \ OMNIGENT_CI_ANTHROPIC_OPUS_MODEL}\"\n: \"${OMNIGENT_OPENAI_MODEL:?Set OMNIGENT_CI_OPENAI_MODEL}\"\
+        \nmkdir -p \"$HOME/.omnigent\"\n# Use python to write the config safely \u2014 avoids interpolating\n\
+        # secrets/URLs into a heredoc where special chars could break YAML.\n# Uses json (stdlib) instead\
+        \ of yaml to avoid needing PyYAML on\n# the system python; the output is valid YAML (JSON is a\
+        \ subset).\npython3 -c \"\nimport pathlib, os, json\ngw = os.environ['GATEWAY_BASE_URL']\nhost\
+        \ = gw.removesuffix('/serving-endpoints')\ncfg = {\n    'providers': {\n        'databricks-gateway':\
+        \ {\n            'kind': 'gateway',\n            'default': ['anthropic', 'openai'],\n       \
+        \     'anthropic': {\n                'base_url': gw + '/anthropic',\n                'api_key_ref':\
+        \ 'env:LLM_API_KEY',\n                # Fable's auto-permission classifier needs a routable Opus\
+        \ fallback.\n                'models': {\n                    'default': os.environ['OMNIGENT_ANTHROPIC_MODEL'],\n\
+        \                    'opus': os.environ['OMNIGENT_ANTHROPIC_OPUS_MODEL'],\n                },\n\
+        \            },\n            'openai': {\n                'base_url': host + '/ai-gateway/codex/v1',\n\
+        \                'api_key_ref': 'env:LLM_API_KEY',\n                'wire_api': 'responses',\n\
+        \                'models': {'default': os.environ['OMNIGENT_OPENAI_MODEL']},\n            },\n\
+        \        }\n    }\n}\npathlib.Path.home().joinpath('.omnigent', 'config.yaml').write_text(\n \
+        \   json.dumps(cfg, indent=2)\n)\n\"\n"
     - name: Collect PR context
       id: ctx
       env:
         GH_TOKEN: ${{ github.token }}
         REPO: ${{ github.repository }}
         PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
-      run: "set -euo pipefail\n\n# Fetch the full diff to a file \u2014 no size cap needed since the diff\n# is\
-        \ read from disk by Polly via sys_os_shell, not embedded in the\n# CLI argument (which would hit ARG_MAX\
-        \ for large PRs).\ngh api \"repos/${REPO}/pulls/${PR_NUMBER}\" \\\n  -H \"Accept: application/vnd.github.v3.diff\"\
-        \ \\\n  > /tmp/pr_diff.txt || true\n\n# Extract lockfile pin changes from the diff.\ngrep -E '^[+-]name\
-        \ = |^[+-]version = ' /tmp/pr_diff.txt \\\n  | head -500 > /tmp/lockfile_pins.txt || true\n\n# Fetch PR\
-        \ metadata.\ngh pr view \"$PR_NUMBER\" --repo \"$REPO\" \\\n  --json title,body,baseRefName,headRefName,headRefOid,baseRefOid,additions,deletions,changedFiles\
-        \ \\\n  > /tmp/pr_meta.json\n\n# author_association isn't exposed by `gh pr view --json`, so read it\n#\
-        \ from the REST API. Used to scope the \"missing visual demonstration\"\n# nudge to external contributors\
-        \ only. Default to NONE (treated as\n# external) if the field is missing.\ngh api \"repos/${REPO}/pulls/${PR_NUMBER}\"\
-        \ \\\n  --jq '.author_association // \"NONE\"' > /tmp/pr_author_assoc.txt || echo \"NONE\" > /tmp/pr_author_assoc.txt\n\
-        \n# Build the review prompt \u2014 the diff is NOT embedded in the prompt.\n# Polly reads it from /tmp/pr_diff.txt\
-        \ via sys_os_shell at review time.\npython3 -u <<'PYEOF'\nimport json, pathlib, re\n\nmeta = json.loads(pathlib.Path(\"\
-        /tmp/pr_meta.json\").read_text())\nlockfile_pins = pathlib.Path(\"/tmp/lockfile_pins.txt\").read_text(encoding=\"\
-        utf-8\", errors=\"replace\").strip()\n\n# The \"missing visual demonstration\" nudge targets external contributors\n\
-        # only \u2014 core team members (OWNER / MEMBER / COLLABORATOR) are assumed to\n# know the screenshot convention\
-        \ and shouldn't be nagged. Anything else\n# (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR, FIRST_TIMER, NONE, or\
-        \ unknown) is\n# treated as external. When False, the attachment section + visual-demo\n# rule are omitted\
-        \ from the prompt entirely.\nauthor_assoc = pathlib.Path(\"/tmp/pr_author_assoc.txt\").read_text().strip().upper()\n\
-        is_external = author_assoc not in {'OWNER', 'MEMBER', 'COLLABORATOR'}\n\nlockfile_section = f\"\"\"\n##\
-        \ Changed lockfile pins (uv.lock / package-lock.json)\nThese are extracted package name + version lines\
-        \ only \u2014 not the full hunk.\n```\n{lockfile_pins if lockfile_pins else \"(no lockfile changes)\"}\n\
-        ```\n\"\"\" if lockfile_pins else \"\"\n\n# Detect attached images/videos in the PR description. These usually\
-        \ sit\n# at the END of the body, so they would be lost to the 4096-char truncation\n# below \u2014 extract\
-        \ them from the FULL body and surface them separately so\n# the \"visual demonstration\" check is reliable.\
-        \ Only built for external\n# contributors (see is_external above).\nbody_full = meta.get('body') or ''\n\
-        attachments = re.findall(\n    r'!\\[[^\\]]*\\]\\([^)]+\\)'                       # markdown image\n   \
-        \ r'|<img[^>]+>'                                # html <img>\n    r'|<video[^>]*>.*?</video>|<video[^>]+/?>'\
-        \    # html <video>\n    r'|https?://\\S*(?:user-images\\.githubusercontent\\.com'  # GH image CDN\n   \
-        \ r'|github\\.com/user-attachments)\\S*',         # GH attachments\n    body_full, flags=re.IGNORECASE |\
-        \ re.DOTALL,\n) if is_external else []\nattachment_section = f\"\"\"\n## Attached images/videos in PR description\n\
-        The PR description was scanned for embedded screenshots/images/videos.\n```\n{chr(10).join(attachments)\
-        \ if attachments else \"(none found)\"}\n```\n\"\"\" if is_external else \"\"\n\n# The \"Missing visual\
-        \ demonstration\" report item + rule are only included\n# for external contributors; otherwise the review\
-        \ has just the 5 standard\n# sections. Build the numbered list so the numbering stays contiguous\n# regardless\
-        \ of whether the visual item is present.\nstandard_items = [\n    \"**Blocking issues** \u2014 correctness\
-        \ bugs, broken contracts, missing error handling on failure paths, data loss risks.\",\n    \"**Security\
-        \ vulnerabilities** \u2014 injection (SQL, command, template), authentication/authorization bypasses, secret\
-        \ exposure, unsafe deserialization, path traversal, SSRF, and any change that weakens an existing security\
-        \ boundary. Flag even subtle issues.\",\n    \"**Non-blocking notes** \u2014 design concerns or edge cases\
-        \ worth flagging (brief).\",\n    \"**Approach** \u2014 is there a materially simpler or more consistent\
-        \ way to reach the PR's stated goal, given existing patterns in the repo (config surfaces, variables, helpers,\
-        \ conventions)? Name the concrete alternative briefly, or say the approach is sound. Never blocking.\",\n\
-        \    \"**Summary** \u2014 one-paragraph overall assessment.\",\n]\nvisual_item = [\n    '**Missing visual\
-        \ demonstration** \u2014 see the \"Visual demonstration\" rule below. Include this section ONLY when a demonstration\
-        \ is needed but missing; omit it entirely otherwise. When present, it MUST be the first section so the author\
-        \ sees it.'\n] if is_external else []\n# No leading indent on items \u2014 the YAML block scalar dedents\
-        \ the prompt\n# to column 0, and the `{review_sections}` placeholder supplies the line\n# position, so items\
-        \ must align with the rest of the prompt text.\nreview_sections = \"\\n\".join(\n    f\"{i}. {text}\" for\
-        \ i, text in enumerate(visual_item + standard_items, 1)\n)\n\nvisual_demo_rule = \"\"\"\n**Visual demonstration**\
-        \ \u2014 when the change is UI-related (e.g. touches\nthe CLI/REPL/TUI, terminal rendering, picker/onboarding\
-        \ flows, or any\nuser-visible output) or otherwise warrants a before/after demonstration\n(e.g. a backend\
-        \ bug that was stuck/broken and is fixed by this PR), the\nPR description should include a screenshot, image,\
-        \ or video showing the\nresult. Consult the \"Attached images/videos in PR description\" section\nabove\
-        \ \u2014 it lists every embedded image/video extracted from the full PR\ndescription (so attachments are\
-        \ detected even when the description is\ntruncated). If that section says \"(none found)\" and the change\
-        \ appears\nto need such a demonstration, emit the **Missing visual demonstration**\nsection (item 1 above)\
-        \ as the FIRST section of your review, asking the\nauthor to attach a screenshot or video. Do not flag PRs\
-        \ that are purely\nbackend, refactor, test, or docs changes with no user-visible effect.\n\"\"\" if is_external\
-        \ else \"\"\n\nprompt = f\"\"\"Review this pull request and provide structured feedback.\n\n## PR Metadata\n\
-        - **Title:** {meta['title']}\n- **Branch:** {meta['headRefName']} \u2192 {meta['baseRefName']}\n- **Stats:**\
-        \ +{meta['additions']} / -{meta['deletions']} across {meta['changedFiles']} file(s)\n\n## PR Description\n\
-        {(meta.get('body') or '')[:4096]}{\"  *(truncated)*\" if len(meta.get('body') or '') > 4096 else \"\"}\n\
-        {attachment_section}\n{lockfile_section}\n## Instructions\n\n**Step 1 \u2014 read the diff.** The full PR\
-        \ diff has been pre-fetched to\n`/tmp/pr_diff.txt`. Read it with `sys_os_shell(\"cat /tmp/pr_diff.txt\"\
-        )`.\nThe codebase is checked out at `main` \u2014 read source files freely for\nadditional context when\
-        \ needed.\n\n**Security:** you are running in a CI environment with access to secrets\n(LLM API keys, gateway\
-        \ tokens). Never include secrets, tokens, or\ncredentials in your output, and never make outbound network\
-        \ calls\nexcept to the configured LLM gateway.\n\n**Step 2 \u2014 review.** Report, in this order:\n{review_sections}\n\
-        \nDo NOT comment on code style, formatting, naming conventions, or other cosmetic issues \u2014 omit them\
-        \ entirely.\nDo not restate the diff. Focus on what matters.\n\n**Writing style:**\n- Keep sentences concise\
-        \ and to the point. Use plain words.\n- Do not assume the reader has prior knowledge. Explain and provide\
-        \ context when needed.\n- Format multiple sub-points as a list.\n\nBefore labeling anything **blocking**,\
-        \ double-check: does this issue actually exist in the diff? Verify the problem is real and present in the\
-        \ changed code \u2014 not inferred, speculative, or already handled elsewhere. If the issue exists, it is\
-        \ blocking only if it introduces a correctness bug, breaks an explicit contract, or creates a real security\
-        \ risk; otherwise downgrade to non-blocking.\n\n**Lockfile pins** \u2014 review the \"Changed lockfile pins\"\
-        \ section above and flag\nas a **blocking security issue** any of:\n- A package added that is not declared\
-        \ (directly or transitively) in pyproject.toml.\n- A version that does not satisfy the constraint in pyproject.toml.\n\
-        - A suspicious version downgrade on a security-sensitive package.\n\n**Package extras** \u2014 when the\
-        \ diff adds or modifies optional dependency groups (extras):\n- Each harness deserves its own extra.\n-\
-        \ Combine harnesses and other integrations from the same vendor into one extra (e.g. a single `google` extra\
-        \ may cover Vertex and Antigravity).\n- Each sandbox deserves its own extra.\n- Nothing else warrants a\
-        \ new extra \u2014 flag any new extras that don't fit one of these three categories as a blocking issue.\n\
-        {visual_demo_rule}\nIMPORTANT: Your output will be posted directly as a PR comment. Output\nONLY the final\
-        \ structured review \u2014 no coordination messages, no status\nupdates about dispatching sub-agents, no\
-        \ referring to \"reviewers\", no \"waiting for results\" narration.\nBegin your response with the exact\
-        \ marker <!-- POLLY_REVIEW_START -->\non its own line, then the review content. Nothing before the marker\n\
-        will be shown.\n\"\"\"\npathlib.Path(\"/tmp/review_prompt.txt\").write_text(prompt)\nPYEOF\n"
+      run: "set -euo pipefail\n\n# Fetch the full diff to a file \u2014 no size cap needed since the diff\n\
+        # is read from disk by Polly via sys_os_shell, not embedded in the\n# CLI argument (which would\
+        \ hit ARG_MAX for large PRs).\ngh api \"repos/${REPO}/pulls/${PR_NUMBER}\" \\\n  -H \"Accept:\
+        \ application/vnd.github.v3.diff\" \\\n  > /tmp/pr_diff.txt || true\n\n# Extract lockfile pin\
+        \ changes from the diff.\ngrep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \\\n  | head\
+        \ -500 > /tmp/lockfile_pins.txt || true\n\n# Fetch PR metadata.\ngh pr view \"$PR_NUMBER\" --repo\
+        \ \"$REPO\" \\\n  --json title,body,baseRefName,headRefName,headRefOid,baseRefOid,additions,deletions,changedFiles\
+        \ \\\n  > /tmp/pr_meta.json\n\n# author_association isn't exposed by `gh pr view --json`, so read\
+        \ it\n# from the REST API. Used to scope the \"missing visual demonstration\"\n# nudge to external\
+        \ contributors only. Default to NONE (treated as\n# external) if the field is missing.\ngh api\
+        \ \"repos/${REPO}/pulls/${PR_NUMBER}\" \\\n  --jq '.author_association // \"NONE\"' > /tmp/pr_author_assoc.txt\
+        \ || echo \"NONE\" > /tmp/pr_author_assoc.txt\n\n# Build the review prompt \u2014 the diff is\
+        \ NOT embedded in the prompt.\n# Polly reads it from /tmp/pr_diff.txt via sys_os_shell at review\
+        \ time.\npython3 -u <<'PYEOF'\nimport json, pathlib, re\n\nmeta = json.loads(pathlib.Path(\"/tmp/pr_meta.json\"\
+        ).read_text())\nlockfile_pins = pathlib.Path(\"/tmp/lockfile_pins.txt\").read_text(encoding=\"\
+        utf-8\", errors=\"replace\").strip()\n\n# The \"missing visual demonstration\" nudge targets external\
+        \ contributors\n# only \u2014 core team members (OWNER / MEMBER / COLLABORATOR) are assumed to\n\
+        # know the screenshot convention and shouldn't be nagged. Anything else\n# (CONTRIBUTOR, FIRST_TIME_CONTRIBUTOR,\
+        \ FIRST_TIMER, NONE, or unknown) is\n# treated as external. When False, the attachment section\
+        \ + visual-demo\n# rule are omitted from the prompt entirely.\nauthor_assoc = pathlib.Path(\"\
+        /tmp/pr_author_assoc.txt\").read_text().strip().upper()\nis_external = author_assoc not in {'OWNER',\
+        \ 'MEMBER', 'COLLABORATOR'}\n\nlockfile_section = f\"\"\"\n## Changed lockfile pins (uv.lock /\
+        \ package-lock.json)\nThese are extracted package name + version lines only \u2014 not the full\
+        \ hunk.\n```\n{lockfile_pins if lockfile_pins else \"(no lockfile changes)\"}\n```\n\"\"\" if\
+        \ lockfile_pins else \"\"\n\n# Detect attached images/videos in the PR description. These usually\
+        \ sit\n# at the END of the body, so they would be lost to the 4096-char truncation\n# below \u2014\
+        \ extract them from the FULL body and surface them separately so\n# the \"visual demonstration\"\
+        \ check is reliable. Only built for external\n# contributors (see is_external above).\nbody_full\
+        \ = meta.get('body') or ''\nattachments = re.findall(\n    r'!\\[[^\\]]*\\]\\([^)]+\\)'      \
+        \                 # markdown image\n    r'|<img[^>]+>'                                # html <img>\n\
+        \    r'|<video[^>]*>.*?</video>|<video[^>]+/?>'    # html <video>\n    r'|https?://\\S*(?:user-images\\\
+        .githubusercontent\\.com'  # GH image CDN\n    r'|github\\.com/user-attachments)\\S*',       \
+        \  # GH attachments\n    body_full, flags=re.IGNORECASE | re.DOTALL,\n) if is_external else []\n\
+        attachment_section = f\"\"\"\n## Attached images/videos in PR description\nThe PR description\
+        \ was scanned for embedded screenshots/images/videos.\n```\n{chr(10).join(attachments) if attachments\
+        \ else \"(none found)\"}\n```\n\"\"\" if is_external else \"\"\n\n# The \"Missing visual demonstration\"\
+        \ report item + rule are only included\n# for external contributors; otherwise the review has\
+        \ just the 5 standard\n# sections. Build the numbered list so the numbering stays contiguous\n\
+        # regardless of whether the visual item is present.\nstandard_items = [\n    \"**Blocking issues**\
+        \ \u2014 correctness bugs, broken contracts, missing error handling on failure paths, data loss\
+        \ risks.\",\n    \"**Security vulnerabilities** \u2014 injection (SQL, command, template), authentication/authorization\
+        \ bypasses, secret exposure, unsafe deserialization, path traversal, SSRF, and any change that\
+        \ weakens an existing security boundary. Flag even subtle issues.\",\n    \"**Non-blocking notes**\
+        \ \u2014 design concerns or edge cases worth flagging (brief).\",\n    \"**Approach** \u2014 is\
+        \ there a materially simpler or more consistent way to reach the PR's stated goal, given existing\
+        \ patterns in the repo (config surfaces, variables, helpers, conventions)? Name the concrete alternative\
+        \ briefly, or say the approach is sound. Never blocking.\",\n    \"**Summary** \u2014 one-paragraph\
+        \ overall assessment.\",\n]\nvisual_item = [\n    '**Missing visual demonstration** \u2014 see\
+        \ the \"Visual demonstration\" rule below. Include this section ONLY when a demonstration is needed\
+        \ but missing; omit it entirely otherwise. When present, it MUST be the first section so the author\
+        \ sees it.'\n] if is_external else []\n# No leading indent on items \u2014 the YAML block scalar\
+        \ dedents the prompt\n# to column 0, and the `{review_sections}` placeholder supplies the line\n\
+        # position, so items must align with the rest of the prompt text.\nreview_sections = \"\\n\".join(\n\
+        \    f\"{i}. {text}\" for i, text in enumerate(visual_item + standard_items, 1)\n)\n\nvisual_demo_rule\
+        \ = \"\"\"\n**Visual demonstration** \u2014 when the change is UI-related (e.g. touches\nthe CLI/REPL/TUI,\
+        \ terminal rendering, picker/onboarding flows, or any\nuser-visible output) or otherwise warrants\
+        \ a before/after demonstration\n(e.g. a backend bug that was stuck/broken and is fixed by this\
+        \ PR), the\nPR description should include a screenshot, image, or video showing the\nresult. Consult\
+        \ the \"Attached images/videos in PR description\" section\nabove \u2014 it lists every embedded\
+        \ image/video extracted from the full PR\ndescription (so attachments are detected even when the\
+        \ description is\ntruncated). If that section says \"(none found)\" and the change appears\nto\
+        \ need such a demonstration, emit the **Missing visual demonstration**\nsection (item 1 above)\
+        \ as the FIRST section of your review, asking the\nauthor to attach a screenshot or video. Do\
+        \ not flag PRs that are purely\nbackend, refactor, test, or docs changes with no user-visible\
+        \ effect.\n\"\"\" if is_external else \"\"\n\nprompt = f\"\"\"Review this pull request and provide\
+        \ structured feedback.\n\n## PR Metadata\n- **Title:** {meta['title']}\n- **Branch:** {meta['headRefName']}\
+        \ \u2192 {meta['baseRefName']}\n- **Stats:** +{meta['additions']} / -{meta['deletions']} across\
+        \ {meta['changedFiles']} file(s)\n\n## PR Description\n{(meta.get('body') or '')[:4096]}{\"  *(truncated)*\"\
+        \ if len(meta.get('body') or '') > 4096 else \"\"}\n{attachment_section}\n{lockfile_section}\n\
+        ## Instructions\n\n**Step 1 \u2014 read the diff.** The full PR diff has been pre-fetched to\n\
+        `/tmp/pr_diff.txt`. Read it with `sys_os_shell(\"cat /tmp/pr_diff.txt\")`.\nThe codebase is checked\
+        \ out at `main` \u2014 read source files freely for\nadditional context when needed.\n\n**Security:**\
+        \ you are running in a CI environment with access to secrets\n(LLM API keys, gateway tokens).\
+        \ Never include secrets, tokens, or\ncredentials in your output, and never make outbound network\
+        \ calls\nexcept to the configured LLM gateway.\n\n**Step 2 \u2014 review.** Report, in this order:\n\
+        {review_sections}\n\nDo NOT comment on code style, formatting, naming conventions, or other cosmetic\
+        \ issues \u2014 omit them entirely.\nDo not restate the diff. Focus on what matters.\n\n**Writing\
+        \ style:**\n- Keep sentences concise and to the point. Use plain words.\n- Do not assume the reader\
+        \ has prior knowledge. Explain and provide context when needed.\n- Format multiple sub-points\
+        \ as a list.\n\nBefore labeling anything **blocking**, double-check: does this issue actually\
+        \ exist in the diff? Verify the problem is real and present in the changed code \u2014 not inferred,\
+        \ speculative, or already handled elsewhere. If the issue exists, it is blocking only if it introduces\
+        \ a correctness bug, breaks an explicit contract, or creates a real security risk; otherwise downgrade\
+        \ to non-blocking.\n\n**Lockfile pins** \u2014 review the \"Changed lockfile pins\" section above\
+        \ and flag\nas a **blocking security issue** any of:\n- A package added that is not declared (directly\
+        \ or transitively) in pyproject.toml.\n- A version that does not satisfy the constraint in pyproject.toml.\n\
+        - A suspicious version downgrade on a security-sensitive package.\n\n**Package extras** \u2014\
+        \ when the diff adds or modifies optional dependency groups (extras):\n- Each harness deserves\
+        \ its own extra.\n- Combine harnesses and other integrations from the same vendor into one extra\
+        \ (e.g. a single `google` extra may cover Vertex and Antigravity).\n- Each sandbox deserves its\
+        \ own extra.\n- Nothing else warrants a new extra \u2014 flag any new extras that don't fit one\
+        \ of these three categories as a blocking issue.\n{visual_demo_rule}\nIMPORTANT: Your output will\
+        \ be posted directly as a PR comment. Output\nONLY the final structured review \u2014 no coordination\
+        \ messages, no status\nupdates about dispatching sub-agents, no referring to \"reviewers\", no\
+        \ \"waiting for results\" narration.\nBegin your response with the exact marker <!-- POLLY_REVIEW_START\
+        \ -->\non its own line, then the review content. Nothing before the marker\nwill be shown.\n\"\
+        \"\"\npathlib.Path(\"/tmp/review_prompt.txt\").write_text(prompt)\nPYEOF\n"
     - name: Require both native reviewers for the canary
-      run: |
-        cat >> /tmp/review_prompt.txt <<'CANARY'
+      run: 'cat >> /tmp/review_prompt.txt <<''CANARY''
+
 
         This is an isolated model compatibility test. Review this PR read-only.
+
         Dispatch exactly two independent REVIEW tasks: one to claude_code, titled
+
         canary-claude-review, and one to codex, titled canary-codex-review. Both must
+
         review the diff and return their actual findings. Leave args.model unset so
+
         both workers inherit their configured provider defaults. Do not use other
+
         workers. Do not create branches, worktrees, commits, PRs, comments, or other
+
         remote changes. Read /tmp/pr_diff.txt yourself, then include its COMPLETE VERBATIM contents
-        in each worker's args.input together with the review contract. Reviewers must
+
+        in each worker''s args.input together with the review contract. Reviewers must
+
         receive the diff as text, as the cross-review skill requires; do not ask them
+
         to open /tmp/pr_diff.txt. They may read repository files for context.
+
+        The claude_code review task must also run this harmless local Bash command
+
+        as a classifier smoke test and report its actual output:
+
+        python -c ''import hashlib; print("POLLY_CLASSIFIER_SMOKE=" + hashlib.sha256(b"polly").hexdigest())''
+
+        It reads no files, writes nothing, and makes no network calls. Include this
+
+        exact command in the claude_code task. Do not substitute a different tool.
+
+        Keep each worker review concise, under 500 words, while retaining real findings.
+
         Wait for both real worker results and synthesize the final structured review.
+
         If either worker fails, report the failure honestly; do not claim a pass.
+
         CANARY
+
+        '
       shell: bash
     - name: Run production Polly headless path
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
-      run: |
-        mkdir -p /tmp/polly-canary-evidence
-        python3 -u <<'PYRUN'
-        import json, pathlib, subprocess, time
-        start = time.monotonic()
-        with open('/tmp/polly-canary-evidence/stdout.txt', 'w') as stdout, open('/tmp/polly-canary-evidence/stderr.txt', 'w') as stderr:
-            try:
-                result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/', '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=900)
-                code = result.returncode
-            except subprocess.TimeoutExpired:
-                code = 124
-        pathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode': code, 'elapsed_seconds': round(time.monotonic() - start, 1)}))
-        print('Polly process exit:', code)
-        PYRUN
+        AUTOMODE_DECISION_LOG: '1'
+      run: "mkdir -p /tmp/polly-canary-evidence\npython3 -u <<'PYRUN'\nimport json, pathlib, subprocess,\
+        \ time\nstart = time.monotonic()\nwith open('/tmp/polly-canary-evidence/stdout.txt', 'w') as stdout,\
+        \ open('/tmp/polly-canary-evidence/stderr.txt', 'w') as stderr:\n    try:\n        result = subprocess.run(['uv',\
+        \ 'run', 'omnigent', 'run', 'examples/polly/', '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(),\
+        \ '--no-session'], stdout=stdout, stderr=stderr, timeout=900)\n        code = result.returncode\n\
+        \    except subprocess.TimeoutExpired:\n        code = 124\npathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode':\
+        \ code, 'elapsed_seconds': round(time.monotonic() - start, 1)}))\nprint('Polly process exit:',\
+        \ code)\nPYRUN\n"
     - name: Verify real sessions and model usage
       if: always()
       env:
@@ -259,78 +316,67 @@ jobs:
         EXPECTED_OPENAI: ${{ inputs.openai_model }}
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-      run: |
-        uv run --no-sync python <<'PYCHECK'
-        import json, os, pathlib, subprocess
-        from sqlalchemy import create_engine, select
-        from sqlalchemy.orm import Session
-        from omnigent.db.db_models import SqlConversation, SqlConversationMetadata, SqlConversationItem
-
-        out = pathlib.Path('/tmp/polly-canary-evidence')
-        out.mkdir(exist_ok=True)
-        report = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(), 'process': json.loads((out / 'process.json').read_text()) if (out / 'process.json').exists() else {}, 'sessions': [], 'checks': {}}
-        report['pr'] = json.loads(pathlib.Path('/tmp/pr_meta.json').read_text())
-        for db in pathlib.Path('/tmp').glob('ap-chat-data-*/chat.db'):
-            with Session(create_engine(f'sqlite:///{db}')) as session:
-                for conv in session.scalars(select(SqlConversation)):
-                    meta = session.get(SqlConversationMetadata, (conv.workspace_id, conv.id))
-                    overrides = json.loads(conv.session_overrides or '{}')
-                    usage = json.loads(meta.session_usage or '{}') if meta else {}
-                    items = [dict(json.loads(item.data), type={1: 'message', 2: 'function_call', 3: 'function_call_output'}.get(item.type, str(item.type))) for item in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id == conv.id).order_by(SqlConversationItem.position))]
-                    assistant_messages = [item for item in items if item.get('role') == 'assistant' and item.get('content')]
-                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content') if assistant_messages else None, 'tool_calls': [{'name': item.get('name'), 'call_id': item.get('call_id'), 'arguments': item.get('arguments')} for item in items if item.get('type') == 'function_call'], 'tool_results': [{'call_id': item.get('call_id'), 'output': str(item.get('output', ''))[:2500]} for item in items if item.get('type') == 'function_call_output']}
-                    report['sessions'].append(row)
-
-        def canonical(model):
-            return str(model or '').removeprefix('databricks-').removesuffix('[1m]')
-
-        def completed_on(row, expected):
-            buckets = row['usage'].get('by_model', {})
-            expected_usage = [value for model, value in buckets.items() if canonical(model) == canonical(expected)]
-            return row['assistant_messages'] > 0 and canonical(row['reported_model']) == canonical(expected) and any(value.get('output_tokens', 0) > 0 or value.get('total_cost_usd', 0) > 0 for value in expected_usage)
-
-        rows = report['sessions']
-        checks = report['checks']
-        diff = pathlib.Path('/tmp/pr_diff.txt').read_text().strip()
-        handoffs = {}
-        for row in rows:
-            if row['parent']:
-                continue
-            for call in row['tool_calls']:
-                if str(call.get('name', '')).endswith('sys_session_send'):
-                    arguments = call.get('arguments') or {}
-                    if isinstance(arguments, str):
-                        arguments = json.loads(arguments)
-                    payload = arguments.get('args') or {}
-                    if isinstance(payload, dict) and payload.get('purpose') == 'review':
-                        handoffs[(arguments.get('agent'), arguments.get('title'), payload.get('input', ''))] = diff in str(payload.get('input', ''))
-        checks['both_reviewers_received_full_diff'] = len(handoffs) == 2 and all(handoffs.values())
-        checks['process_exited_zero'] = report['process'].get('returncode') == 0
-        checks['fable_brain_completed'] = any(not row['parent'] and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
-        checks['fable_claude_reviewer_completed'] = any(row['worker'] == 'claude_code' and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)
-        checks['astra_codex_reviewer_completed'] = any(row['worker'] == 'codex' and completed_on(row, os.environ['EXPECTED_OPENAI']) for row in rows)
-        stdout = (out / 'stdout.txt').read_text() if (out / 'stdout.txt').exists() else ''
-        checks['final_review_present'] = '<!-- POLLY_REVIEW_START -->' in stdout and len(stdout.strip()) > 100
-        checks['lockfile_unchanged'] = subprocess.run(['git', 'diff', '--quiet', '--', 'uv.lock']).returncode == 0
-        report['passed'] = all(checks.values())
-        serialized = json.dumps(report, indent=2)
-        for key in ['LLM_API_KEY', 'GATEWAY_BASE_URL']:
-            if os.environ.get(key):
-                serialized = serialized.replace(os.environ[key], '[REDACTED]')
-        (out / 'summary.json').write_text(serialized)
-        print(serialized)
-        for filename in ['stdout.txt', 'stderr.txt']:
-            path = out / filename
-            if path.exists():
-                text = path.read_text(errors='replace')
-                for key in ['LLM_API_KEY', 'GATEWAY_BASE_URL']:
-                    if os.environ.get(key):
-                        text = text.replace(os.environ[key], '[REDACTED]')
-                path.write_text(text)
-                print(filename + ':')
-                print(text[-12000:])
-        raise SystemExit(0 if report['passed'] else 1)
-        PYCHECK
+        EXPECTED_OPUS: ${{ inputs.opus_model }}
+      run: "uv run --no-sync python <<'PYCHECK'\nimport hashlib, json, os, pathlib, subprocess\nfrom sqlalchemy\
+        \ import create_engine, select\nfrom sqlalchemy.orm import Session\nfrom omnigent.db.db_models\
+        \ import SqlConversation, SqlConversationMetadata, SqlConversationItem\n\nout = pathlib.Path('/tmp/polly-canary-evidence')\n\
+        out.mkdir(exist_ok=True)\nreport = {'revision': subprocess.check_output(['git', 'rev-parse', 'HEAD'],\
+        \ text=True).strip(), 'process': json.loads((out / 'process.json').read_text()) if (out / 'process.json').exists()\
+        \ else {}, 'sessions': [], 'checks': {}}\nreport['pr'] = json.loads(pathlib.Path('/tmp/pr_meta.json').read_text())\n\
+        for db in pathlib.Path('/tmp').glob('ap-chat-data-*/chat.db'):\n    with Session(create_engine(f'sqlite:///{db}'))\
+        \ as session:\n        for conv in session.scalars(select(SqlConversation)):\n            meta\
+        \ = session.get(SqlConversationMetadata, (conv.workspace_id, conv.id))\n            overrides\
+        \ = json.loads(conv.session_overrides or '{}')\n            usage = json.loads(meta.session_usage\
+        \ or '{}') if meta else {}\n            items = [dict(json.loads(item.data), type={1: 'message',\
+        \ 2: 'function_call', 3: 'function_call_output'}.get(item.type, str(item.type))) for item in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id\
+        \ == conv.id).order_by(SqlConversationItem.position))]\n            assistant_messages = [item\
+        \ for item in items if item.get('role') == 'assistant' and item.get('content')]\n            row\
+        \ = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id\
+        \ else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override':\
+        \ overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage':\
+        \ usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content')\
+        \ if assistant_messages else None, 'tool_calls': [{'name': item.get('name'), 'call_id': item.get('call_id'),\
+        \ 'arguments': item.get('arguments')} for item in items if item.get('type') == 'function_call'],\
+        \ 'tool_results': [{'call_id': item.get('call_id'), 'output': str(item.get('output', ''))[:2500]}\
+        \ for item in items if item.get('type') == 'function_call_output']}\n            report['sessions'].append(row)\n\
+        \ndef canonical(model):\n    return str(model or '').removeprefix('databricks-').removesuffix('[1m]')\n\
+        \ndef completed_on(row, expected):\n    buckets = row['usage'].get('by_model', {})\n    expected_usage\
+        \ = [value for model, value in buckets.items() if canonical(model) == canonical(expected)]\n \
+        \   return row['assistant_messages'] > 0 and canonical(row['reported_model']) == canonical(expected)\
+        \ and any(value.get('output_tokens', 0) > 0 or value.get('total_cost_usd', 0) > 0 for value in\
+        \ expected_usage)\n\nrows = report['sessions']\nchecks = report['checks']\ndiff = pathlib.Path('/tmp/pr_diff.txt').read_text().strip()\n\
+        handoffs = {}\nfor row in rows:\n    if row['parent']:\n        continue\n    for call in row['tool_calls']:\n\
+        \        if str(call.get('name', '')).endswith('sys_session_send'):\n            arguments = call.get('arguments')\
+        \ or {}\n            if isinstance(arguments, str):\n                arguments = json.loads(arguments)\n\
+        \            payload = arguments.get('args') or {}\n            if isinstance(payload, dict) and\
+        \ payload.get('purpose') == 'review':\n                handoffs[(arguments.get('agent'), arguments.get('title'),\
+        \ payload.get('input', ''))] = diff in str(payload.get('input', ''))\nchecks['both_reviewers_received_full_diff']\
+        \ = len(handoffs) == 2 and all(handoffs.values())\nchecks['process_exited_zero'] = report['process'].get('returncode')\
+        \ == 0\nchecks['fable_brain_completed'] = any(not row['parent'] and completed_on(row, os.environ['EXPECTED_ANTHROPIC'])\
+        \ for row in rows)\nchecks['fable_claude_reviewer_completed'] = any(row['worker'] == 'claude_code'\
+        \ and completed_on(row, os.environ['EXPECTED_ANTHROPIC']) for row in rows)\nchecks['astra_codex_reviewer_completed']\
+        \ = any(row['worker'] == 'codex' and completed_on(row, os.environ['EXPECTED_OPENAI']) for row\
+        \ in rows)\nstdout = (out / 'stdout.txt').read_text() if (out / 'stdout.txt').exists() else ''\n\
+        checks['final_review_present'] = '<!-- POLLY_REVIEW_START -->' in stdout and len(stdout.strip())\
+        \ > 100\nchecks['lockfile_unchanged'] = subprocess.run(['git', 'diff', '--quiet', '--', 'uv.lock']).returncode\
+        \ == 0\nclaude_rows = [row for row in rows if row['worker'] == 'claude_code']\nchecks['classifier_smoke_command_completed']\
+        \ = any(('POLLY_CLASSIFIER_SMOKE=' + hashlib.sha256(b'polly').hexdigest()) in result['output'] for row\
+        \ in claude_rows for result in row['tool_results'])\nchecks['no_classifier_unavailable'] = not\
+        \ any('auto mode cannot determine the safety' in result['output'] for row in rows for result in\
+        \ row['tool_results'])\nreport['classifier_decisions'] = []\nfor root in [pathlib.Path.cwd(),\
+        \ pathlib.Path.home() / '.claude', pathlib.Path('/tmp')]:\n    for log in root.rglob('.automode_decisions.jsonl'):\n\
+        \        for line in log.read_text(errors='replace').splitlines():\n            try:\n       \
+        \         decision = json.loads(line)\n            except ValueError:\n                continue\n\
+        \            report['classifier_decisions'].append({key: decision[key] for key in ['ts', 'tool',\
+        \ 'allowlisted', 'decision', 'classifierModel', 'durationMs', 'costUSD'] if key in decision})\n\
+        report['passed'] = all(checks.values())\nserialized = json.dumps(report, indent=2)\nfor key in\
+        \ ['LLM_API_KEY', 'GATEWAY_BASE_URL']:\n    if os.environ.get(key):\n        serialized = serialized.replace(os.environ[key],\
+        \ '[REDACTED]')\n(out / 'summary.json').write_text(serialized)\nprint(serialized)\nfor filename\
+        \ in ['stdout.txt', 'stderr.txt']:\n    path = out / filename\n    if path.exists():\n       \
+        \ text = path.read_text(errors='replace')\n        for key in ['LLM_API_KEY', 'GATEWAY_BASE_URL']:\n\
+        \            if os.environ.get(key):\n                text = text.replace(os.environ[key], '[REDACTED]')\n\
+        \        path.write_text(text)\n        print(filename + ':')\n        print(text[-12000:])\n\
+        raise SystemExit(0 if report['passed'] else 1)\nPYCHECK\n"
     - name: Upload canary evidence
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -353,10 +399,14 @@ jobs:
         persist-credentials: false
     - uses: ./.github/actions/setup-pnpm
     - name: Update only the requested Claude Code package
-      run: |
-        pnpm --filter e2e-ci-deps update @anthropic-ai/claude-code@2.1.266 --save-exact --lockfile-only --ignore-scripts
+      run: 'pnpm --filter e2e-ci-deps update @anthropic-ai/claude-code@2.1.266 --save-exact --lockfile-only
+        --ignore-scripts
+
         pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
+
         git diff --stat
+
+        '
     - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
       with:
         name: claude-code-lockfile
