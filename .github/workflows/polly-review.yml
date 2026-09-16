@@ -15,6 +15,11 @@ run-name: Polly model compatibility canary
         description: Candidate OpenAI gateway model
         required: true
         type: string
+      generate_lockfile:
+        description: Generate the Claude Code dependency lockfile update
+        required: false
+        type: boolean
+        default: false
 permissions:
   contents: read
   pull-requests: read
@@ -74,7 +79,7 @@ jobs:
         # this dir's node_modules empty.
         CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
         mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-        npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.255
+        npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.273
         node node_modules/@anthropic-ai/claude-code/install.cjs
         echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
     - name: Install Codex CLI
@@ -312,3 +317,26 @@ jobs:
         path: /tmp/polly-canary-evidence/
         retention-days: 7
         if-no-files-found: warn
+  lockfile:
+    if: inputs.generate_lockfile
+    name: Generate Claude Code lockfile update
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+      with:
+        ref: 6711c90b1bde2c75deef879b4a6d4bb81abd8610
+        persist-credentials: false
+    - uses: ./.github/actions/setup-pnpm
+    - name: Update only the requested Claude Code package
+      run: |
+        pnpm --filter e2e-ci-deps update @anthropic-ai/claude-code@2.1.273 --save-exact --lockfile-only --ignore-scripts --config.minimumReleaseAge=0
+        pnpm install --frozen-lockfile --ignore-scripts --filter e2e-ci-deps
+        git diff --stat
+    - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: claude-code-lockfile
+        path: pnpm-lock.yaml
+        retention-days: 7
