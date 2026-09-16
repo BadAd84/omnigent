@@ -586,6 +586,9 @@ aside[aria-label="Workspace"][data-maximized] {
   inset: 0 0 auto 0;
   height: 2.25rem;
   -webkit-app-region: drag;
+  /* Drag regions are geometric, so dragging still works; this keeps the fixed
+   * strip from swallowing DOM clicks on anything that lands in its band. */
+  pointer-events: none;
 }
 /* Drag regions are geometric (see the [data-electron-mac] counter-rule above):
  * a tall auth card scrolled up under the strip would lose clicks on whatever

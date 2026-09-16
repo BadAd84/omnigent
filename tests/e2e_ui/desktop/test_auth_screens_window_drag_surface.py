@@ -2,34 +2,27 @@
 
 On macOS the Electron shell hides the native title bar (``titleBarStyle:
 "hiddenInset"`` in ``web/electron/src/main.js``), so the web page is the
-window's ONLY drag surface: whatever screen is showing must carry a
-``-webkit-app-region: drag`` region or the user cannot move the window at all.
-The signed-in ``AppShell`` provides one (``.electron-drag-strip``, gated on
-``isMacElectronShell()``), and the bundled setup page carries its own
-``.drag-strip`` — but ``/login`` and ``/register`` sit OUTSIDE the AppShell
-route tree (``web/src/App.tsx``) and own minimal layouts, so they must render
-their own drag region (``ElectronWindowDragStrip``).
-
-Journey (the user-study report): install the desktop app on macOS → connect it
-to an accounts-gated (shared) server → the 401 redirect lands on the Sign in
-screen → try to drag the window → the window does not move (frozen).
-
-These tests pin that invariant in the browser lane: a real accounts-mode
-server (so ``/login`` / ``/register`` are actually routed) driven with the two
-signals ``isMacElectronShell()`` sniffs — a Macintosh user agent and the
-``window.omnigentDesktop`` preload bridge. The assertion is that each auth
-screen exposes at least one *visible* draggable window region; zero regions is
-exactly the frozen window. A control test pins the signed-in shell's drag
-strip so the probe machinery itself stays honest.
+window's ONLY drag surface: whatever screen is showing must carry a visible
+``-webkit-app-region: drag`` element or the user cannot move the window at
+all. The signed-in ``AppShell`` renders one (``.electron-drag-strip``, gated
+on ``isMacElectronShell()``); ``/login`` and ``/register`` mount OUTSIDE the
+AppShell route tree (``web/src/App.tsx``), so each must render its own
+(``ElectronWindowDragStrip``) — without one, connecting the desktop app to an
+accounts-gated (shared) server lands on a Sign in screen where the window is
+frozen.
 
 The OS-level symptom (the window not following the mouse) only exists on a
-macOS frameless window, which this harness cannot host — but the invariant
-"every screen a frameless window can show carries a drag region" is fully
-observable here, and is what a fix must restore.
+macOS frameless window, which this harness cannot host. The tests instead pin
+the fully observable invariant behind it — every screen the frameless window
+can show carries at least one visible drag region — against a real
+accounts-mode server (so ``/login`` / ``/register`` are actually routed),
+driven with the two signals ``isMacElectronShell()`` sniffs: a Macintosh user
+agent and the ``window.omnigentDesktop`` preload bridge.
 """
 
 from __future__ import annotations
 
+import os
 from collections.abc import Iterator
 from typing import Any
 
@@ -43,19 +36,16 @@ from tests.e2e_ui.auth._accounts_server import (
     spawn_accounts_server,
 )
 
-# The desktop shell's renderer UA: Chromium-on-macOS plus the Electron token.
-# ``isMacElectronShell()`` (web/src/lib/nativeBridge.ts) requires "Macintosh"
-# in the UA; the rest mirrors what a packaged mac build reports.
+# What a packaged mac desktop build's renderer reports; isMacElectronShell()
+# requires the "Macintosh" token.
 _MAC_ELECTRON_USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) omnigent-desktop/1.0.0 Chrome/126.0.0.0 "
     "Electron/31.0.0 Safari/537.36"
 )
 
-# The Electron preload bridge surface ``isElectronShell()`` detects
-# (``window.omnigentDesktop`` with ``kind: "electron"``), with no-op stubs for
-# the calls the SPA chrome makes during boot. Same shape the existing desktop
-# -bridge e2e tests stub (see sessions/test_settings_back_navigation.py).
+# The preload bridge surface isElectronShell() detects, with no-op stubs for
+# the calls the SPA chrome makes during boot.
 _ELECTRON_BRIDGE_STUB = """
 window.omnigentDesktop = {
   kind: "electron",
@@ -66,7 +56,7 @@ window.omnigentDesktop = {
 """
 
 # Every visible element whose computed style makes it a window-drag handle.
-# ``app-region`` is the standardized name; ``webkitAppRegion`` covers Chromium
+# `app-region` is the standardized name; `webkitAppRegion` covers Chromium
 # versions that only expose the prefixed form. Zero-sized elements are
 # excluded — a collapsed drag region cannot be grabbed.
 _VISIBLE_DRAG_REGIONS_JS = """
@@ -92,7 +82,7 @@ def accounts_server(
     """An accounts-mode server, so ``/login`` / ``/register`` are routed.
 
     The suite's shared ``live_server`` runs single-user with auth disabled, so
-    its route table omits the auth pages entirely (``accounts_enabled`` false).
+    its route table omits the auth pages entirely.
     """
     server_tmp = tmp_path_factory.mktemp("e2e_ui_window_drag")
     yield from spawn_accounts_server(mock_llm_server_url, server_tmp)
@@ -105,15 +95,18 @@ def mac_desktop_page(
 ) -> Iterator[Page]:
     """A page presenting as the macOS Electron desktop shell.
 
-    Both signals ``isMacElectronShell()`` checks are supplied: the Macintosh
-    user agent (context option) and the ``omnigentDesktop`` preload bridge
-    (init script). The plugin's context args are spread so --video/--tracing
-    keep working even though this builds its own context for the UA.
+    The plugin's context args are spread first so the UA override composes
+    with them; OMNIGENT_E2E_RECORD_DIR is honored directly because the
+    conftest's recording hook only patches the async Browser API.
     """
-    context = browser.new_context(
+    context_args: dict[str, Any] = {
         **browser_context_args,
-        user_agent=_MAC_ELECTRON_USER_AGENT,
-    )
+        "user_agent": _MAC_ELECTRON_USER_AGENT,
+    }
+    record_dir = os.environ.get("OMNIGENT_E2E_RECORD_DIR")
+    if record_dir:
+        context_args["record_video_dir"] = record_dir
+    context = browser.new_context(**context_args)
     page = context.new_page()
     page.add_init_script(_ELECTRON_BRIDGE_STUB)
     yield page
@@ -121,8 +114,21 @@ def mac_desktop_page(
 
 
 def _visible_drag_regions(page: Page) -> list[str]:
-    """Descriptors of every visible window-drag region on the current page."""
     return page.evaluate(_VISIBLE_DRAG_REGIONS_JS)
+
+
+def _attempt_window_drag(page: Page) -> None:
+    """The reported user action: grab the window's top edge and pull.
+
+    Paced like a real gesture so a journey recording shows the attempt.
+    """
+    page.mouse.move(400, 10)
+    page.mouse.down()
+    for x in range(420, 700, 40):
+        page.mouse.move(x, 14)
+        page.wait_for_timeout(80)
+    page.mouse.up()
+    page.wait_for_timeout(1_200)
 
 
 @pytest.mark.parametrize(
@@ -131,9 +137,8 @@ def _visible_drag_regions(page: Page) -> list[str]:
         # The 401 redirect target: what a desktop user connecting to a shared
         # accounts-gated server lands on first.
         pytest.param("/login", "#login-username", id="login"),
-        # The invite-redemption page a brand-new member opens from their
-        # invite link (rendered here in its no-invite state; the layout —
-        # and its missing drag region — is the same either way).
+        # The invite-redemption page (rendered here in its no-invite state;
+        # the layout — and its missing drag region — is the same either way).
         pytest.param("/register", "[role=alert]", id="register"),
     ],
 )
@@ -145,13 +150,15 @@ def test_auth_screens_offer_window_drag_surface(
 ) -> None:
     """Each auth screen must expose a draggable window region on mac Electron.
 
-    With the native title bar hidden, a screen with zero ``app-region: drag``
-    elements leaves the desktop window impossible to move — the "frozen
-    window". Guards the ElectronWindowDragStrip each auth layout renders.
+    With the native title bar hidden, a screen with zero visible
+    ``app-region: drag`` elements leaves the desktop window impossible to
+    move — the "frozen window" from the user study.
     """
     page = mac_desktop_page
     page.goto(f"{accounts_server.public_url}{path}")
     page.wait_for_selector(ready_selector, timeout=30_000)
+
+    _attempt_window_drag(page)
 
     regions = _visible_drag_regions(page)
     assert regions, (
@@ -168,10 +175,8 @@ def test_signed_in_shell_offers_window_drag_surface(
 ) -> None:
     """Control: the signed-in AppShell exposes its title-bar drag strip.
 
-    Passes today. Pins the working half of the journey — sign in through the
-    real form and land in the shell — so the drag-region probe above is known
-    to detect a strip when one exists, and so a regression that drops the
-    shell's own strip is caught too.
+    Passes today. Proves the drag-region probe detects a strip when one
+    exists, and guards the shell's own strip against regressing too.
     """
     page = mac_desktop_page
     page.goto(f"{accounts_server.public_url}/login")
@@ -180,8 +185,8 @@ def test_signed_in_shell_offers_window_drag_surface(
     page.fill("#login-password", ADMIN_PASSWORD)
     page.get_by_role("button", name="Sign in").click()
 
-    # A successful login hard-navigates into the AppShell, which renders the
-    # macOS title-bar drag strip (gated on isMacElectronShell()).
+    # A successful login lands in the AppShell, which renders the macOS
+    # title-bar drag strip (gated on isMacElectronShell()).
     page.wait_for_selector(".electron-drag-strip", state="attached", timeout=30_000)
 
     regions = _visible_drag_regions(page)
