@@ -274,7 +274,7 @@ jobs:
                     usage = json.loads(meta.session_usage or '{}') if meta else {}
                     items = [json.loads(item.data) for item in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id == conv.id).order_by(SqlConversationItem.position))]
                     assistant_messages = [item for item in items if item.get('role') == 'assistant' and item.get('content')]
-                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages)}
+                    row = {'id': str(conv.id), 'parent': str(conv.parent_conversation_id) if conv.parent_conversation_id else None, 'title': conv.title, 'worker': meta.sub_agent_name if meta else None, 'model_override': overrides.get('model_override'), 'reported_model': overrides.get('reported_model'), 'usage': usage, 'assistant_messages': len(assistant_messages), 'last_assistant_content': assistant_messages[-1].get('content') if assistant_messages else None}
                     report['sessions'].append(row)
 
         def canonical(model):
@@ -283,7 +283,7 @@ jobs:
         def completed_on(row, expected):
             buckets = row['usage'].get('by_model', {})
             expected_usage = [value for model, value in buckets.items() if canonical(model) == canonical(expected)]
-            return row['assistant_messages'] > 0 and any(value.get('output_tokens', 0) > 0 for value in expected_usage)
+            return row['assistant_messages'] > 0 and canonical(row['reported_model']) == canonical(expected) and any(value.get('output_tokens', 0) > 0 or value.get('total_cost_usd', 0) > 0 for value in expected_usage)
 
         rows = report['sessions']
         checks = report['checks']
