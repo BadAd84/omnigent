@@ -8786,16 +8786,14 @@ def _selected_daemon_records(
     :param all_targets: Whether ``--all`` was passed.
     :param default_all: Whether no selector should mean all records.
     :returns: Matching daemon records.
-    :raises click.ClickException: If ``--server`` and ``--all`` conflict.
+    :raises click.ClickException: If ``--server`` and ``--all`` conflict
+        outside a wrapper-managed deployment.
     """
-    if all_targets and server is not None:
-        # A deployment wrapper (e.g. `isaac omni`) rewrites every invocation
-        # to add its managed --server, so under a wrapper the conflict is an
-        # injected flag, not user intent: the explicit --all wins.
-        if _wrapper_managed_deployment():
-            server = None
-        else:
-            raise click.ClickException("Use either --server or --all, not both.")
+    # A deployment wrapper (e.g. `isaac omni`) rewrites every invocation to add
+    # its managed --server, so under a wrapper the conflict is an injected
+    # flag, not user intent: --all wins for every consumer of this selector.
+    if all_targets and server is not None and not _wrapper_managed_deployment():
+        raise click.ClickException("Use either --server or --all, not both.")
     if all_targets or (server is None and default_all):
         return _list_daemon_records()
     target = _normalize_daemon_target(_resolve_host_server(server))
