@@ -377,10 +377,15 @@ def _probe_first_served(
     candidates: tuple[str, ...],
     served: set[str],
     *,
+    erroring: set[str] | None = None,
     seen: list[str] | None = None,
     route_error: bool = False,
 ) -> str | None:
-    """Probe *candidates* against a codex route that serves only *served*."""
+    """Probe *candidates* against a codex route that serves only *served*.
+
+    Ids in *erroring* answer with a transient ``500`` instead of the 404
+    rejection or the served-model validation 400.
+    """
     from omnigent.models.databricks_model_discovery import first_served_codex_model
 
     def _handler(request: httpx.Request) -> httpx.Response:
@@ -393,6 +398,8 @@ def _probe_first_served(
         model = json.loads(request.content).get("model", "")
         if seen is not None:
             seen.append(model)
+        if erroring and model in erroring:
+            return httpx.Response(500, json={"error": "upstream hiccup"}, request=request)
         if model in served:
             # A validation 400 for the minimal probe body still proves the
             # model resource exists on the route.
@@ -440,6 +447,29 @@ def test_first_served_codex_model_rejecting_every_candidate_returns_none() -> No
     assert (
         _probe_first_served(("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5"), served=set()) is None
     )
+
+
+def test_first_served_codex_model_skips_a_transient_error_candidate() -> None:
+    """A 5xx answer proves nothing about the model, so the walk skips it.
+
+    Pinning a candidate on a transient error would recreate the unserved
+    launch default this probe exists to prevent.
+    """
+    seen: list[str] = []
+    picked = _probe_first_served(
+        ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2"),
+        served={"system.ai.glm-5-2"},
+        erroring={"system.ai.gpt-5-5"},
+        seen=seen,
+    )
+    assert picked == "system.ai.glm-5-2"
+    assert seen == ["system.ai.gpt-5-6-sol", "system.ai.gpt-5-5", "system.ai.glm-5-2"]
+
+
+def test_first_served_codex_model_no_affirmative_answer_returns_none() -> None:
+    """A walk of only errors cannot discriminate; the ranked default stands."""
+    candidates = ("system.ai.gpt-5-6-sol", "system.ai.gpt-5-5")
+    assert _probe_first_served(candidates, served=set(), erroring=set(candidates)) is None
 
 
 def test_first_served_codex_model_unreachable_route_fails_open() -> None:

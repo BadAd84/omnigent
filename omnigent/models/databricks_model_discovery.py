@@ -434,13 +434,17 @@ def first_served_codex_model(
     route rejects with ``404 RESOURCE_DOES_NOT_EXIST`` — so a launch default
     taken from the listing alone can die on the user's first turn. The route
     itself is the only servability oracle: each candidate gets a minimal
-    probe request, in rank order, and the first one the gateway does not
-    reject as absent wins.
+    probe request, in rank order, and the first one the route affirmatively
+    serves wins.
 
-    Fail-open by design: any non-404 answer (including a validation 400 for
-    the deliberately minimal probe body) proves the model resource exists,
-    and an unreachable route returns ``None`` so the caller keeps its ranked
-    default — a transient failure must never silently downgrade the launch.
+    Only affirmative answers count as served: a success, or a validation
+    ``400``/``422`` for the deliberately minimal probe body, proves the model
+    resource exists. A ``404`` rejects the candidate, and any other answer
+    (``5xx``, ``429``, auth errors) proves nothing about the model, so the
+    walk skips it rather than pinning a candidate on a transient error.
+    Fail-open by design: an unreachable route — or a walk with no affirmative
+    answer — returns ``None`` so the caller keeps its ranked default; a
+    transient failure must never silently downgrade the launch.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
@@ -448,8 +452,8 @@ def first_served_codex_model(
         :func:`discover_databricks_codex_models`. Probing stops after
         ``_CODEX_PROBE_MAX_MODELS`` ids so a large listing cannot stall the
         launch.
-    :returns: The first served id, or ``None`` when every probed candidate is
-        rejected or the route cannot be reached.
+    :returns: The first served id, or ``None`` when no probed candidate
+        answered affirmatively or the route cannot be reached.
     """
     url = f"{workspace_url.rstrip('/')}{_CODEX_RESPONSES_PATH}"
     headers = {"Authorization": f"Bearer {token}"}
@@ -461,7 +465,10 @@ def first_served_codex_model(
                 # The route is unreachable, so the probe cannot discriminate;
                 # let the caller keep its ranked default.
                 return None
-            if response.status_code != 404:
+            # The gateway's RESOURCE_DOES_NOT_EXIST rejection is model-level:
+            # a served model answers the minimal body with a success or a
+            # validation 400/422, never a 404.
+            if response.is_success or response.status_code in (400, 422):
                 return model_id
     return None
 
