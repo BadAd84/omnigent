@@ -4,7 +4,7 @@ On Azure workspaces the AI Gateway's Unity Catalog
 model-services listing advertises GPT models even though the workspace does
 not serve them -- POSTing a turn to the Codex Responses route returns
 ``404 RESOURCE_DOES_NOT_EXIST``. Omnigent's codex launch trusts that listing
-(:func:`omnigent.databricks_model_discovery.discover_databricks_codex_models`)
+(:func:`omnigent.models.databricks_model_discovery.discover_databricks_codex_models`)
 and pins the top-ranked GPT id as the launch default, so the user's very
 first ucode turn errors with the gateway 404 -- even though the same
 workspace serves another codex-compatible model that would have worked.
@@ -266,7 +266,7 @@ async def test_azure_gpt_listing_does_not_404_first_codex_turn(
 
         # The launch-default resolution the ucode/codex-native launch runs
         # with no explicit model: pick from the workspace's live listing.
-        from omnigent.codex_native_app_server import _resolve_databricks_codex_model
+        from omnigent.harnesses.codex_native.app_server import _resolve_databricks_codex_model
 
         launch_model = _resolve_databricks_codex_model(gateway.host, "azure", None)
 
