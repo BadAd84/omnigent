@@ -549,10 +549,10 @@ jobs:
           raw = pathlib.Path('/tmp/polly_output.txt').read_text()
           sentinel = '<!-- POLLY_REVIEW_START -->'
           # Headless output can include earlier drafts before the final review.
-          # Keep only the last marked review.
-          idx = raw.rfind(sentinel)
-          if idx >= 0:
-              cleaned = raw[idx + len(sentinel):].lstrip('\n')
+          # Only standalone marker lines separate reviews; inline quotes do not.
+          markers = list(re.finditer(r'^' + re.escape(sentinel) + r'$', raw, re.MULTILINE))
+          if markers:
+              cleaned = raw[markers[-1].end():].lstrip('\n')
           else:
               m = re.search(r'^#{1,6} ', raw, re.MULTILINE)
               cleaned = raw[m.start():] if m else ''
