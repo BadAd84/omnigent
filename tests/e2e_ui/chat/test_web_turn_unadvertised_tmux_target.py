@@ -13,6 +13,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _TMUX_FILE,
     read_active_session_id,
 )
+from tests.e2e_ui.conftest import configure_mock_llm
 
 _log = logging.getLogger(__name__)
 
@@ -21,6 +22,7 @@ _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _TERMINAL_VIEW = '[data-testid="terminal-view"]'
 _ERROR_PILL = '[data-testid="error-pill"]'
 _NOT_ADVERTISED = "not advertised"
+_ECHO_TOKEN = "advertok"
 
 # The pane's tmux target must advertise within this long after connect. A
 # healthy runner writes tmux.json within ~1s of the pane launching.
@@ -94,7 +96,8 @@ def _not_advertised_error_text(page: Page) -> str | None:
 @pytest.mark.timeout(300)
 def test_web_turn_survives_unadvertised_tmux_target(
     page: Page,
-    native_claude_session: tuple[str, str],
+    native_claude_mock_session: tuple[str, str],
+    mock_llm_server_url: str,
 ) -> None:
     """A web turn must not hard-fail when the tmux target is momentarily absent.
 
@@ -102,7 +105,13 @@ def test_web_turn_survives_unadvertised_tmux_target(
     a web-chat turn must re-establish the target and deliver the message --
     never surface "Claude terminal tmux target is not advertised yet".
     """
-    base_url, session_id = native_claude_session
+    base_url, session_id = native_claude_mock_session
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": _ECHO_TOKEN}],
+        key="unadvertised-tmux",
+        match=_ECHO_TOKEN,
+    )
     _log.info("session ready base=%s id=%s", base_url, session_id)
 
     page.goto(f"{base_url}/c/{session_id}")
@@ -122,7 +131,7 @@ def test_web_turn_survives_unadvertised_tmux_target(
         segment.click()
     composer = page.get_by_placeholder(_COMPOSER)
     composer.wait_for(state="visible", timeout=30_000)
-    composer.fill("Reply with exactly this token and nothing else: advertok")
+    composer.fill(f"Reply with exactly this token and nothing else: {_ECHO_TOKEN}")
     page.get_by_role("button", name="Send", exact=True).click()
     t_send = time.monotonic()
     _log.info("sent web-chat turn")
@@ -139,7 +148,7 @@ def test_web_turn_survives_unadvertised_tmux_target(
                 f"{time.monotonic() - t_send:.0f}s after send because the tmux "
                 f"target was not advertised -- {message!r}"
             )
-        if page.locator(_ASSISTANT).filter(has_text="advertok").count() > 0:
+        if page.locator(_ASSISTANT).filter(has_text=_ECHO_TOKEN).count() > 0:
             _log.info("turn delivered %.0fs after send", time.monotonic() - t_send)
             return
         page.wait_for_timeout(500)
