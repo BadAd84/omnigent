@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import errno
+import json
 import logging
 import subprocess
 import sys
@@ -51,6 +52,8 @@ from omnigent.host.frames import (
     HostRunnerExitedFrame,
     HostRunnerStatusFrame,
     HostRunnerStatusResultFrame,
+    HostSkillsFrame,
+    HostSkillsResultFrame,
     HostStatFrame,
     HostStatResultFrame,
     HostStopRunnerFrame,
@@ -107,6 +110,149 @@ def _no_real_zygote(monkeypatch: pytest.MonkeyPatch) -> None:
     from omnigent.runner._zygote import ZYGOTE_ENABLED_ENV_VAR
 
     monkeypatch.setenv(ZYGOTE_ENABLED_ENV_VAR, "0")
+
+
+def _write_discovery_skill(root: Path, name: str, *, visible: bool = True) -> None:
+    skill_dir = root / name
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: {name} description\n"
+        f"user-invocable: {str(visible).lower()}\n---\nprivate skill body\n"
+    )
+
+
+@pytest.mark.parametrize(
+    "harness,expected",
+    [
+        ("claude-native", {"project", "user", "toolkit:review"}),
+        ("codex-native", {"codex-user"}),
+    ],
+)
+async def test_host_discovers_harness_skills_without_a_runner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, harness: str, expected: set[str]
+) -> None:
+    home = tmp_path / "home"
+    workspace = tmp_path / "project with spaces"
+    home.mkdir()
+    (home / "project with spaces").symlink_to(workspace, target_is_directory=True)
+    monkeypatch.setattr(Path, "home", lambda: home)
+    monkeypatch.setenv("HOME", str(home))
+    config = tmp_path / "claude-config"
+    codex_home = tmp_path / "codex-config"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
+    monkeypatch.setenv("CODEX_HOME", str(codex_home))
+    _write_discovery_skill(workspace / ".claude" / "skills", "project")
+    _write_discovery_skill(workspace / ".claude" / "skills", "hidden", visible=False)
+    _write_discovery_skill(workspace / ".agents" / "skills", "agents")
+    _write_discovery_skill(config / "skills", "user")
+    _write_discovery_skill(config / "skills", "project")
+    _write_discovery_skill(codex_home / "skills", "codex-user")
+    _write_discovery_skill(home / ".claude" / "skills", "wrong-config-home")
+    plugin = config / "plugins" / "cache" / "market" / "toolkit" / "1.0"
+    _write_discovery_skill(plugin / "skills", "review")
+    (config / "settings.json").write_text(json.dumps({"enabledPlugins": {"toolkit@market": True}}))
+    (config / "plugins" / "installed_plugins.json").write_text(
+        json.dumps(
+            {
+                "version": 2,
+                "plugins": {"toolkit@market": [{"scope": "user", "installPath": str(plugin)}]},
+            }
+        )
+    )
+
+    host = _make_host_process()
+    result = host._handle_skills(
+        HostSkillsFrame(request_id="r", harness=harness, path="~/project with spaces")
+    )
+    assert result.status == "ok", result.error
+    assert {skill["name"] for skill in result.skills} == expected
+    assert len(result.skills) == len(expected)
+    assert all(set(skill) == {"name", "description"} for skill in result.skills)
+    assert "private skill body" not in encode_host_frame(result)
+    assert host._alive_runner_ids() == []
+
+
+@pytest.mark.parametrize(
+    "path,error_code",
+    [
+        ("", "invalid_path"),
+        ("relative/path", "invalid_path"),
+        ("bad\x00path", "invalid_path"),
+        ("missing", "not_directory"),
+        ("file", "not_directory"),
+    ],
+)
+async def test_host_skills_rejects_invalid_directory(
+    tmp_path: Path, path: str, error_code: str
+) -> None:
+    (tmp_path / "file").write_text("not a directory")
+    if path in {"missing", "file"}:
+        path = str(tmp_path / path)
+    result = _make_host_process()._handle_skills(
+        HostSkillsFrame(request_id="r", harness="claude-native", path=path)
+    )
+    assert result.status == "failed"
+    assert result.error_code == error_code
+
+
+async def test_host_skills_distinguishes_empty_and_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    host = _make_host_process()
+    frame = HostSkillsFrame(request_id="r", harness="claude-native", path=str(tmp_path))
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", lambda *_: [])
+    assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
+
+    def fail(*_args: object) -> None:
+        raise OSError("unreadable skill directory")
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", fail)
+    host = _make_host_process()
+    result = host._handle_skills(frame)
+    assert result.status == "failed"
+    assert result.error_code == "discovery_failed"
+
+
+async def test_host_skills_does_not_block_tunnel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.host import skills as skill_sources
+
+    host = _make_host_process()
+    ws = _RecordingWS()
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def slow_discovery(*_args: object) -> list[object]:
+        loop.call_soon_threadsafe(started.set)
+        assert release.wait(timeout=5)
+        return []
+
+    monkeypatch.setattr(skill_sources, "resolve_harness_skills", slow_discovery)
+    host._start_frame_task(
+        ws,  # type: ignore[arg-type] — duck-typed WebSocket
+        encode_host_frame(
+            HostSkillsFrame(request_id="skills", harness="claude-native", path=str(tmp_path))
+        ),
+    )
+    try:
+        await asyncio.wait_for(started.wait(), timeout=2)
+        await host._handle_raw_message(
+            ws,  # type: ignore[arg-type] — duck-typed WebSocket
+            encode_host_frame(HostStatFrame(request_id="stat", path=str(tmp_path))),
+        )
+        reply = decode_host_frame(ws.sent[0])
+        assert isinstance(reply, HostStatResultFrame)
+        assert reply.request_id == "stat"
+    finally:
+        release.set()
+        await _drain_frame_tasks(host)
+    assert decode_host_frame(ws.sent[-1]) == HostSkillsResultFrame(
+        request_id="skills", status="ok"
+    )
 
 
 async def test_handle_model_options_serves_the_claude_catalog(
@@ -4235,8 +4381,29 @@ def test_run_host_process_announces_session_log_dir_on_start(
     assert "This host's log: ~/.omnigent/logs/host/host-" in out
 
 
+class _ConnectReachedThenPark:
+    """Async-CM stand-in for ``websockets.asyncio.client.connect``.
+
+    Signals that the host reached its connect attempt (the step that
+    registers it), then parks until the test cancels ``run()`` so a
+    background startup task can be observed completing meanwhile.
+    """
+
+    def __init__(self, reached: asyncio.Event) -> None:
+        self._reached = reached
+
+    async def __aenter__(self) -> object:
+        self._reached.set()
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+
 async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """Host startup reclaims native bridge dirs orphaned by a crashed runner.
 
@@ -4244,21 +4411,46 @@ async def test_run_sweeps_orphaned_native_bridge_dirs_on_startup(
     never runs its explicit-delete cleanup, and if no new runner ever
     launches on the machine the runner-side startup sweep never fires
     either — so ``~/.omnigent`` grows without bound. The host daemon's own
-    (re)start is the reliable moment to reap: ``run()`` must invoke the
-    cross-harness bridge-dir sweep before entering the connect loop.
+    (re)start is the reliable moment to reap — in the background: the sweep
+    must complete while the connect loop (which registers the host) is
+    already underway, not as a startup prerequisite, and it must be torn
+    down cleanly when ``run()`` exits.
     """
-    monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
-    _patch_connect(monkeypatch, _ConnectSpy([asyncio.CancelledError()]))
+    import websockets.asyncio.client as ws_client
+
+    import omnigent.runner._entry as entry_mod
+
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", lambda *, server_url=None: None)
+    connect_reached = asyncio.Event()
+    monkeypatch.setattr(
+        ws_client, "connect", lambda url, **kwargs: _ConnectReachedThenPark(connect_reached)
+    )
     sweeps: list[int] = []
     monkeypatch.setattr(
         "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
         lambda: sweeps.append(1) or 3,
     )
     host = _host()
+    host._capabilities_initialized = True
+    host._zygote_disabled = True  # keep the test from prestarting a zygote
 
-    await host.run()
+    caplog.set_level(logging.INFO, logger="omnigent.host.connect")
+    run_task = asyncio.create_task(host.run())
+    try:
+        await asyncio.wait_for(connect_reached.wait(), timeout=10.0)
+        sweep_task = host._bridge_sweep_task
+        assert sweep_task is not None, "run() never launched the bridge-dir sweep"
+        # The host is parked in its connect attempt; the sweep completes
+        # concurrently rather than gating registration.
+        await asyncio.wait_for(asyncio.shield(sweep_task), timeout=10.0)
+    finally:
+        run_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            await run_task
 
     assert sweeps == [1]
+    assert "Reaped 3 orphaned native bridge dir(s)" in caplog.text
+    assert host._bridge_sweep_task is None, "run() teardown left the sweep task"
 
 
 async def test_run_survives_a_failing_native_bridge_dir_sweep(
@@ -4283,6 +4475,23 @@ async def test_run_survives_a_failing_native_bridge_dir_sweep(
 
     # Startup completes (run returns via the clean cancel) despite the raise.
     await host.run()
+
+
+async def test_bridge_dir_sweep_failure_is_contained(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failing sweep is housekeeping: it must never escape its background task."""
+
+    def _boom() -> int:
+        raise RuntimeError("sweep exploded")
+
+    monkeypatch.setattr(
+        "omnigent.native.native_bridge_common.reap_orphaned_native_bridge_dirs",
+        _boom,
+    )
+    host = _host()
+    # Must swallow the failure (logged at debug), not raise.
+    await host._sweep_orphaned_bridge_dirs()
 
 
 async def test_launch_cancelled_midspawn_does_not_leak_untracked_runner(
