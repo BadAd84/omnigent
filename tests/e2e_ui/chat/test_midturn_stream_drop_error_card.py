@@ -1,34 +1,7 @@
-"""Claude stops mid-response, then a delayed *generic* runtime error.
+"""A provider stream drop has a specific failure description while the host stays online.
 
-Reported journey (Omnigent desktop, a Claude session):
-
-1. open a session and send a prompt
-2. Claude starts responding (text streams in)
-3. the model stream dies mid-flight — the answer stops with no message/error,
-   yet the host is still connected
-4. after waiting a few seconds a runtime-error card appears
-
-Reported impact: "User is confused if Claude is still running or not. Not sure
-what the issue is." — i.e. the turn stops silently and the error that finally
-appears is a *generic* card that never names what actually went wrong (the
-model stream dropped mid-turn), so the user cannot tell a dropped connection
-from a still-running turn.
-
-Driven here on the real web SPA against a live server + runner and the real
-claude CLI pointed at the mock Anthropic endpoint. The mock scripts the user
-turn's model calls — routed by a content token so only this turn is affected —
-to open a normal SSE stream, emit a couple of text deltas, then die mid-flight
-without a ``message_stop``. Every retry the CLI attempts also dies mid-stream,
-so the turn fails as a dropped-connection error after it visibly started. The
-runner is never killed, so the host stays online the whole time (matching
-"Host also still seems connected").
-
-Regression guard: a mid-turn stream drop must surface as a card that *names*
-the failure (a dropped/lost connection to the agent), NOT the generic
-catch-all "Something went wrong" (nor the ``runner_error`` "setting up the turn
-on the host" misattribution). On the current build the card headline is the
-bare "Something went wrong" fallback — the final assertion FAILS there and
-passes once the mid-turn failure is classified for the user.
+The local provider stub emits partial text and then drops every retry. The web
+client must show the resulting connection failure instead of a generic error.
 """
 
 from __future__ import annotations
