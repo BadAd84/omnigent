@@ -3,21 +3,23 @@ r"""UI journey: uploading an HTML file must not make its source the session titl
 On a native Codex ("codex-native") session, attaching an ``.html`` file to the
 first prompt must not make the *HTML source code* the session title. The web
 composer uploads the file as an ``input_file`` block (title seeding ignores
-those), but if ``codex_native_executor._file_block_to_input_item`` inlines a
+those), but ``codex_native_executor._file_block_to_input_item`` inlines a
 ``text/*`` attachment's full content as a plain ``text`` input item (instead of
 the ``[Attached file: ...]`` marker that title seeding strips), Codex echoes
 the turn's ``userMessage`` back, the forwarder's ``_post_user_message`` joins
 every text block — raw HTML included — into one ``input_text``, and
 ``_seed_missing_title_from_user_message`` synthesizes the session title from
-it, so the sidebar shows ``<!DOCTYPE html> <html lang=...`` instead of a
-meaningful name.
+it. Attachments precede typed text in the composer's content blocks, so the
+seeded title is the file's source: ``<!DOCTYPE html> <html lang=...``.
 
-The journey is the real user path: open a codex-native session, wait for the
-TUI to attach, attach an ``.html`` file plus a short typed prompt in the chat
-composer, send, and let the native round-trip seed the title. The assertion
-pins the *correct* behavior — the persisted session title must not contain the
-attached file's HTML source — so this test fails while the bug is live and
-passes once it is fixed.
+Background session titles (default on) later overwrite the seeded title with
+an LLM-generated one, which hides the leak from a fixed-interval poll. The
+journey therefore starts by switching that setting off through the real
+Settings toggle — the configuration on which the leaked title is what the user
+keeps — so the assertion pins the seeding path itself. It asserts the
+*correct* behavior — the persisted session title must not contain the attached
+file's HTML source — so this test fails while the bug is live and passes once
+it is fixed.
 
 LLM calls are served by the in-process mock LLM server (see
 ``native_codex_mock_session`` in ``conftest.py``); run with ``LLM_API_KEY``
@@ -110,6 +112,20 @@ def _wait_for_title(base_url: str, session_id: str) -> str:
     )
 
 
+def _disable_background_session_titles(page: Page, base_url: str) -> None:
+    """Switch the Settings → General background-titles preference off.
+
+    :param page: The Playwright page.
+    :param base_url: Spawned server base URL.
+    """
+    page.goto(f"{base_url}/settings/general")
+    toggle = page.get_by_test_id("background-session-titles-toggle")
+    expect(toggle).to_be_visible(timeout=30_000)
+    expect(toggle).to_have_attribute("aria-checked", "true")
+    toggle.click()
+    expect(toggle).to_have_attribute("aria-checked", "false")
+
+
 @pytest.mark.nightly
 @pytest.mark.timeout(300)
 def test_html_upload_does_not_become_session_title(
@@ -121,6 +137,8 @@ def test_html_upload_does_not_become_session_title(
     """An HTML attachment's source must not be seeded as the session title."""
     base_url, session_id = native_codex_mock_session
     _log.info("native-codex mock session ready: base_url=%s session_id=%s", base_url, session_id)
+
+    _disable_background_session_titles(page, base_url)
 
     page.goto(f"{base_url}/c/{session_id}")
     _open_terminal_view(page)
