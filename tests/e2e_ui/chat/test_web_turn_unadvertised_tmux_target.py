@@ -1,35 +1,4 @@
-"""E2E regression: web-chat delivery must survive an unadvertised Claude tmux target.
-
-A web-chat turn to a ``claude-native`` ("Claude Code") session is delivered by
-injecting into the session's tmux pane. Before injecting, the harness bridge
-waits (``_wait_for_tmux_info``, up to ``_TMUX_READY_TIMEOUT_S`` = 30s) for the
-runner to advertise the pane's tmux target by writing ``tmux.json`` into the
-bridge directory. If that advertisement is not present when the turn injects,
-the wait times out and the turn hard-fails with:
-
-    inner executor error: Claude terminal tmux target is not advertised yet.
-    Wait for the terminal to launch before sending messages from the web UI.
-
-In production this fired when the runner was starved enough that the
-``tmux.json`` write lagged past the 30s inject wait while the pane was already
-registered and alive -- so the turn-time self-heal
-(``_ensure_native_terminal_for_turn``) saw a live pane, returned early WITHOUT
-re-establishing the advertisement, and the inject raced an absent target.
-
-This test reproduces that read-side condition deterministically and faithfully:
-it brings the terminal fully up, then removes the ``tmux.json`` advertisement
-while leaving the pane alive (exactly the "pane alive, target not advertised"
-state the starved runner produced), and sends a web turn. The pane is alive, so
-the turn *can* be delivered once the runner re-advertises the target; a healthy
-delivery path must not hard-fail the turn with "tmux target is not advertised".
-
-Assertion direction is fail->pass across the fix:
-
-* On the buggy build the turn hard-fails ~30s after send with the
-  "not advertised" error pill -> this test FAILS.
-* A fix that re-establishes / waits for the advertisement before injecting
-  delivers the turn -> this test PASSES.
-"""
+"""Web-chat delivery restores a missing advertisement for its live Claude pane."""
 
 from __future__ import annotations
 
@@ -39,7 +8,11 @@ import time
 import pytest
 from playwright.sync_api import Page
 
-from omnigent.harnesses.claude_native.bridge import _BRIDGE_ROOT, _TMUX_FILE
+from omnigent.harnesses.claude_native.bridge import (
+    _BRIDGE_ROOT,
+    _TMUX_FILE,
+    read_active_session_id,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -78,23 +51,19 @@ def _wait_terminal_connected(page: Page, timeout_ms: int) -> None:
     raise AssertionError(f"terminal never reached 'connected' within {timeout_ms}ms")
 
 
-def _remove_tmux_advertisement() -> str:
-    """Remove the freshest ``tmux.json`` advertisement under the bridge root.
+def _remove_tmux_advertisement(session_id: str) -> str:
+    """Remove the advertisement owned by the fixture's session.
 
-    The runner (a local subprocess sharing this uid) writes each session's
-    ``tmux.json`` under ``/tmp/omnigent-<uid>/claude-native/<digest>/``. The
-    active session's file is the most recently written; removing it injects the
-    fault -- the tmux target is no longer advertised while the pane stays
-    alive -- without touching product code.
-
+    :param session_id: Session whose pane should lose its advertisement.
     :returns: The path of the removed advertisement.
     """
-    recent = [
-        p for p in _BRIDGE_ROOT.glob(f"*/{_TMUX_FILE}") if time.time() - p.stat().st_mtime < 600
+    matches = [
+        p
+        for p in _BRIDGE_ROOT.glob(f"*/{_TMUX_FILE}")
+        if read_active_session_id(p.parent) == session_id
     ]
-    recent.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    assert recent, f"no fresh tmux.json advertisement found under {_BRIDGE_ROOT}"
-    target = recent[0]
+    assert len(matches) == 1, "expected exactly one advertisement for the fixture session"
+    target = matches[0]
     target.unlink()
     assert not target.exists()
     return str(target)
@@ -139,11 +108,11 @@ def test_web_turn_survives_unadvertised_tmux_target(
     page.goto(f"{base_url}/c/{session_id}")
 
     # Bring the terminal fully up so tmux.json has been written and the pane is
-    # alive -- the exact precondition of the production race.
+    # alive before removing this session's advertisement.
     _wait_terminal_connected(page, _TERMINAL_READY_TIMEOUT_MS)
 
     # Inject the fault: the tmux target is no longer advertised, pane still alive.
-    removed = _remove_tmux_advertisement()
+    removed = _remove_tmux_advertisement(session_id)
     _log.info("removed tmux advertisement: %s", removed)
 
     # Switch to the chat composer and send a web-chat turn (the user's action).
@@ -170,7 +139,7 @@ def test_web_turn_survives_unadvertised_tmux_target(
                 f"{time.monotonic() - t_send:.0f}s after send because the tmux "
                 f"target was not advertised -- {message!r}"
             )
-        if page.locator(_ASSISTANT).count() > 0:
+        if page.locator(_ASSISTANT).filter(has_text="advertok").count() > 0:
             _log.info("turn delivered %.0fs after send", time.monotonic() - t_send)
             return
         page.wait_for_timeout(500)

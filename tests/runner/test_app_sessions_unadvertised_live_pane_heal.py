@@ -1,18 +1,9 @@
-"""A live-but-unadvertised Claude pane must be re-advertised, not injected blind.
-
-Pane liveness does not imply deliverability: a starved runner can leave the
-Claude pane alive while its ``tmux.json`` advertisement is missing (the
-launch-time write lagged or was lost). The turn/inject-time self-heal used to
-return early on ``is_alive()`` without checking the advertisement, so the
-injection raced an absent target and hard-failed after the advertisement wait
-("Claude terminal tmux target is not advertised yet"). These tests plant
-exactly that state -- a live registry instance with no ``tmux.json`` -- and
-assert the heal rewrites the advertisement from the live instance instead of
-failing the injection, and never tears down the live pane to do it.
-"""
+"""Restore a live Claude pane's missing advertisement before message injection."""
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
@@ -275,3 +266,49 @@ async def test_live_advertised_pane_advertisement_is_left_untouched(
     assert (bridge_dir / _TMUX_FILE).read_text(encoding="utf-8") == advertised_before, (
         "a valid advertisement must not be rewritten on every inject"
     )
+
+
+def _advertised_bridge(root: Path, name: str, session_id: str) -> Path:
+    directory = root / name
+    directory.mkdir(parents=True)
+    (directory / claude_native_bridge._CONFIG_FILE).write_text(
+        json.dumps({"active_session_id": session_id}), encoding="utf-8"
+    )
+    target = directory / _TMUX_FILE
+    target.write_text("synthetic advertisement", encoding="utf-8")
+    return target
+
+
+def test_browser_fault_injection_only_removes_its_session_advertisement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from tests.e2e_ui.chat import test_web_turn_unadvertised_tmux_target as browser_test
+
+    own = _advertised_bridge(tmp_path, "own", "fixture-session")
+    other = _advertised_bridge(tmp_path, "other", "unrelated-session")
+    os.utime(own, (1, 1))
+    other_content = other.read_bytes()
+    monkeypatch.setattr(browser_test, "_BRIDGE_ROOT", tmp_path)
+
+    assert browser_test._remove_tmux_advertisement("fixture-session") == str(own)
+    assert not own.exists()
+    assert other.read_bytes() == other_content
+
+
+@pytest.mark.parametrize("own_advertisements", [0, 2], ids=["missing", "ambiguous"])
+def test_browser_fault_injection_requires_one_owned_advertisement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, own_advertisements: int
+) -> None:
+    from tests.e2e_ui.chat import test_web_turn_unadvertised_tmux_target as browser_test
+
+    targets = [_advertised_bridge(tmp_path, "other", "unrelated-session")]
+    targets.extend(
+        _advertised_bridge(tmp_path, f"own-{i}", "fixture-session")
+        for i in range(own_advertisements)
+    )
+    contents = {target: target.read_bytes() for target in targets}
+    monkeypatch.setattr(browser_test, "_BRIDGE_ROOT", tmp_path)
+
+    with pytest.raises(AssertionError, match="exactly one advertisement"):
+        browser_test._remove_tmux_advertisement("fixture-session")
+    assert {target: target.read_bytes() for target in targets} == contents
