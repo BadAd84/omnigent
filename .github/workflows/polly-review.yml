@@ -622,5 +622,6 @@ jobs:
         print('Review and cleanup completed', flush=True)
         PYWAIT
 concurrency:
-  group: polly-lifecycle-canary-${{ inputs.mode == 'baseline' && inputs.key || github.run_id }}
+  group: polly-lifecycle-canary-${{ inputs.purpose == 'concurrency' && inputs.mode == 'baseline' && inputs.key ||
+    github.run_id }}
   cancel-in-progress: true
