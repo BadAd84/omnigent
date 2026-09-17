@@ -13,7 +13,7 @@ from omnigent.harnesses.claude_native.bridge import (
     _TMUX_FILE,
     read_active_session_id,
 )
-from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.conftest import configure_mock_llm, set_fallback_mock_llm
 
 _log = logging.getLogger(__name__)
 
@@ -108,10 +108,12 @@ def test_web_turn_survives_unadvertised_tmux_target(
     base_url, session_id = native_claude_mock_session
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": _ECHO_TOKEN}],
+        [],
         key="unadvertised-tmux",
         match=_ECHO_TOKEN,
     )
+    # Native background requests can consume a queued reply before the visible turn.
+    set_fallback_mock_llm(mock_llm_server_url, "unadvertised-tmux", _ECHO_TOKEN)
     _log.info("session ready base=%s id=%s", base_url, session_id)
 
     page.goto(f"{base_url}/c/{session_id}")
