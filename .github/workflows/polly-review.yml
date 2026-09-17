@@ -1,6 +1,6 @@
 name: Polly AI Review
-run-name: Polly diagnostics ${{ inputs.purpose }} ${{ inputs.mode }} ${{ inputs.key }} eligible=${{ inputs.eligible
-  }}
+run-name: Polly diagnostics ${{ inputs.purpose }} ${{ inputs.mode }} ${{ inputs.key }} ${{ fromJSON(inputs.event
+  || '{}').case }}
 'on':
   workflow_dispatch:
     inputs:
@@ -18,6 +18,7 @@ run-name: Polly diagnostics ${{ inputs.purpose }} ${{ inputs.mode }} ${{ inputs.
         - timing
         - concurrency
         - artifacts
+        - requests
         default: concurrency
       mode:
         type: choice
@@ -31,6 +32,16 @@ run-name: Polly diagnostics ${{ inputs.purpose }} ${{ inputs.mode }} ${{ inputs.
       eligible:
         type: boolean
         default: true
+      event:
+        type: string
+        default: '{}'
+        description: Synthetic webhook fields
+      allowlist:
+        type: string
+        default: '[]'
+      hold_seconds:
+        type: number
+        default: 1
 permissions:
   contents: read
   pull-requests: read
@@ -55,9 +66,8 @@ jobs:
         ::add-mask::${LLM_API_KEY}\"\n  echo \"available=true\" >> \"$GITHUB_OUTPUT\"\nfi\n"
     - name: Resolve PR number
       id: pr
-      run: 'echo "pr_number=${{ inputs.pr }}" >> "$GITHUB_OUTPUT"
-
-        '
+      run: |
+        echo "pr_number=${{ inputs.pr }}" >> "$GITHUB_OUTPUT"
     - name: Check out repo
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
@@ -72,56 +82,39 @@ jobs:
       with:
         enable-cache: true
     - name: Install tmux
-      run: 'sudo apt-get update
-
+      run: |
+        sudo apt-get update
         sudo apt-get install -y tmux
-
-        '
     - name: Cache virtualenv
       uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae
       with:
         path: .venv
         key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
     - name: Install dependencies
-      run: 'uv sync --frozen --extra all
-
-        '
+      run: |
+        uv sync --frozen --extra all
     - name: Install Claude Code CLI
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      run: '# Install outside the checked-out tree: a repo-root package.json would
-
+      run: |
+        # Install outside the checked-out tree: a repo-root package.json would
         # otherwise capture this bare `npm install` and hoist it there, leaving
-
-        # this dir''s node_modules empty.
-
+        # this dir's node_modules empty.
         CC_CLI_DIR="${RUNNER_TEMP}/omnigent-cc-cli"
-
         mkdir -p "$CC_CLI_DIR" && cd "$CC_CLI_DIR"
-
         npm install --ignore-scripts --no-audit --no-fund @anthropic-ai/claude-code@2.1.266
-
         node node_modules/@anthropic-ai/claude-code/install.cjs
-
         echo "$CC_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
-
-        '
     - name: Install Codex CLI
       env:
         NPM_CONFIG_REGISTRY: https://registry.npmjs.org/
-      run: '# Install outside the checked-out tree so a repo-root package.json
-
-        # can''t capture this bare `npm install` and hoist it away from here.
-
+      run: |
+        # Install outside the checked-out tree so a repo-root package.json
+        # can't capture this bare `npm install` and hoist it away from here.
         CODEX_CLI_DIR="${RUNNER_TEMP}/omnigent-codex-cli"
-
         mkdir -p "$CODEX_CLI_DIR" && cd "$CODEX_CLI_DIR"
-
         npm install --ignore-scripts --no-audit --no-fund @openai/codex@0.139.0
-
         echo "$CODEX_CLI_DIR/node_modules/.bin" >> "$GITHUB_PATH"
-
-        '
     - name: Set LLM credentials
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
@@ -260,48 +253,78 @@ jobs:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         OMNIGENT_POLLY_MODEL: ${{ vars.OMNIGENT_CI_POLLY_MODEL }}
         OMNIGENT_POLLY_HARNESS: ${{ vars.OMNIGENT_CI_POLLY_HARNESS }}
-      run: "mkdir -p /tmp/polly-canary-evidence\npython3 -u <<'PYRUN'\nimport hashlib, json, os, pathlib, subprocess,\
-        \ time\nsnapshot = pathlib.Path(\"/tmp/pr_diff.txt\").read_bytes()\npathlib.Path(\"/tmp/polly-canary-evidence/tested-pr.diff\"\
-        ).write_bytes(snapshot)\npathlib.Path(\"/tmp/polly-canary-evidence/snapshot.json\").write_text(json.dumps({\"\
-        sha256\": hashlib.sha256(snapshot).hexdigest(), \"bytes\": len(snapshot)}))\nstart = time.monotonic()\n\
-        with open('/tmp/polly-canary-evidence/stdout.txt', 'w') as stdout, open('/tmp/polly-canary-evidence/stderr.txt',\
-        \ 'w') as stderr:\n    try:\n        result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/',\
-        \ '--harness', os.environ['OMNIGENT_POLLY_HARNESS'], '--model', os.environ['OMNIGENT_POLLY_MODEL'], '-p',\
-        \ pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=1500)\n\
-        \        code = result.returncode\n    except subprocess.TimeoutExpired:\n        code = 124\npathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode':\
-        \ code, 'elapsed_seconds': round(time.monotonic() - start, 1), 'consolidator_harness': os.environ['OMNIGENT_POLLY_HARNESS'],\
-        \ 'consolidator_model': os.environ['OMNIGENT_POLLY_MODEL']}))\nprint('Polly process exit:', code)\nPYRUN\n"
+      run: |
+        mkdir -p /tmp/polly-canary-evidence
+        python3 -u <<'PYRUN'
+        import hashlib, json, os, pathlib, subprocess, time
+        snapshot = pathlib.Path("/tmp/pr_diff.txt").read_bytes()
+        pathlib.Path("/tmp/polly-canary-evidence/tested-pr.diff").write_bytes(snapshot)
+        pathlib.Path("/tmp/polly-canary-evidence/snapshot.json").write_text(json.dumps({"sha256": hashlib.sha256(snapshot).hexdigest(), "bytes": len(snapshot)}))
+        start = time.monotonic()
+        with open('/tmp/polly-canary-evidence/stdout.txt', 'w') as stdout, open('/tmp/polly-canary-evidence/stderr.txt', 'w') as stderr:
+            try:
+                result = subprocess.run(['uv', 'run', 'omnigent', 'run', 'examples/polly/', '--harness', os.environ['OMNIGENT_POLLY_HARNESS'], '--model', os.environ['OMNIGENT_POLLY_MODEL'], '-p', pathlib.Path('/tmp/review_prompt.txt').read_text(), '--no-session'], stdout=stdout, stderr=stderr, timeout=1500)
+                code = result.returncode
+            except subprocess.TimeoutExpired:
+                code = 124
+        pathlib.Path('/tmp/polly-canary-evidence/process.json').write_text(json.dumps({'returncode': code, 'elapsed_seconds': round(time.monotonic() - start, 1), 'consolidator_harness': os.environ['OMNIGENT_POLLY_HARNESS'], 'consolidator_model': os.environ['OMNIGENT_POLLY_MODEL']}))
+        print('Polly process exit:', code)
+        PYRUN
     - name: Collect durable transcript and process diagnostics
       if: always()
       env:
         LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
         GATEWAY_BASE_URL: ${{ secrets.GATEWAY_BASE_URL }}
-      run: "uv run --no-sync python <<'PYCHECK'\nimport json, os, pathlib, subprocess\nfrom sqlalchemy import create_engine,\
-        \ select\nfrom sqlalchemy.orm import Session\nfrom omnigent.db.db_models import SqlConversation, SqlConversationMetadata,\
-        \ SqlConversationItem\nfrom omnigent.process_logging import logs_root\n\nout=pathlib.Path('/tmp/polly-canary-evidence')\n\
-        out.mkdir(exist_ok=True)\nsecrets=[os.environ[k] for k in ['LLM_API_KEY','GATEWAY_BASE_URL'] if os.environ.get(k)]\n\
-        def redact(text):\n    for secret in secrets: text=text.replace(secret,'[REDACTED]')\n    return text\n\
-        report={'revision':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),\n        'process':json.loads((out/'process.json').read_text())\
-        \ if (out/'process.json').exists() else {},\n        'pr':json.loads(pathlib.Path('/tmp/pr_meta.json').read_text()),'sessions':[]}\n\
-        for db in pathlib.Path('/tmp').glob('ap-chat-data-*/chat.db'):\n    with Session(create_engine(f'sqlite:///{db}'))\
-        \ as session:\n        for conv in session.scalars(select(SqlConversation)):\n            meta=session.get(SqlConversationMetadata,(conv.workspace_id,conv.id))\n\
-        \            items=[dict(json.loads(i.data), stored_type=str(i.type), position=i.position)\n           \
-        \        for i in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id==conv.id).order_by(SqlConversationItem.position))]\n\
-        \            row={'id':str(conv.id),'parent':str(conv.parent_conversation_id) if conv.parent_conversation_id\
-        \ else None,\n                 'created_at':conv.created_at,'updated_at':conv.updated_at,'title':conv.title,'worker':meta.sub_agent_name\
-        \ if meta else None,\n                 'overrides':json.loads(conv.session_overrides or '{}'),\n       \
-        \          'usage':json.loads(meta.session_usage or '{}') if meta else {},'items':items}\n            report['sessions'].append(row)\n\
-        \            (out/(str(conv.id)+'-transcript.json')).write_text(redact(json.dumps(row,indent=2)))\nfor file\
-        \ in logs_root().rglob('*.log'):\n    if file.is_file():\n        target=out/'process-logs'/file.relative_to(logs_root())\n\
-        \        target.parent.mkdir(parents=True,exist_ok=True)\n        target.write_text(redact(file.read_text(errors='replace')[-5000000:]))\n\
-        stdout=(out/'stdout.txt').read_text() if (out/'stdout.txt').exists() else ''\nreport['stdout_characters']=len(stdout)\n\
-        report['roots']=[]\nfor row in report['sessions']:\n    if row['parent']: continue\n    assistant=[i for\
-        \ i in row['items'] if i.get('role')=='assistant']\n    report['roots'].append({'id':row['id'],'assistant_messages':len(assistant),\n\
-        \                           'last_assistant':assistant[-1] if assistant else None})\n(out/'summary.json').write_text(redact(json.dumps(report,indent=2)))\n\
-        for file in out.rglob('*'):\n    if file.is_file(): file.write_text(redact(file.read_text(errors='replace')))\n\
-        print(json.dumps({'revision':report['revision'],'process':report['process'],\n                  'stdout_characters':len(stdout),'sessions':len(report['sessions']),\n\
-        \                  'root_assistant_counts':[r['assistant_messages'] for r in report['roots']]}))\nraise\
-        \ SystemExit(0 if stdout.strip() and report['process'].get('returncode')==0 else 1)\nPYCHECK\n"
+      run: |
+        uv run --no-sync python <<'PYCHECK'
+        import json, os, pathlib, subprocess
+        from sqlalchemy import create_engine, select
+        from sqlalchemy.orm import Session
+        from omnigent.db.db_models import SqlConversation, SqlConversationMetadata, SqlConversationItem
+        from omnigent.process_logging import logs_root
+
+        out=pathlib.Path('/tmp/polly-canary-evidence')
+        out.mkdir(exist_ok=True)
+        secrets=[os.environ[k] for k in ['LLM_API_KEY','GATEWAY_BASE_URL'] if os.environ.get(k)]
+        def redact(text):
+            for secret in secrets: text=text.replace(secret,'[REDACTED]')
+            return text
+        report={'revision':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
+                'process':json.loads((out/'process.json').read_text()) if (out/'process.json').exists() else {},
+                'pr':json.loads(pathlib.Path('/tmp/pr_meta.json').read_text()),'sessions':[]}
+        for db in pathlib.Path('/tmp').glob('ap-chat-data-*/chat.db'):
+            with Session(create_engine(f'sqlite:///{db}')) as session:
+                for conv in session.scalars(select(SqlConversation)):
+                    meta=session.get(SqlConversationMetadata,(conv.workspace_id,conv.id))
+                    items=[dict(json.loads(i.data), stored_type=str(i.type), position=i.position)
+                           for i in session.scalars(select(SqlConversationItem).where(SqlConversationItem.conversation_id==conv.id).order_by(SqlConversationItem.position))]
+                    row={'id':str(conv.id),'parent':str(conv.parent_conversation_id) if conv.parent_conversation_id else None,
+                         'created_at':conv.created_at,'updated_at':conv.updated_at,'title':conv.title,'worker':meta.sub_agent_name if meta else None,
+                         'overrides':json.loads(conv.session_overrides or '{}'),
+                         'usage':json.loads(meta.session_usage or '{}') if meta else {},'items':items}
+                    report['sessions'].append(row)
+                    (out/(str(conv.id)+'-transcript.json')).write_text(redact(json.dumps(row,indent=2)))
+        for file in logs_root().rglob('*.log'):
+            if file.is_file():
+                target=out/'process-logs'/file.relative_to(logs_root())
+                target.parent.mkdir(parents=True,exist_ok=True)
+                target.write_text(redact(file.read_text(errors='replace')[-5000000:]))
+        stdout=(out/'stdout.txt').read_text() if (out/'stdout.txt').exists() else ''
+        report['stdout_characters']=len(stdout)
+        report['roots']=[]
+        for row in report['sessions']:
+            if row['parent']: continue
+            assistant=[i for i in row['items'] if i.get('role')=='assistant']
+            report['roots'].append({'id':row['id'],'assistant_messages':len(assistant),
+                                   'last_assistant':assistant[-1] if assistant else None})
+        (out/'summary.json').write_text(redact(json.dumps(report,indent=2)))
+        for file in out.rglob('*'):
+            if file.is_file(): file.write_text(redact(file.read_text(errors='replace')))
+        print(json.dumps({'revision':report['revision'],'process':report['process'],
+                          'stdout_characters':len(stdout),'sessions':len(report['sessions']),
+                          'root_assistant_counts':[r['assistant_messages'] for r in report['roots']]}))
+        raise SystemExit(0 if stdout.strip() and report['process'].get('returncode')==0 else 1)
+        PYCHECK
     - name: Upload canary evidence
       if: always()
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -321,19 +344,13 @@ jobs:
       cancel-in-progress: false
     steps:
     - name: Hold review lock
-      run: 'python3 -u - <<''PYWAIT''
-
+      run: |
+        python3 -u - <<'PYWAIT'
         import time
-
-        print(''Review active'', flush=True)
-
+        print('Review active', flush=True)
         time.sleep(50)
-
-        print(''Review and cleanup completed'', flush=True)
-
+        print('Review and cleanup completed', flush=True)
         PYWAIT
-
-        '
   artifacts:
     name: Artifact test (${{ matrix.scenario }})
     runs-on: ubuntu-latest
@@ -356,19 +373,19 @@ jobs:
         ref: 86083d7348f0eaf437879615a0a5b2d29bfa615e
         persist-credentials: false
     - name: Prepare synthetic process output
-      run: "python3 <<'SETUP'\nimport os, pathlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'polly-fake-command'\n\
-        root.mkdir()\n(root / 'uv').write_text(\"#!/usr/bin/env python3\\nimport os, sys\\nfrom pathlib import Path\\\
-        nlogs = Path.home() / '.omnigent' / 'logs' / 'runner'\\nlogs.mkdir(parents=True, exist_ok=True)\\n(logs\
-        \ / 'canary.log').write_text('Synthetic process log: canary-fake-key https://canary.invalid')\\nprint('Synthetic\
-        \ stderr: canary-fake-key', file=sys.stderr)\\nscenario = os.environ['CANARY_SCENARIO']\\nif scenario !=\
-        \ 'empty':\\n    print('Preamble: canary-fake-key https://canary.invalid')\\nif scenario in {'secret-scan',\
-        \ 'posting', 'success'}:\\n    print('<!-- POLLY_REVIEW_START -->')\\n    print('## Summary')\\n    print('Synthetic\
-        \ review.')\\nif scenario == 'secret-scan':\\n    print('canary-fake-key')\\n\")\n(root / 'gh').write_text(\"\
-        #!/usr/bin/env python3\\nimport os, sys\\nassert sys.argv[1:3] == ['pr', 'comment'], sys.argv\\nif os.environ['CANARY_SCENARIO']\
-        \ == 'posting':\\n    print('Forced posting failure', file=sys.stderr)\\n    sys.exit(42)\\n\")\nfor name\
-        \ in ('uv', 'gh'):\n    (root / name).chmod(0o755)\nwith open(os.environ['GITHUB_PATH'], 'a') as path:\n\
-        \    path.write(str(root) + '\\n')\npathlib.Path('/tmp/review_prompt.txt').write_text('Synthetic test; no\
-        \ model calls or comments.')\nSETUP\n"
+      run: |
+        python3 <<'SETUP'
+        import os, pathlib
+        root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'polly-fake-command'
+        root.mkdir()
+        (root / 'uv').write_text("#!/usr/bin/env python3\nimport os, sys\nfrom pathlib import Path\nlogs = Path.home() / '.omnigent' / 'logs' / 'runner'\nlogs.mkdir(parents=True, exist_ok=True)\n(logs / 'canary.log').write_text('Synthetic process log: canary-fake-key https://canary.invalid')\nprint('Synthetic stderr: canary-fake-key', file=sys.stderr)\nscenario = os.environ['CANARY_SCENARIO']\nif scenario != 'empty':\n    print('Preamble: canary-fake-key https://canary.invalid')\nif scenario in {'secret-scan', 'posting', 'success'}:\n    print('<!-- POLLY_REVIEW_START -->')\n    print('## Summary')\n    print('Synthetic review.')\nif scenario == 'secret-scan':\n    print('canary-fake-key')\n")
+        (root / 'gh').write_text("#!/usr/bin/env python3\nimport os, sys\nassert sys.argv[1:3] == ['pr', 'comment'], sys.argv\nif os.environ['CANARY_SCENARIO'] == 'posting':\n    print('Forced posting failure', file=sys.stderr)\n    sys.exit(42)\n")
+        for name in ('uv', 'gh'):
+            (root / name).chmod(0o755)
+        with open(os.environ['GITHUB_PATH'], 'a') as path:
+            path.write(str(root) + '\n')
+        pathlib.Path('/tmp/review_prompt.txt').write_text('Synthetic test; no model calls or comments.')
+        SETUP
     - name: Run Polly review
       id: polly
       env:
@@ -421,23 +438,45 @@ jobs:
       if: always()
       env:
         REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
-      run: "case \"$CANARY_SCENARIO\" in\n  empty|narration) test -z \"$REVIEW_TEXT\" ;;\n  *) test -n \"$REVIEW_TEXT\"\
-        ; test -f /tmp/polly_review.txt ;;\nesac\n"
+      run: |
+        case "$CANARY_SCENARIO" in
+          empty|narration) test -z "$REVIEW_TEXT" ;;
+          *) test -n "$REVIEW_TEXT"; test -f /tmp/polly_review.txt ;;
+        esac
     - name: Prepare Polly diagnostics
       if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))
       env:
         LLM_API_KEY: canary-fake-key
         GATEWAY_BASE_URL: https://canary.invalid/serving-endpoints
-      run: "python3 <<'PY'\nimport os, pathlib\ndestination = pathlib.Path('/tmp/polly-diagnostics')\ndestination.mkdir(parents=True,\
-        \ exist_ok=True)\nsources = {\n    'polly-stderr.log': pathlib.Path('polly-stderr.log'),\n    'polly-output.txt':\
-        \ pathlib.Path('/tmp/polly_output.txt'),\n    'polly-review.txt': pathlib.Path('/tmp/polly_review.txt'),\n\
-        }\nlogs = pathlib.Path.home() / '.omnigent' / 'logs'\nfor source in logs.rglob('*.log'):\n    sources['process-logs/'\
-        \ + str(source.relative_to(logs))] = source\nfor name, source in sources.items():\n    if not source.is_file():\n\
-        \        continue\n    text = source.read_text(errors='replace')\n    for key in ('LLM_API_KEY', 'GATEWAY_BASE_URL'):\n\
-        \        value = os.environ.get(key)\n        if value:\n            text = text.replace(value, '[REDACTED]')\n\
-        \            if key == 'GATEWAY_BASE_URL':\n                host = value.rstrip('/').removesuffix('/serving-endpoints')\n\
-        \                if host:\n                    text = text.replace(host, '[REDACTED]')\n    target = destination\
-        \ / name\n    target.parent.mkdir(parents=True, exist_ok=True)\n    target.write_text(text)\nPY\n"
+      run: |
+        python3 <<'PY'
+        import os, pathlib
+        destination = pathlib.Path('/tmp/polly-diagnostics')
+        destination.mkdir(parents=True, exist_ok=True)
+        sources = {
+            'polly-stderr.log': pathlib.Path('polly-stderr.log'),
+            'polly-output.txt': pathlib.Path('/tmp/polly_output.txt'),
+            'polly-review.txt': pathlib.Path('/tmp/polly_review.txt'),
+        }
+        logs = pathlib.Path.home() / '.omnigent' / 'logs'
+        for source in logs.rglob('*.log'):
+            sources['process-logs/' + str(source.relative_to(logs))] = source
+        for name, source in sources.items():
+            if not source.is_file():
+                continue
+            text = source.read_text(errors='replace')
+            for key in ('LLM_API_KEY', 'GATEWAY_BASE_URL'):
+                value = os.environ.get(key)
+                if value:
+                    text = text.replace(value, '[REDACTED]')
+                    if key == 'GATEWAY_BASE_URL':
+                        host = value.rstrip('/').removesuffix('/serving-endpoints')
+                        if host:
+                            text = text.replace(host, '[REDACTED]')
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(text)
+        PY
     - name: Upload Polly diagnostics
       if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
@@ -447,6 +486,141 @@ jobs:
         retention-days: 7
         if-no-files-found: ignore
     if: inputs.purpose == 'artifacts'
+  request_gate:
+    name: Synthetic security gate
+    if: inputs.purpose == 'requests' && (fromJSON(inputs.event).event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    steps:
+    - name: Return synthetic gate result
+      env:
+        FAIL_GATE: ${{ fromJSON(inputs.event).gate_failure }}
+      run: |
+        test "$FAIL_GATE" != "true"
+  request_trigger:
+    name: Validate review request
+    if: |-
+      inputs.purpose == 'requests' && inputs.mode == 'candidate' && (fromJSON(inputs.event).event_name == 'issue_comment' && fromJSON(inputs.event).issue.pull_request != null && contains(fromJSON(inputs.event).comment.body, '/review') && !endsWith(fromJSON(inputs.event).actor, '[bot]') && (
+        fromJSON(inputs.event).comment.author_association == 'OWNER' ||
+        fromJSON(inputs.event).comment.author_association == 'MEMBER' ||
+        fromJSON(inputs.event).comment.author_association == 'COLLABORATOR' ||
+        contains(fromJSON(inputs.allowlist || '[]'), fromJSON(inputs.event).comment.user.login)
+      ))
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions: {}
+    outputs:
+      eligible: ${{ steps.command.outputs.eligible }}
+    steps:
+    - name: Validate /review command
+      id: command
+      env:
+        COMMENT_BODY: ${{ fromJSON(inputs.event).comment.body }}
+      run: |
+        set -euo pipefail
+        # Reject inline mentions before they can replace a pending review.
+        if grep -qE '^[[:space:]]*/review([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+          echo "eligible=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "::notice::Comment mentions '/review' but not as a command; skipping."
+          echo "eligible=false" >> "$GITHUB_OUTPUT"
+        fi
+  baseline_request_review:
+    name: baseline request review
+    if: |-
+      inputs.purpose == 'requests' && inputs.mode == 'baseline' && (!cancelled() && (
+        (
+          fromJSON(inputs.event).event_name == 'pull_request' &&
+          !fromJSON(inputs.event).pull_request.draft &&
+          needs.request_gate.result == 'success'
+        ) ||
+        (
+          fromJSON(inputs.event).event_name == 'issue_comment' &&
+          fromJSON(inputs.event).issue.pull_request != null &&
+          contains(fromJSON(inputs.event).comment.body, '/review') &&
+          !endsWith(fromJSON(inputs.event).actor, '[bot]') &&
+          (
+            fromJSON(inputs.event).comment.author_association == 'OWNER' ||
+            fromJSON(inputs.event).comment.author_association == 'MEMBER' ||
+            fromJSON(inputs.event).comment.author_association == 'COLLABORATOR' ||
+            contains(fromJSON(inputs.allowlist || '[]'), fromJSON(inputs.event).comment.user.login)
+          )
+        ) ||
+        fromJSON(inputs.event).event_name == 'workflow_dispatch'
+      ))
+    concurrency:
+      group: polly-request-canary-${{ inputs.mode }}-${{ inputs.key }}-${{ fromJSON(inputs.event).pull_request.number
+        || fromJSON(inputs.event).issue.number || inputs.pr }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+    - request_gate
+    steps:
+    - name: Validate /review command
+      id: trigger
+      if: fromJSON(inputs.event).event_name == 'issue_comment'
+      env:
+        COMMENT_BODY: ${{ fromJSON(inputs.event).comment.body }}
+      run: |
+        set -euo pipefail
+        # Validate `/review` appears as a command (first non-space token on a line).
+        if ! grep -qE '^[[:space:]]*/review([[:space:]]|$)' <<<"$COMMENT_BODY"; then
+          echo "::notice::Comment mentions '/review' but not as a command; skipping."
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        echo "skip=false" >> "$GITHUB_OUTPUT"
+    - name: Hold review lock
+      env:
+        HOLD_SECONDS: ${{ inputs.hold_seconds }}
+        CANDIDATE_SHA: 24c4bd4282efc76c8a86d90b61a37bc620c1fb13
+      run: |
+        python3 -u - <<'PYWAIT'
+        import os, time
+        print('Candidate workflow:', os.environ['CANDIDATE_SHA'], flush=True)
+        print('Review active', flush=True)
+        time.sleep(min(float(os.environ['HOLD_SECONDS']), 150))
+        print('Review and cleanup completed', flush=True)
+        PYWAIT
+      if: steps.trigger.outputs.skip != 'true'
+  candidate_request_review:
+    name: candidate request review
+    if: |-
+      inputs.purpose == 'requests' && inputs.mode == 'candidate' && (!cancelled() && (
+        (
+          fromJSON(inputs.event).event_name == 'pull_request' &&
+          !fromJSON(inputs.event).pull_request.draft &&
+          needs.request_gate.result == 'success'
+        ) ||
+        (
+          fromJSON(inputs.event).event_name == 'issue_comment' &&
+          needs.request_trigger.result == 'success' &&
+          needs.request_trigger.outputs.eligible == 'true'
+        ) ||
+        fromJSON(inputs.event).event_name == 'workflow_dispatch'
+      ))
+    concurrency:
+      group: polly-request-canary-${{ inputs.mode }}-${{ inputs.key }}-${{ fromJSON(inputs.event).pull_request.number
+        || fromJSON(inputs.event).issue.number || inputs.pr }}
+      cancel-in-progress: false
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs:
+    - request_gate
+    - request_trigger
+    steps:
+    - name: Hold review lock
+      env:
+        HOLD_SECONDS: ${{ inputs.hold_seconds }}
+        CANDIDATE_SHA: 24c4bd4282efc76c8a86d90b61a37bc620c1fb13
+      run: |
+        python3 -u - <<'PYWAIT'
+        import os, time
+        print('Candidate workflow:', os.environ['CANDIDATE_SHA'], flush=True)
+        print('Review active', flush=True)
+        time.sleep(min(float(os.environ['HOLD_SECONDS']), 150))
+        print('Review and cleanup completed', flush=True)
+        PYWAIT
 concurrency:
   group: polly-lifecycle-canary-${{ inputs.mode == 'baseline' && inputs.key || github.run_id }}
   cancel-in-progress: true
