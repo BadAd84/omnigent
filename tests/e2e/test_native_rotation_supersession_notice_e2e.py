@@ -31,7 +31,7 @@ gap at the harness-level producer boundary the fix touches: it drives the
 client and asserts on the exact set of HTTP posts each rotation makes to the OLD
 session -- deterministically, and for BOTH harnesses in one place (e2e_ui has no
 real ``agy`` binary). The codex web half is additionally driven live end-to-end
-in ``tests/e2e_ui/chat/test_codex_rotation_supersession_redirect.py`` (real Codex
+in ``tests/e2e_ui/chat/test_codex_rotation_supersession.py`` (real Codex
 ``/new`` in the SPA terminal against the mock LLM, showing the stranded browser
 that never redirects). The web redirect/notice machinery the missing posts feed
 is present and already covered by
@@ -53,17 +53,20 @@ from __future__ import annotations
 from pathlib import Path
 
 import httpx
-import pytest
 
 from omnigent.harnesses.antigravity_native import reader as areader
 from omnigent.harnesses.antigravity_native.bridge import (
     AntigravityNativeBridgeState,
+)
+from omnigent.harnesses.antigravity_native.bridge import (
     write_bridge_state as agy_write_bridge_state,
 )
 from omnigent.harnesses.claude_native.forwarder import _post_clear_supersession
 from omnigent.harnesses.codex_native import forwarder as cfwd
 from omnigent.harnesses.codex_native.bridge import (
     CodexNativeBridgeState,
+)
+from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state as codex_write_bridge_state,
 )
 
