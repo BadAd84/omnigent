@@ -7,7 +7,7 @@ bytes are drawn on (``data-terminal-theme`` is the DOM signal, see
 own ANSI colors, and it can only pick readable ones if something tells it what
 background it is rendering against. The conventional carrier for that hint is
 the ``COLORFGBG`` environment variable (``<fg>;<bg>``, background field last:
-0–6/8 = dark, 7/15 = light — the heuristic vim/neovim use for ``bg=``).
+0–6/8 = dark, 7/15 = light — the heuristic Vim uses for ``bg=``).
 
 Today nothing propagates the resolved theme into the PTY environment: the
 attach path pins ``TERM`` and normalizes locale/secrets only. So a dark-mode
@@ -45,7 +45,7 @@ from playwright.sync_api import Locator, Page, expect
 from tests.e2e_ui.conftest import open_right_rail
 
 # COLORFGBG's last ";"-separated field is the background color. 0-6 and 8 are
-# the dark palette entries, 7 and 15 the light ones (the vim/neovim bg= rule).
+# the dark palette entries, 7 and 15 the light ones (the Vim bg= rule).
 _DARK_BG_CODES = {"0", "1", "2", "3", "4", "5", "6", "8"}
 _LIGHT_BG_CODES = {"7", "15"}
 

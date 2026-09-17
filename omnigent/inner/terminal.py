@@ -730,7 +730,7 @@ def _apply_utf8_locale_default(env: dict[str, str]) -> None:
 
 # COLORFGBG values keyed by the client's resolved terminal theme. The value is
 # "<fg>;<bg>" with the background field last: 0 is the dark palette entry,
-# 15 the light one — the heuristic vim/neovim use to pick `background=`.
+# 15 the light one — the heuristic Vim uses to pick `background=`.
 _COLORFGBG_BY_TERMINAL_THEME = {"dark": "15;0", "light": "0;15"}
 
 
