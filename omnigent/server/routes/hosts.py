@@ -24,6 +24,7 @@ import weakref
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from packaging.version import InvalidVersion, Version
 from pydantic import BaseModel
 
 from omnigent.db.utils import now_epoch
@@ -133,21 +134,22 @@ _HARNESS_SETUP_MIN_HOST_VERSION = (0, 7, 0)
 
 
 def _release_tuple(version: str) -> tuple[int, int, int] | None:
-    """Parse the numeric ``major.minor.patch`` prefix of a reported version.
+    """Parse the release component of a reported version, PEP 440 style.
 
-    :param version: Hello-reported version, e.g. ``"0.6.0"`` or
-        ``"0.13.0.dev0"``.
-    :returns: The release tuple, or ``None`` when the version doesn't lead
-        with three numeric dot-separated components.
+    Handles every shape omnigent has shipped — ``"0.6.0"``, ``"0.6.0rc1"``,
+    ``"0.13.0.dev0"`` — so a prerelease of an old daemon is still judged
+    against the floor rather than falling through as unparseable.
+
+    :param version: Hello-reported version.
+    :returns: The release tuple padded to ``(major, minor, patch)``, or
+        ``None`` when the version isn't PEP 440 at all.
     """
-    parts = version.split(".")[:3]
-    if len(parts) < 3:
-        return None
     try:
-        major, minor, patch = (int(part) for part in parts)
-    except ValueError:
+        release = Version(version).release
+    except InvalidVersion:
         return None
-    return (major, minor, patch)
+    padded = (*release, 0, 0, 0)[:3]
+    return (padded[0], padded[1], padded[2])
 
 
 def _require_host_frame_support(

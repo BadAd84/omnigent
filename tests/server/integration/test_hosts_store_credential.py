@@ -568,8 +568,13 @@ def _auto_reply_store_secret(
     return asyncio.create_task(_drain())
 
 
+# The rc shape matters: omnigent ships prerelease daemons (v0.6.0rc1, …), and a
+# naive major.minor.patch split fails on "0rc1" and would fall through to the
+# permissive unparseable path — re-opening the 30s-timeout bug for rc hosts.
+@pytest.mark.parametrize("version", ["0.6.0", "0.6.0rc1", "0.6.0.dev0"])
 async def test_rejects_host_predating_store_secret_fast_and_clearly(
     cred_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    version: str,
 ) -> None:
     """A pre-0.7.0 host gets a fast 409 with an update hint — no forwarded frame.
 
@@ -580,7 +585,7 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
     promptly, naming the version and the remedy.
     """
     app, registry, _hs, _cs = cred_app
-    comm = await _connect_mock_host(app, registry, hello=_hello_text(version="0.6.0"))
+    comm = await _connect_mock_host(app, registry, hello=_hello_text(version=version))
     received: list[HostStoreSecretFrame] = []
     stop = asyncio.Event()
     drain_task = _auto_reply_store_secret(comm, received, stop)
@@ -602,7 +607,7 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
     # Actionable: names the too-old version and the remedy …
-    assert "0.6.0" in detail
+    assert version in detail
     assert "update omnigent on the host" in detail
     # … and never blames responsiveness — the host answered everything it knows.
     assert "did not respond" not in detail.lower()
@@ -621,6 +626,8 @@ async def test_rejects_host_predating_store_secret_fast_and_clearly(
         # No advertisement + unparseable version stays permissive: never block
         # a host we can't prove is too old.
         ("custom-build", None),
+        # A prerelease of the floor version already ships the frames.
+        ("0.7.0rc1", None),
     ],
 )
 async def test_capability_advertisement_and_unparseable_version_allow_the_write(
