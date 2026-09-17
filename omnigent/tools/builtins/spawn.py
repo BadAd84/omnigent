@@ -519,7 +519,9 @@ class SysSessionListTool(Tool):
       ``agent_name`` filter narrows this list. This powers
       orchestration: discovering sessions to inspect
       (``sys_agent_get`` / ``sys_session_get_info``) or drive
-      (``sys_session_send`` by ``session_id``).
+      (``sys_session_send`` by ``session_id``). List rows carry no
+      progress or stall signal — for that (``last_activity_at``, the
+      compaction aggregate) call ``sys_session_get_info`` per session.
 
     The global ``sessions`` view is populated only on the runner
     (REST) path, where the server enforces permissions; the in-process
@@ -544,7 +546,10 @@ class SysSessionListTool(Tool):
             "for orchestration (inspect via sys_agent_get / "
             "sys_session_get_info, or drive via sys_session_send by "
             "session_id). Pass agent_name to filter the global list to "
-            "sessions running that agent. Calls without pagination keep "
+            "sessions running that agent. List rows carry status + "
+            "connectivity only — for progress/stall signals "
+            "(last_activity_at, compaction count) call "
+            "sys_session_get_info on the session. Calls without pagination keep "
             "the complete result while it fits the tool-output budget; "
             "larger global session lists return a page with has_more "
             "metadata and an opaque next_cursor. Pass that cursor to continue; sub_agents stays "
