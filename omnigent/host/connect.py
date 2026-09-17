@@ -458,8 +458,11 @@ ADVERTISED_FRAME_CAPABILITIES: tuple[HostFrameKind, ...] = (
     HostFrameKind.STORE_SECRET,
     HostFrameKind.DETECT_CREDENTIALS,
     HostFrameKind.FS_REQUEST,
+    HostFrameKind.FS_WRITE_REQUEST,
+    HostFrameKind.SKILLS,
     HostFrameKind.MODEL_OPTIONS,
     HostFrameKind.IMPORT_LOCAL,
+    HostFrameKind.IMPORT_LOCAL_BY_ID,
 )
 
 # Host-environment variables a spawned runner is allowed to inherit.
