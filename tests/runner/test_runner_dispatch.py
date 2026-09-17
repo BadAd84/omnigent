@@ -10720,7 +10720,7 @@ class _HarnessInterruptClient:
             task = self._pm.consume_task
             if task is not None and not task.done():
                 task.cancel()
-        return httpx.Response(200, json={})
+        return httpx.Response(200, json={}, request=httpx.Request("POST", _url))
 
     def stream(self, _method: str, _url: str, **_kwargs: Any) -> _ChainEmptyStream:
         return _ChainEmptyStream()
