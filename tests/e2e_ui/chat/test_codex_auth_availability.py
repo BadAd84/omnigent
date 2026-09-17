@@ -43,6 +43,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.test_start_session import _open_entry_config as open_entry_config
+
 # Stubbed host the composer auto-selects (the tunneled runner registers no
 # host). Keyed identically in the recent-workspaces localStorage seed.
 _HOST_ID = "host_e2e"
@@ -198,14 +200,12 @@ async def _open_entry_config(page, agent_id: str) -> None:
     :param page: The Playwright page (the landing picker is already mounted).
     :param agent_id: The stubbed agent id to configure, e.g. ``"ag_polly_e2e"``.
     """
-    await page.get_by_test_id("new-chat-landing-agent-select").click()
-    await page.get_by_test_id(f"new-chat-landing-agent-{agent_id}").click()
-    await page.get_by_test_id("new-chat-landing-config-gear").click()
+    await open_entry_config(page, agent_id)
     await page.get_by_test_id("new-chat-landing-config-harness").click()
 
 
 def test_codex_needs_auth_warns_and_clears_when_available(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A needs-auth Codex host warns to run ``codex login``; an available host doesn't.
 
@@ -219,8 +219,7 @@ def test_codex_needs_auth_warns_and_clears_when_available(
     2. **available** — when the same host omits the reason (Codex ready), the
        warning is absent. Proves the warning is reason-driven, not always-on.
     """
-    base_url, session_id = seeded_session
-    del session_id  # this flow never creates a session — only reads the picker
+    base_url = live_server
     _run_in_fresh_loop(_drive_codex_needs_auth(base_url))
 
 
@@ -292,7 +291,7 @@ async def _drive_codex_needs_auth(base_url: str) -> None:
 
 
 def test_codex_needs_auth_badge_in_harness_menu(
-    seeded_session: tuple[str, str],
+    live_server: str,
 ) -> None:
     """A bundle agent's harness picker badges the Codex row "needs auth".
 
@@ -302,8 +301,7 @@ def test_codex_needs_auth_badge_in_harness_menu(
     (``new-chat-landing-harness-warning-codex``) reading "needs auth" — the
     per-row counterpart to the under-composer message.
     """
-    base_url, session_id = seeded_session
-    del session_id
+    base_url = live_server
     _run_in_fresh_loop(_drive_codex_badge(base_url))
 
 
