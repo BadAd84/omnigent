@@ -353,7 +353,7 @@ jobs:
     - name: Check out exact candidate
       uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
       with:
-        ref: c75daf3b3a40715a3c46fa534c467bfc6abf2231
+        ref: 86083d7348f0eaf437879615a0a5b2d29bfa615e
         persist-credentials: false
     - name: Prepare synthetic process output
       run: "python3 <<'SETUP'\nimport os, pathlib\nroot = pathlib.Path(os.environ['RUNNER_TEMP']) / 'polly-fake-command'\n\
@@ -406,7 +406,7 @@ jobs:
         REVIEW_TEXT: ${{ steps.polly.outputs.review_text }}
         REPO: synthetic/repo
         PR_NUMBER: '1'
-        HEAD_SHA: c75daf3b3a40715a3c46fa534c467bfc6abf2231
+        HEAD_SHA: 86083d7348f0eaf437879615a0a5b2d29bfa615e
         RUN_URL: https://example.test/synthetic
       run: "set -euo pipefail\n\n# Build the comment body safely \u2014 REVIEW_TEXT is passed via env\n# (not expression\
         \ interpolation) to avoid expression injection.\n{\n  echo \"<!-- polly-review-bot -->\"\n  echo \"<!--\
@@ -427,7 +427,7 @@ jobs:
       if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))
       env:
         LLM_API_KEY: canary-fake-key
-        GATEWAY_BASE_URL: https://canary.invalid
+        GATEWAY_BASE_URL: https://canary.invalid/serving-endpoints
       run: "python3 <<'PY'\nimport os, pathlib\ndestination = pathlib.Path('/tmp/polly-diagnostics')\ndestination.mkdir(parents=True,\
         \ exist_ok=True)\nsources = {\n    'polly-stderr.log': pathlib.Path('polly-stderr.log'),\n    'polly-output.txt':\
         \ pathlib.Path('/tmp/polly_output.txt'),\n    'polly-review.txt': pathlib.Path('/tmp/polly_review.txt'),\n\
@@ -435,8 +435,9 @@ jobs:
         \ + str(source.relative_to(logs))] = source\nfor name, source in sources.items():\n    if not source.is_file():\n\
         \        continue\n    text = source.read_text(errors='replace')\n    for key in ('LLM_API_KEY', 'GATEWAY_BASE_URL'):\n\
         \        value = os.environ.get(key)\n        if value:\n            text = text.replace(value, '[REDACTED]')\n\
-        \    target = destination / name\n    target.parent.mkdir(parents=True, exist_ok=True)\n    target.write_text(text)\n\
-        PY\n"
+        \            if key == 'GATEWAY_BASE_URL':\n                host = value.rstrip('/').removesuffix('/serving-endpoints')\n\
+        \                if host:\n                    text = text.replace(host, '[REDACTED]')\n    target = destination\
+        \ / name\n    target.parent.mkdir(parents=True, exist_ok=True)\n    target.write_text(text)\nPY\n"
     - name: Upload Polly diagnostics
       if: always() && (failure() || (steps.polly.outcome != '' && steps.polly.outcome != 'skipped'))
       uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
