@@ -159,7 +159,15 @@ def test_repeated_rpcs_only_revalidate_their_owner(
 ) -> None:
     scans = Mock(return_value=list(authenticated_agy))
     ports = {101: [52548], 102: [52550]} if socket_attribution else {101: [], 102: []}
-    lookups = Mock(side_effect=lambda pid: ports[pid])
+    looked_up: list[int] = []
+    lookup_lock = threading.Lock()
+
+    def lookups(pid: int) -> list[int]:
+        # Mock.call_count uses an unsynchronized increment across RPC threads.
+        with lookup_lock:
+            looked_up.append(pid)
+        return ports[pid]
+
     monkeypatch.setattr(rpc, "_list_agy_pids", scans)
     monkeypatch.setattr(rpc, "_pid_listen_ports", lookups)
     if not socket_attribution:
@@ -177,7 +185,7 @@ def test_repeated_rpcs_only_revalidate_their_owner(
     for port in [52548, 52550]:
         rpc.get_trajectory_steps(port, _CONVERSATION_ID)
     scans.reset_mock()
-    lookups.reset_mock()
+    looked_up.clear()
 
     ports_to_read = [52548, 52550] * 10
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -187,7 +195,7 @@ def test_repeated_rpcs_only_revalidate_their_owner(
             )
         )
     scans.assert_not_called()
-    assert lookups.call_count == len(ports_to_read)
+    assert sorted(looked_up) == [101] * 10 + [102] * 10
 
 
 @pytest.mark.parametrize("cached_owner", [False, True])
