@@ -74,11 +74,6 @@ from tests.e2e_ui.conftest import _BUILD_OUTPUT, _REPO_ROOT, _find_free_port
 
 _HOST_NAME = "old-host-0-6-0-e2e"
 _HARNESS = "claude-native"
-# The server's built-in Claude Code agent — the picker's "Claude Code" harness
-# row (see BUILTIN_AGENTS in web/src/lib/agentGrouping.ts). Its readiness on
-# the fake old host is "needs-auth", which is what makes the setup dialog
-# offer the credential form.
-_CLAUDE_AGENT_NAME = "claude-native-ui"
 
 # The dedicated server cold-boots alongside the suite's shared one; give it a
 # wider window than the shared fixture's 30s so CI can't flake on the spawn.
@@ -366,7 +361,7 @@ async def _drive_credential_post(base_url: str) -> None:
         start = time.monotonic()
         resp = await client.post(
             f"{base_url}/v1/hosts/{host_id}/harnesses/{_HARNESS}/credential",
-            json={"kind": "key", "secret": "sk-ant-e2e-old-host"},
+            json={"kind": "key", "secret": "fake-key-old-host"},
         )
         elapsed = time.monotonic() - start
 
@@ -409,12 +404,6 @@ def test_setup_dialog_save_against_old_host_gives_prompt_feedback(old_host_serve
 async def _drive_setup_dialog_save(base_url: str) -> None:
     dropped: list[str] = []
     async with _old_host(base_url, dropped) as host_id, async_playwright() as pw:
-        # The built-in Claude Code agent's id is minted at registration; look
-        # it up by its stable name.
-        async with httpx.AsyncClient(trust_env=False) as client:
-            agents = (await client.get(f"{base_url}/v1/agents")).json().get("data", [])
-            agent = next(a for a in agents if a["name"] == _CLAUDE_AGENT_NAME)
-
         browser = await pw.chromium.launch()
         # Explicit context so a recorded video is finalized on context.close()
         # even when the drive fails mid-way.
@@ -433,13 +422,13 @@ async def _drive_setup_dialog_save(base_url: str) -> None:
             # (same Radix timing artifact test_windows_workspace_picker.py notes).
             await expect(page.locator('[data-slot="dropdown-menu-content"]')).to_have_count(0)
 
-            # Select the built-in Claude Code agent — needs-auth on this host.
-            await page.get_by_test_id("new-chat-landing-agent-select").click()
-            agent_option = page.get_by_test_id(f"new-chat-landing-agent-{agent['id']}")
-            await expect(agent_option).to_be_visible(timeout=60_000)
-            await agent_option.click()
-
-            # "Set up →" opens the dialog; the auth step expands the form.
+            # The built-in Claude Code agent is the default landing selection and
+            # reads needs-auth on this host, so its "Set up →" affordance is present
+            # immediately. Don't route through the agent picker: on a v0.6.0 host
+            # its model list never resolves (host.model_options is another frame
+            # the old daemon drops), so the picker trigger stays in its loading
+            # placeholder — the same missing-capability-negotiation root cause,
+            # surfacing before the user can even reach Save.
             setup = page.get_by_test_id("new-chat-landing-harness-setup")
             await expect(setup).to_be_visible(timeout=60_000)
             await setup.click()
@@ -448,7 +437,7 @@ async def _drive_setup_dialog_save(base_url: str) -> None:
                 timeout=5_000
             )
 
-            await page.get_by_test_id("harness-credential-key").fill("sk-ant-e2e-old-host")
+            await page.get_by_test_id("harness-credential-key").fill("fake-key-old-host")
             await page.get_by_test_id("harness-credential-save").click()
 
             # The user must get feedback promptly — the buggy build shows
