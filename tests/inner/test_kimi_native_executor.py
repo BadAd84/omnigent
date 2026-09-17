@@ -19,15 +19,8 @@ from pathlib import Path
 
 import pytest
 
-from omnigent import kimi_native_bridge
-from omnigent.inner import kimi_native_executor
-from omnigent.inner.executor import ExecutorError
-from omnigent.inner.kimi_native_executor import (
-    KimiNativeExecutor,
-    _content_to_text,
-    _latest_user_text,
-)
-from omnigent.kimi_native_bridge import (
+from omnigent.harnesses.kimi_native import bridge as kimi_native_bridge
+from omnigent.harnesses.kimi_native.bridge import (
     APPROVE_KEY,
     BRIDGE_DIR_ENV_VAR,
     DENY_KEY,
@@ -38,6 +31,13 @@ from omnigent.kimi_native_bridge import (
     inject_user_message,
     read_tmux_info,
     write_tmux_target,
+)
+from omnigent.inner import kimi_native_executor
+from omnigent.inner.executor import ExecutorError
+from omnigent.inner.kimi_native_executor import (
+    KimiNativeExecutor,
+    _content_to_text,
+    _latest_user_text,
 )
 from omnigent.llms.errors import RetryableLLMError
 
@@ -769,6 +769,54 @@ class TestUserMessageInjection:
         inject_user_message(tmp_path / "bridge", content="fix the flaky test")
         assert [args[-1] for args in sent if args[-1] == "Enter"] == ["Enter", "Enter"]
 
+    def test_steer_follows_confirmed_submit(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        sent = self._stub_tui(
+            monkeypatch,
+            tmp_path,
+            submit_after_enters=2,
+            content="steer now",
+        )
+        inject_user_message(tmp_path / "bridge", content="steer now", turn_streaming=True)
+        assert [args[-1] for args in sent if args[0] == "send-keys"] == [
+            "Enter",
+            "Enter",
+            "C-s",
+        ]
+        enter_index = max(index for index, args in enumerate(sent) if args[-1] == "Enter")
+        assert sent[enter_index + 1 : enter_index + 2] == [("send-keys", "-t", "main", "C-s")]
+
+    @pytest.mark.parametrize(
+        "injected_error",
+        [
+            pytest.param(RuntimeError("tmux socket disappeared"), id="runtime-error"),
+            pytest.param(OSError("tmux socket disappeared"), id="os-error"),
+        ],
+    )
+    def test_ctrl_s_failure_keeps_submitted_message_delivered(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        injected_error: RuntimeError | OSError,
+    ) -> None:
+        sent = self._stub_tui(monkeypatch, tmp_path, submit_after_enters=1)
+        run_tmux = kimi_native_bridge._run_tmux
+
+        def _run_tmux(socket_path: str, *args: str) -> None:
+            run_tmux(socket_path, *args)
+            if args == ("send-keys", "-t", "main", "C-s"):
+                raise injected_error
+
+        monkeypatch.setattr(kimi_native_bridge, "_run_tmux", _run_tmux)
+        inject_user_message(tmp_path / "bridge", content="fix the flaky test")
+        assert sent[-2:] == [
+            ("send-keys", "-t", "main", "Enter"),
+            ("send-keys", "-t", "main", "C-s"),
+        ]
+        assert "the message may remain queued until the turn ends" in caplog.text
+
     def test_raises_when_draft_never_submits(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1315,7 +1363,7 @@ class TestRegistration:
         assert is_native_harness("native-kimi") is True
 
     def test_native_coding_agent_record(self) -> None:
-        from omnigent.native_coding_agents import native_coding_agent_for_harness
+        from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 
         agent = native_coding_agent_for_harness("kimi-native")
         assert agent is not None
