@@ -8719,6 +8719,8 @@ def test_wait_for_claude_prompt_ready_blames_the_interactive_prompt(
     assert "Finish it in the terminal" in message
     # The pane tail still names which step.
     assert "example-cli" in message
+    # The executor keys its keep-the-pane decision on this attribute.
+    assert excinfo.value.pane_state == claude_native_bridge.PANE_STATE_AWAITING_USER_INPUT
 
 
 def test_wait_for_claude_prompt_ready_reports_its_state_slug(
@@ -8742,6 +8744,7 @@ def test_wait_for_claude_prompt_ready_reports_its_state_slug(
     message = str(excinfo.value)
     assert "did not become ready" in message
     assert "state=prompt-absent-from-pane" in message
+    assert excinfo.value.pane_state == "prompt-absent-from-pane"
 
 
 def test_wait_for_claude_prompt_ready_slow_boot_wait_is_bounded(
