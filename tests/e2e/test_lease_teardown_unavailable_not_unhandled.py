@@ -245,8 +245,8 @@ def test_lease_teardown_cancelled_call_is_not_booked_as_unhandled_500(
     cancellation) and the endpoint tears down with GOAWAY "Cancelling all
     calls". The still-connected client must get an error it can act on — not
     the uncoded 500 ``internal_error`` — and the teardown-cancelled call must
-    not be booked through ``_handle_unhandled_exception`` as an ERROR-level
-    ``Unhandled exception``.
+    be booked as a WARNING upstream cancellation, not through
+    ``_handle_unhandled_exception`` as an ERROR-level ``Unhandled exception``.
 
     :param embedded_server: Base URL of the running server plus the records
         captured from the ``omnigent.server.app`` logger.
@@ -295,3 +295,10 @@ def test_lease_teardown_cancelled_call_is_not_booked_as_unhandled_500(
         "lease-teardown-cancelled gRPC call was booked as an unhandled session error: "
         + unhandled[0].getMessage().splitlines()[0]
     )
+
+    warning_booked = any(
+        record.levelno == logging.WARNING
+        and record.getMessage().startswith("Upstream call cancelled by its peer:")
+        for record in records
+    )
+    assert warning_booked, "the teardown cancellation was not booked as a WARNING"
