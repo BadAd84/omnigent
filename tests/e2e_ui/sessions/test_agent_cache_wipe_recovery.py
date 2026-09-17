@@ -138,8 +138,7 @@ def _probe_message_post(base_url: str, session_id: str) -> str:
 
 
 def _probe_terminal_create(base_url: str, session_id: str) -> str:
-    """POST a terminal create; the route loads the agent spec inline, so a
-    poisoned cache entry escapes as the ticket's unhandled 500 here."""
+    """Probe terminal creation, which loads the agent spec synchronously."""
     try:
         resp = httpx.post(
             f"{base_url}/v1/sessions/{session_id}/resources/terminals",
