@@ -1,35 +1,8 @@
-"""E2E regression: a lease-teardown-cancelled call must not fail requests as unhandled 500s.
+"""A local gRPC endpoint shutdown produces a typed upstream cancellation over HTTP.
 
-Journey (Databricks agentbricks embedding): a client's request is in flight
-over a server route backed by a blocking MAS gRPC call on a barnacle-leased
-channel. Another client cancels its request, the barnacle lease covering the
-channel is released, and the endpoint tears down the connection with GOAWAY
-("Cancelling all calls"). The in-flight call raises
-``grpc._channel._InactiveRpcError`` with ``StatusCode.UNAVAILABLE`` and
-details ``"Cancelling all calls"`` — a *different* status than the
-``StatusCode.CANCELLED`` shape already booked as transient upstream — so it
-escapes the route into the server's generic catch-all, which answers the
-still-connected client with a raw 500 ``internal_error`` and books::
-
-    Unhandled exception: <_InactiveRpcError of RPC that terminated with:
-        status = StatusCode.UNAVAILABLE
-        details = "Cancelling all calls" ...
-
-at ERROR level (category UNKNOWN, impact BLOCKING).
-
-The reproduction stands in for that deployment: a real in-process gRPC server
-holds the call open until the test — acting as the lease manager — revokes the
-lease by stopping the backend without grace, which sends the GOAWAY the real
-teardown sends. An ``extra_routers`` router (the embedding extension point
-agentbricks uses to mount its MAS routers) performs the blocking call inside a
-request handler, matching the deployed stack tail
-(``with_call`` → ``_end_unary_response_blocking`` → ``_InactiveRpcError``).
-
-The test drives the journey over real HTTP against a real uvicorn server and
-asserts the guarded contract: the client still gets an error response, but not
-the uncoded 500 ``internal_error``, and the teardown-cancelled call — an
-expected lease-lifecycle condition — is not logged through
-``_handle_unhandled_exception`` as an ERROR-level ``Unhandled exception``.
+A synthetic service holds a request open until the test stops its backend.
+The resulting UNAVAILABLE / "Cancelling all calls" error must return a coded
+upstream cancellation and retain a warning without an unhandled-error booking.
 
 Run::
 
@@ -53,8 +26,7 @@ import pytest
 import uvicorn
 from fastapi import APIRouter
 
-# The reported failure is a grpcio client error escaping a route; without
-# grpcio there is nothing to reproduce.
+# The regression uses a real grpcio backend.
 grpc = pytest.importorskip("grpc", reason="grpcio is required to raise the teardown-cancelled RPC")
 
 from omnigent.runtime import init as init_runtime  # noqa: E402
@@ -68,9 +40,8 @@ from omnigent.stores.conversation_store.sqlalchemy_store import (  # noqa: E402
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore  # noqa: E402
 from tests.e2e.helpers import HEALTH_TIMEOUT_S, POLL_INTERVAL_S  # noqa: E402
 
-# The gRPC method the deployed stack tail names (MAS tree listing via barnacle).
-_GRPC_SERVICE = "mas.TreeService"
-_GRPC_METHOD = "ListTreeNodeChildren"
+_GRPC_SERVICE = "example.ItemService"
+_GRPC_METHOD = "ListItems"
 
 
 class _LeasedBackend(NamedTuple):
@@ -106,10 +77,8 @@ def leased_backend() -> Iterator[_LeasedBackend]:
     """
     Start a real gRPC backend that holds every call open until released.
 
-    Stands in for the MAS backend reached over a barnacle-leased channel: the
-    call stays in flight until the lease teardown (the test stopping the
-    backend without grace) cancels it with GOAWAY "Cancelling all calls", the
-    exact ``StatusCode.UNAVAILABLE`` shape the deployed teardown injects.
+    Stopping the backend without grace cancels its in-flight call with
+    UNAVAILABLE and GOAWAY "Cancelling all calls".
 
     :returns: The backend's target, server handle, and coordination events.
     """
@@ -154,35 +123,29 @@ def leased_backend() -> Iterator[_LeasedBackend]:
 
 def _make_embedding_router(target: str) -> tuple[APIRouter, grpc.Channel]:
     """
-    Build a deployment-style router backed by a blocking leased gRPC call.
-
-    Mirrors how the agentbricks embedding mounts MAS routes through
-    ``create_app(extra_routers=...)``: the handler performs a synchronous
-    ``with_call`` over the leased channel (the exact frame in the deployed
-    stack tail) and lets any ``RpcError`` escape into the server's exception
-    handling, as the deployed router does.
+    Build an extension router backed by a blocking gRPC call.
 
     :param target: ``host:port`` of the backing gRPC service.
     :returns: The router and the channel (for teardown).
     """
     channel = grpc.insecure_channel(target)
-    list_children = channel.unary_unary(
+    list_items = channel.unary_unary(
         f"/{_GRPC_SERVICE}/{_GRPC_METHOD}",
         request_serializer=lambda payload: payload,
         response_deserializer=lambda payload: payload,
     )
     router = APIRouter()
 
-    @router.get("/workspace-tree/children")
-    def tree_children() -> dict[str, list[str]]:
+    @router.get("/items")
+    def items() -> dict[str, list[str]]:
         """
-        List workspace-tree children via the backing leased gRPC service.
+        List synthetic items via the backing gRPC service.
 
-        :returns: The (empty) children listing when the backend answers.
+        :returns: The empty item listing when the backend answers.
         """
-        response, _call = list_children.with_call(b"")
+        response, _call = list_items.with_call(b"")
         del response
-        return {"children": []}
+        return {"items": []}
 
     return router, channel
 
@@ -196,15 +159,14 @@ def embedded_server(
     """
     Run a real omnigent server with an embedding router over the leased backend.
 
-    Builds the app exactly as a deployment does — real stores, plus an
-    ``extra_routers`` entry whose handler calls the holding gRPC service — and
+    Uses real stores and an ``extra_routers`` entry backed by the local service, and
     serves it with uvicorn on a real socket, capturing everything the
     ``omnigent.server.app`` logger emits (the logger that books unhandled
     exceptions).
 
     :param db_uri: Per-test database URI from the root conftest.
     :param tmp_path: Pytest temp directory for artifacts and cache.
-    :param leased_backend: The holding gRPC backend standing in for barnacle.
+    :param leased_backend: The local gRPC backend with a controllable shutdown.
     :returns: ``(base_url, records)`` — the server URL and captured records.
     """
     agent_store = SqlAlchemyAgentStore(db_uri)
@@ -226,7 +188,7 @@ def embedded_server(
         conversation_store=conversation_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
-        extra_routers=[(router, "/v1/mas", ["mas"])],
+        extra_routers=[(router, "/v1/example", ["example"])],
     )
 
     records: list[logging.LogRecord] = []
@@ -288,14 +250,14 @@ def test_lease_teardown_cancelled_call_is_not_booked_as_unhandled_500(
 
     :param embedded_server: Base URL of the running server plus the records
         captured from the ``omnigent.server.app`` logger.
-    :param leased_backend: The holding gRPC backend standing in for barnacle.
+    :param leased_backend: The local gRPC backend with a controllable shutdown.
     """
     base_url, records = embedded_server
     result: dict[str, object] = {}
 
     def _request() -> None:
         """Perform the listing request and stash the outcome for assertions."""
-        response = httpx.get(f"{base_url}/v1/mas/workspace-tree/children", timeout=30.0)
+        response = httpx.get(f"{base_url}/v1/example/items", timeout=30.0)
         result["status"] = response.status_code
         result["body"] = response.text
 
@@ -317,9 +279,8 @@ def test_lease_teardown_cancelled_call_is_not_booked_as_unhandled_500(
         error_code = json.loads(str(result["body"]))["error"]["code"]
     except (json.JSONDecodeError, KeyError, TypeError):
         error_code = None
-    assert (status, error_code) != (500, "internal_error"), (
-        "lease-teardown-cancelled call failed the client's request as a raw "
-        f"internal_error 500: {result['body']!r}"
+    assert (status, error_code) == (499, "upstream_cancelled"), (
+        f"expected a coded upstream cancellation, received: {status} {result['body']!r}"
     )
 
     unhandled = [
