@@ -74,6 +74,24 @@ Some tests gate on local binaries. Install whichever you need; tests for missing
 - `uv sync --extra all --group test` from the repo root installs pytest, its plugins, and the runtime integrations exercised by the suite.
 - The `databricks` CLI must be installed separately for profile-backed runs; once configured, it reads `~/.databrickscfg`.
 
+### Cursor local gateway tests (no credentials)
+
+`test_cursor_local_gateway.py` runs the real local-agent CLI against a mock
+gateway. It requires `tmux`; the installer pins the CLI version and verifies
+SHA-256 checksums on macOS arm64 and Linux x64.
+
+```bash
+bash scripts/install_cursor_local_for_tests.sh /tmp/omnigent-cursor-local
+OMNIGENT_TEST_CURSOR_LOCAL_PATH=/tmp/omnigent-cursor-local/dist-package/cursor-agent-local \
+OMNIGENT_REQUIRE_CURSOR_LOCAL_TESTS=1 \
+uv run --no-sync pytest tests/e2e/test_cursor_local_gateway.py -v --timeout=180 \
+  > /tmp/cursor-e2e.log 2>&1 &
+```
+
+Expect two passing cases covering both gateway URL forms and cold resume.
+The normal E2E CI job requires these tests; compatibility jobs do not install
+the local CLI. This covers native Cursor with a mock backend, not the Cursor SDK.
+
 ## Recommended invocation
 
 ```bash
