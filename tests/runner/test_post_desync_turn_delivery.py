@@ -492,3 +492,94 @@ async def test_post_desync_turn_proceeds_when_harness_process_is_dead(
     assert _CONV_ID not in app.state.desynced_sessions
     completed = [e for e in turn2 if e.get("type") == "response.completed"]
     assert completed, f"turn 2 should complete cleanly after a respawn: {turn2}"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_reconciliation_releases_the_background_turn_slot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, harness, _pm = _build_app()
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    original_post = harness.post
+
+    async def _blocked_interrupt(url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if json.get("type") == "interrupt":
+            entered.set()
+            await release.wait()
+        return await original_post(url, json=json, timeout=timeout)
+
+    monkeypatch.setattr(harness, "post", _blocked_interrupt)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        await _desync_via_dropped_turn(client, app)
+        response = await client.post(
+            f"/v1/sessions/{_CONV_ID}/events", json=_message_body("second message")
+        )
+        assert response.status_code == 202
+        task = app.state.active_turns[_CONV_ID]
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert _CONV_ID not in app.state.active_turns
+            assert _CONV_ID in app.state.desynced_sessions
+
+            monkeypatch.setattr(harness, "post", original_post)
+            retry = await _drive_turn(client, "retry after cancellation")
+            assert any(event.get("type") == "response.completed" for event in retry)
+            assert harness.rejected_with_204 == 0
+        finally:
+            release.set()
+            if not task.done():
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("streaming", [True, False], ids=["streamed", "background"])
+@pytest.mark.parametrize("failure", ["connection", "status"])
+async def test_failed_reconciliation_preserves_retry_without_delivering_into_stale_context(
+    monkeypatch: pytest.MonkeyPatch, streaming: bool, failure: str
+) -> None:
+    app, harness, _pm = _build_app()
+    original_post = harness.post
+
+    async def _failed_interrupt(url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        if json.get("type") == "interrupt":
+            if failure == "connection":
+                raise httpx.ConnectError("Synthetic interrupt connection failure")
+            return httpx.Response(
+                503, request=httpx.Request("POST", "http://synthetic-harness/events")
+            )
+        return await original_post(url, json=json, timeout=timeout)
+
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        await _desync_via_dropped_turn(client, app)
+        monkeypatch.setattr(harness, "post", _failed_interrupt)
+        suffix = "?stream=true" if streaming else ""
+        response = await client.post(
+            f"/v1/sessions/{_CONV_ID}/events{suffix}",
+            json=_message_body("second message"),
+        )
+        if streaming:
+            assert response.status_code == 503
+            assert response.json()["error"]["code"] == "harness_reconciliation_failed"
+        else:
+            assert response.status_code == 202
+            task = app.state.active_turns.get(_CONV_ID)
+            if isinstance(task, asyncio.Task):
+                await asyncio.wait_for(task, timeout=2)
+        assert len(harness.stream_calls) == 1
+        assert harness.rejected_with_204 == 0
+        assert _CONV_ID in app.state.desynced_sessions
+        assert _CONV_ID not in app.state.active_turns
+
+        monkeypatch.setattr(harness, "post", original_post)
+        retry = await _drive_turn(client, "retry after recovery becomes available")
+        assert any(event.get("type") == "response.completed" for event in retry)
+        assert harness.interrupts_forwarded == 1
+        assert _CONV_ID not in app.state.desynced_sessions

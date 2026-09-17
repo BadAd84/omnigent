@@ -92,7 +92,7 @@ from omnigent.runtime.harnesses._scaffold import ToolResultEvent as _ToolResultE
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
 from omnigent.runtime.prompt import EMBEDDED_BROWSER_PRIORITY_INSTRUCTION
 from omnigent.server.schemas import CreateResponseRequest as _CreateResponseRequest
-from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy
+from omnigent.spec.types import AgentSpec, ExecutorSpec, SharePolicy, ToolsConfig
 from omnigent.util.session_lifecycle import CLOSED_LABEL_KEY, CLOSED_LABEL_VALUE
 from tests.runner.conftest import (
     _FakeProcessManager as _RecoveryFakeProcessManager,
@@ -4115,6 +4115,7 @@ def _spec_with_real_subagent(harness: str) -> AgentSpec:
     return AgentSpec(
         spec_version=1,
         name="parent",
+        tools=ToolsConfig(agents=["worker"]),
         sub_agents=[
             AgentSpec(
                 spec_version=1,
@@ -10025,8 +10026,8 @@ class _DeadInterruptHarnessClient(_RecoveryScriptedHarnessClient):
 
 
 @pytest.mark.asyncio
-async def test_recovery_stream_mode_clears_gate_even_when_interrupt_fails() -> None:
-    """Stream-mode sentinel clears and buffer drains even on a dead interrupt."""
+async def test_recovery_stream_mode_clears_gate_but_retains_desync_when_interrupt_fails() -> None:
+    """Failed interruption releases the slot and preserves the pending recovery."""
     conv = "conv_recovery_streammode_dead"
     harness = _DeadInterruptHarnessClient([])
     pm = _RecoveryFakeProcessManager(harness)
@@ -10053,9 +10054,22 @@ async def test_recovery_stream_mode_clears_gate_even_when_interrupt_fails() -> N
         await app.state.resync_turn_state(conv, "verdict_delivery_channel_dead")
 
         deadline = loop.time() + 3.0
-        while loop.time() < deadline and conv in app.state.desynced_sessions:
+        while loop.time() < deadline and (
+            conv in app.state.active_turns or app.state.session_message_buffers.get(conv)
+        ):
             await asyncio.sleep(0.02)
-        assert conv not in app.state.desynced_sessions
+        assert conv not in app.state.active_turns
+        assert not app.state.session_message_buffers.get(conv)
+        assert conv in app.state.desynced_sessions
+
+    queue = app.state.session_event_queues.get(conv)
+    statuses: list[dict[str, Any]] = []
+    while queue is not None and not queue.empty():
+        event = queue.get_nowait()
+        if isinstance(event, dict) and event.get("type") == "session.status":
+            statuses.append(event)
+    assert statuses[-1]["status"] == "failed"
+    assert "Please retry your message" in statuses[-1]["error"]["message"]
 
 
 class _InterruptEndsStreamHarnessClient(_RecoveryScriptedHarnessClient):
@@ -11012,6 +11026,7 @@ def _fake_entry(harness: str, model: str | None, returncode: int | None = None) 
 
     class _FakeProc:
         def __init__(self, rc: int | None) -> None:
+            self.pid = 12345
             self.returncode = rc
 
     return _SubprocessEntry(
