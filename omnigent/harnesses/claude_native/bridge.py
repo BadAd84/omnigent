@@ -492,8 +492,9 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
     Return the trusted parent for an allowed bridge directory.
 
     Claude-native files live below the uid-scoped temp bridge root.
-    Codex-, Pi-, Cursor-, Qwen-, Hermes-, Antigravity-, and OpenCode-native reuse
-    the relay/MCP implementation but keep bridge files below their own bridge roots.
+    Codex-, Pi-, Cursor-, Qwen-, Hermes-, Kimi-, Antigravity-, and OpenCode-native
+    reuse the relay/MCP implementation but keep bridge files below their own
+    bridge roots.
     All roots use the same owner-only ancestor validation; only the trusted
     anchor differs.
 
@@ -580,6 +581,15 @@ def _trusted_parent_for_bridge_dir(target: Path) -> Path:
         # the uid-scoped temp dir's parent and validate/chmod the two
         # bridge-owned directories below it.
         return _absolute_syntactic_path(hermes_root.parent.parent)
+
+    from omnigent.harnesses.kimi_native.bridge import bridge_root as kimi_bridge_root
+
+    kimi_root = _absolute_syntactic_path(kimi_bridge_root())
+    if target.is_relative_to(kimi_root):
+        # Same shape as cursor-native ($TMPDIR/omnigent-<uid>/kimi-native): trust
+        # the uid-scoped temp dir's parent and validate/chmod the two
+        # bridge-owned directories below it.
+        return _absolute_syntactic_path(kimi_root.parent.parent)
 
     from omnigent.harnesses.opencode_native.bridge import bridge_root as opencode_bridge_root
 

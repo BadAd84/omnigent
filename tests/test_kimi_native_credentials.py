@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -139,3 +140,65 @@ def test_build_session_home_without_user_home_writes_hooks_only(
 
     parsed = tomllib.loads((session_home / "config.toml").read_text(encoding="utf-8"))
     assert {h["event"] for h in parsed["hooks"]} == {"PreToolUse", "PermissionRequest"}
+
+
+def test_build_session_home_mcp_merges_user_servers_with_omnigent_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mcp=True`` writes a session mcp.json: the user's servers + the relay.
+
+    Kimi loads the user-level ``$KIMI_CODE_HOME/mcp.json`` ungated, so this is
+    the surface that puts the session's Omnigent tool schemas on kimi's wire.
+    """
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    (user_home / "mcp.json").write_text(
+        json.dumps({"mcpServers": {"theirs": {"command": "their-mcp"}}}), encoding="utf-8"
+    )
+    session_home = tmp_path / "session-home"
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    build_kimi_session_home(session_home, bridge_dir=bridge_dir, mcp=True)
+
+    mcp_path = session_home / "mcp.json"
+    assert not mcp_path.is_symlink(), "mcp.json must be session-private, not the user's file"
+    servers = json.loads(mcp_path.read_text(encoding="utf-8"))["mcpServers"]
+    assert servers["theirs"] == {"command": "their-mcp"}
+    omnigent = servers["omnigent"]
+    assert "serve-mcp" in omnigent["args"]
+    assert str(bridge_dir) in omnigent["args"]
+
+
+def test_build_session_home_without_mcp_drops_stale_registration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``mcp=False`` removes a prior launch's entry (it points at a dead relay)
+    and replaces a pre-privacy symlink without touching the user's file."""
+    user_home = _fake_user_home(tmp_path, monkeypatch)
+    (user_home / "mcp.json").write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    session_home = tmp_path / "session-home"
+    session_home.mkdir()
+    (session_home / "mcp.json").symlink_to(user_home / "mcp.json")
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    build_kimi_session_home(session_home, bridge_dir=bridge_dir, mcp=False)
+
+    assert not (session_home / "mcp.json").exists()
+    assert (user_home / "mcp.json").read_text(encoding="utf-8"), "user's file is untouched"
+
+
+def test_build_session_home_hooks_disabled_keeps_config_verbatim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``hooks=False`` (headless executor) copies the user config with no hooks."""
+    _fake_user_home(tmp_path, monkeypatch)
+    session_home = tmp_path / "session-home"
+    bridge_dir = tmp_path / "bridge"
+    bridge_dir.mkdir()
+
+    build_kimi_session_home(session_home, bridge_dir=bridge_dir, hooks=False)
+
+    parsed = tomllib.loads((session_home / "config.toml").read_text(encoding="utf-8"))
+    assert parsed["default_model"] == "kimi-code/x"
+    assert "hooks" not in parsed

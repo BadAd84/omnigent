@@ -2310,6 +2310,90 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
 
 
 @pytest.mark.asyncio
+async def test_auto_create_kimi_wires_omnigent_mcp_relay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With a relay starter available, kimi auto-create bridges Omnigent tools.
+
+    The relay token (``bridge.json``) must exist before the TUI spawns
+    ``serve-mcp``, the session home must be built with the MCP registration,
+    and the comment relay must be started for this bridge dir — otherwise the
+    TUI runs with zero Omnigent tool schemas.
+    """
+    import omnigent.harnesses.kimi_native.credentials as kimi_creds_mod
+    import omnigent.harnesses.kimi_native.forwarder as kimi_fwd_mod
+    import omnigent.harnesses.kimi_native.main as kimi_mod
+    from omnigent.harnesses.kimi_native import bridge as kimi_bridge_mod
+    from omnigent.runner import app as runner_app_mod
+    from omnigent.runner.app import _auto_create_kimi_terminal
+
+    session_id = "5f31d9222c7ac0f45ba2736b57b51f77"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", tmp_path / "kimi-native")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
+
+    home_builds: list[dict[str, Any]] = []
+
+    def _fake_home(session_home: Path, **kwargs: Any) -> dict[str, str]:
+        home_builds.append(kwargs)
+        return {"KIMI_CODE_HOME": str(session_home)}
+
+    monkeypatch.setattr(kimi_creds_mod, "build_kimi_session_home", _fake_home)
+
+    async def _sleeping_forwarder(**_kwargs: Any) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(kimi_fwd_mod, "supervise_kimi_forwarder", _sleeping_forwarder)
+
+    snapshot = {"workspace": str(workspace), "terminal_launch_args": []}
+
+    class _SnapshotServerClient:
+        async def get(self, url: str, **_kwargs: Any) -> httpx.Response:
+            assert url == f"/v1/sessions/{session_id}"
+            return httpx.Response(200, json=snapshot, request=httpx.Request("GET", url))
+
+    class _FakeResourceRegistry:
+        terminal_registry = None
+
+        async def launch_required_terminal(self, **_kwargs: Any) -> SessionResourceView:
+            return SessionResourceView(
+                id="terminal_kimi_main",
+                type="terminal",
+                session_id=session_id,
+                name="Kimi",
+            )
+
+    relay_calls: list[dict[str, Any]] = []
+
+    async def _ensure_relay(sid: str, **kwargs: Any) -> None:
+        relay_calls.append({"session_id": sid, **kwargs})
+
+    try:
+        await _auto_create_kimi_terminal(
+            session_id,
+            cast(SessionResourceRegistry, _FakeResourceRegistry()),
+            lambda _sid, _event: None,
+            server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
+            ensure_comment_relay=_ensure_relay,
+        )
+        await asyncio.sleep(0)
+    finally:
+        await runner_app_mod._cancel_auto_forwarder_task(session_id)
+
+    bridge_dir = kimi_bridge_mod.bridge_dir_for_session_id(session_id)
+    assert (bridge_dir / "bridge.json").is_file(), "relay token must exist before launch"
+    assert home_builds and home_builds[0].get("mcp") is True
+    assert relay_calls == [
+        {"session_id": session_id, "explicit_bridge_dir": bridge_dir, "await_notify": False}
+    ]
+
+
+@pytest.mark.asyncio
 async def test_auto_create_antigravity_cold_start_scopes_to_pane_agy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

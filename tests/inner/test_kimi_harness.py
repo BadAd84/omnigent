@@ -1448,18 +1448,14 @@ def _collect_stubbed_turn(
     return asyncio.run(_collect(ex, [{"role": "user", "content": "hi"}]))
 
 
-def test_run_turn_warns_once_when_tools_declared(
+def _tools_spawn_capture(
     monkeypatch: pytest.MonkeyPatch,
-    caplog: pytest.LogCaptureFixture,
+    spawn_envs: list[dict[str, str]],
 ) -> None:
-    """Tools on the spec are silently dropped (no MCP bridge on upstream kimi
-    yet) — we should warn exactly once per session.
-    """
-    import logging
+    """Stub the kimi spawn, capturing each turn's env into *spawn_envs*."""
 
-    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
-
-    def _make_fake() -> _FakeProcess:
+    async def _fake_spawn(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        spawn_envs.append(dict(kwargs["env"]))
         return _FakeProcess(
             [
                 json.dumps({"role": "assistant", "content": "ok"}),
@@ -1471,28 +1467,128 @@ def test_run_turn_warns_once_when_tools_declared(
             returncode=0,
         )
 
-    fakes = [_make_fake(), _make_fake()]
-
-    async def _fake_spawn(*_args: Any, **_kwargs: Any) -> _FakeProcess:
-        return fakes.pop(0)
-
     monkeypatch.setattr(kimi_executor, "_create_subprocess_exec", _fake_spawn)
     monkeypatch.setattr(kimi_executor.shutil, "which", lambda _binary: "/usr/local/bin/kimi")
 
-    ex = KimiExecutor(binary_path="kimi")
-    tools = [{"name": "my_tool", "description": "x", "parameters": {}}]
 
-    async def _two_turns() -> None:
-        async for _ in ex.run_turn(
-            messages=[{"role": "user", "content": "hi"}], tools=tools, system_prompt=""
-        ):
-            pass
-        async for _ in ex.run_turn(
+async def _fake_tool_executor(_name: str, _args: dict[str, Any]) -> dict[str, Any]:
+    return {"ok": True}
+
+
+def test_run_turn_bridges_declared_tools_via_session_home_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Declared tools re-home kimi to a session home whose mcp.json serves them.
+
+    The spawn env's ``KIMI_CODE_HOME`` must point at a session-scoped home whose
+    ``mcp.json`` registers the shared ``serve-mcp`` relay, and the relay's
+    ``tool_relay.json`` must advertise the declared Omnigent tool — the schema
+    surface kimi forwards to the model. The turn's wire-log usage is read from
+    that same home.
+    """
+    spawn_envs: list[dict[str, str]] = []
+    _tools_spawn_capture(monkeypatch, spawn_envs)
+
+    ex = KimiExecutor(binary_path="kimi")
+    ex._tool_executor = _fake_tool_executor
+    tools = [{"name": "sys_os_read", "description": "read", "parameters": {"type": "object"}}]
+
+    async def _turn(text: str) -> list[Any]:
+        return [
+            evt
+            async for evt in ex.run_turn(
+                messages=[{"role": "user", "content": text}], tools=tools, system_prompt=""
+            )
+        ]
+
+    try:
+        asyncio.run(_turn("hi"))
+        home_str = spawn_envs[0].get("KIMI_CODE_HOME")
+        assert home_str, "spawn env should re-home kimi to the session-scoped home"
+        home = Path(home_str)
+        mcp_config = json.loads((home / "mcp.json").read_text(encoding="utf-8"))
+        omnigent_entry = mcp_config["mcpServers"]["omnigent"]
+        assert "serve-mcp" in omnigent_entry["args"]
+        bridge_dir = Path(omnigent_entry["args"][omnigent_entry["args"].index("--bridge-dir") + 1])
+        relay_info = json.loads((bridge_dir / "tool_relay.json").read_text(encoding="utf-8"))
+        assert [t["name"] for t in relay_info["tools"]] == ["sys_os_read"]
+        # No hooks for headless: -p mode has no TUI to answer a permission menu.
+        assert "[[hooks]]" not in (home / "config.toml").read_text(encoding="utf-8")
+
+        # Usage is collected from the session home's private wire log, and the
+        # second turn reuses the same home (one relay per session).
+        _write_wire(
+            home,
+            "session_x",
+            [_usage_row(input_other=12, output=3, time_ms=int(time.time() * 1000))],
+        )
+        events = asyncio.run(_turn("again"))
+        assert spawn_envs[1].get("KIMI_CODE_HOME") == home_str
+        completes = [evt for evt in events if isinstance(evt, TurnComplete)]
+        assert completes and completes[0].usage is not None
+    finally:
+        asyncio.run(ex.close())
+    assert not Path(home_str).exists(), "close() removes the bridge dir + session home"
+
+
+def test_run_turn_without_tool_executor_runs_bare(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No adapter tool bridge (standalone / unit use): the turn runs unbridged."""
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
+    spawn_envs: list[dict[str, str]] = []
+    _tools_spawn_capture(monkeypatch, spawn_envs)
+
+    ex = KimiExecutor(binary_path="kimi")
+    tools = [{"name": "sys_os_read", "description": "read", "parameters": {}}]
+
+    async def _turn() -> list[Any]:
+        return [
+            evt
+            async for evt in ex.run_turn(
+                messages=[{"role": "user", "content": "hi"}], tools=tools, system_prompt=""
+            )
+        ]
+
+    events = asyncio.run(_turn())
+    assert any(isinstance(evt, TurnComplete) for evt in events)
+    assert "KIMI_CODE_HOME" not in spawn_envs[0]
+
+
+def test_run_turn_mcp_setup_failure_is_not_fatal(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A relay boot failure degrades to a no-tools turn instead of erroring."""
+    import logging
+
+    caplog.set_level(logging.WARNING, logger="omnigent.inner.kimi_executor")
+    monkeypatch.delenv("KIMI_CODE_HOME", raising=False)
+    spawn_envs: list[dict[str, str]] = []
+    _tools_spawn_capture(monkeypatch, spawn_envs)
+
+    def _boom(**_kwargs: Any) -> None:
+        raise RuntimeError("relay down")
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge.start_tool_relay", _boom)
+
+    ex = KimiExecutor(binary_path="kimi")
+    ex._tool_executor = _fake_tool_executor
+    tools = [{"name": "sys_os_read", "description": "read", "parameters": {}}]
+
+    async def _two_turns() -> list[Any]:
+        events = [
+            evt
+            async for evt in ex.run_turn(
+                messages=[{"role": "user", "content": "hi"}], tools=tools, system_prompt=""
+            )
+        ]
+        async for evt in ex.run_turn(
             messages=[{"role": "user", "content": "again"}], tools=tools, system_prompt=""
         ):
-            pass
+            events.append(evt)
+        return events
 
-    asyncio.run(_two_turns())
-
-    warnings = [rec for rec in caplog.records if "tool-injection bridge" in rec.message]
-    assert len(warnings) == 1, "should warn exactly once across both turns"
+    events = asyncio.run(_two_turns())
+    assert sum(isinstance(evt, TurnComplete) for evt in events) == 2
+    assert all("KIMI_CODE_HOME" not in env for env in spawn_envs)
+    warnings = [rec for rec in caplog.records if "MCP bridge setup failed" in rec.message]
+    assert len(warnings) == 1, "definitive failure is cached, not retried every turn"

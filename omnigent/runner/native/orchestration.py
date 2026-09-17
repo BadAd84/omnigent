@@ -4143,8 +4143,14 @@ async def _auto_create_kimi_terminal(
     supervise_kimi_forwarder`) tails kimi's per-session ``wire.jsonl`` transcript
     and mirrors each user prompt + assistant reply into the Omnigent chat, so the
     response shows in the web UI — not only the embedded terminal. Tool calls and
-    reasoning are NOT mirrored (the embedded terminal renders those). NO MCP
-    plumbing (upstream kimi has no per-spawn MCP config).
+    reasoning are NOT mirrored (the embedded terminal renders those).
+
+    Omnigent's builtin tools (``sys_*``, ``load_skill``, ``web_fetch``, …) are
+    exposed to the TUI via the shared MCP relay: upstream kimi has no per-spawn
+    MCP flag, so the registration rides in the session-scoped home's user-level
+    ``mcp.json`` (which loads ungated — only project-scoped MCP files hit kimi's
+    trust prompt), pointing at ``serve-mcp`` in this session's bridge dir; the
+    relay itself is started by ``ensure_comment_relay`` after launch.
 
     :param session_id: Session/conversation identifier.
     :param resource_registry: Session resource registry for launching the
@@ -4152,16 +4158,18 @@ async def _auto_create_kimi_terminal(
     :param publish_event: Runner session event publisher.
     :param server_client: Runner Omnigent server client (used only for the
         workspace snapshot read).
-    :param ensure_comment_relay: Unused; kept for call-site parity with the
-        other native auto-create helpers.
+    :param ensure_comment_relay: Callback that starts the Omnigent builtin-tool
+        relay for this session's bridge dir. ``None`` skips wiring the Omnigent
+        MCP relay (tests / no server).
     :param agent_spec: Unused for now (model pinning via the kimi TUI is a
         follow-up); kept for call-site parity.
     :returns: Created terminal resource view.
     """
-    del ensure_comment_relay, agent_spec
+    del agent_spec
     from omnigent.harnesses.kimi_native.bridge import (
         bridge_dir_for_session_id,
         write_hook_config,
+        write_mcp_bridge_config,
         write_tmux_target,
     )
     from omnigent.harnesses.kimi_native.credentials import build_kimi_session_home
@@ -4218,9 +4226,31 @@ async def _auto_create_kimi_terminal(
         headers=_runner_headers,
         session_id=session_id,
     )
+    # Expose Omnigent's builtin tools to the TUI via the shared MCP relay. The
+    # relay token must exist before kimi spawns ``serve-mcp``; the live tool
+    # surface is advertised by the ``tool_relay.json`` that
+    # ``ensure_comment_relay`` writes below. Only wired when the relay will
+    # actually start, else the registered server would be dead (serve-mcp with
+    # nothing to route calls back to) — mirrors the qwen-native gating.
+    mcp_enabled = server_client is not None and ensure_comment_relay is not None
+    if mcp_enabled:
+        try:
+            write_mcp_bridge_config(bridge_dir)
+        except RuntimeError:
+            # The bridge dir failed owner-only validation (e.g. a redirected
+            # ancestor on a shared host) — don't write the relay token there.
+            # Degrade to no MCP rather than crash the session.
+            mcp_enabled = False
+            _logger.warning(
+                "kimi-native: bridge dir failed secure validation; skipping "
+                "Omnigent MCP wiring for session %s.",
+                session_id,
+                exc_info=True,
+            )
     kimi_env = build_kimi_session_home(
         bridge_dir / "kimi-code-home",
         bridge_dir=bridge_dir,
+        mcp=mcp_enabled,
     )
     terminal_view = await resource_registry.launch_required_terminal(
         session_id=session_id,
@@ -4256,6 +4286,16 @@ async def _auto_create_kimi_terminal(
             "resource": session_resource_view_to_dict(terminal_view),
         },
     )
+
+    # Start the Omnigent builtin-tool relay backing the session home's
+    # ``mcp.json`` registration, so kimi's serve-mcp has a live tool surface
+    # to advertise and a dispatcher to route calls back to.
+    if mcp_enabled and ensure_comment_relay is not None:
+        await ensure_comment_relay(
+            session_id,
+            explicit_bridge_dir=bridge_dir,
+            await_notify=False,
+        )
 
     # Mirror the kimi TUI transcript into the Omnigent chat: tail the per-session
     # wire.jsonl and POST each user/assistant turn, so the reply renders in the

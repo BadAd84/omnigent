@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 import threading
@@ -33,6 +34,7 @@ BRIDGE_DIR_ENV_VAR = "HARNESS_KIMI_NATIVE_BRIDGE_DIR"
 
 _BRIDGE_ROOT = Path(tempfile.gettempdir()) / f"omnigent-{stable_user_id()}" / "kimi-native"
 _TMUX_FILE = "tmux.json"
+_BRIDGE_CONFIG_FILE = "bridge.json"
 # Omnigent routing details the kimi hook subprocess reads to reach the server.
 # Mirrors claude-native's ``permission_hook.json`` (server URL + auth headers +
 # the active Omnigent session). Written by the runner at terminal-create time;
@@ -139,6 +141,33 @@ def _ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
     with contextlib.suppress(OSError):
         os.chmod(path, 0o700)
+
+
+def write_mcp_bridge_config(bridge_dir: Path) -> None:
+    """Write the token config the shared Omnigent MCP relay reads at startup.
+
+    The ``serve-mcp`` relay (spawned by kimi from the session home's
+    ``mcp.json``) reads ``bridge.json`` for a bearer token and exits if it's
+    missing, so this must exist *before* kimi launches. ``bridge.json`` only
+    ever holds ``{token}``; the live tool surface is advertised separately via
+    the ``tool_relay.json`` that the runner's comment relay
+    (``ensure_comment_relay`` → ``_ensure_comment_relay_started``) writes into
+    this same bridge dir when it starts. Mirrors
+    :func:`omnigent.harnesses.qwen_native.bridge.write_mcp_bridge_config`.
+
+    :raises RuntimeError: If the bridge dir fails owner-only validation — the
+        token is not written.
+    """
+    from omnigent.harnesses.claude_native.bridge import ensure_secure_dir
+
+    ensure_secure_dir(bridge_dir)
+    config_path = bridge_dir / _BRIDGE_CONFIG_FILE
+    if config_path.exists():
+        return
+    payload = {"token": secrets.token_urlsafe(32)}
+    tmp = bridge_dir / (_BRIDGE_CONFIG_FILE + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(tmp, config_path)
 
 
 def build_kimi_native_spawn_env(session_id: str) -> dict[str, str]:

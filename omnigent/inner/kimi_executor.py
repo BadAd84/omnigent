@@ -48,11 +48,20 @@ Env-var contract (read once at construction by
   ``--skills-dir <path>`` per entry. Empty / unset = use kimi's
   default skill discovery (user + project dirs).
 
-Per-invocation provider routing (``--config-file`` / ``--mcp-config-file``
-/ gateway env vars) is **not** wired: upstream kimi has no per-spawn
-config override. Provider configuration lives in ``~/.kimi-code/config.toml``
-and is managed out-of-band via ``kimi provider add`` (Omnigent-side
-provider injection is a deferred follow-up).
+Omnigent tool schemas ARE exposed to kimi: upstream kimi has no per-spawn
+MCP flag, but it reads the user-level ``$KIMI_CODE_HOME/mcp.json``, so when a
+turn declares tools the executor starts the shared ``serve-mcp`` relay
+(:mod:`omnigent.harnesses.claude_native.bridge`) and re-homes the subprocess to a
+session-scoped ``KIMI_CODE_HOME`` — the user's config + auth plus an
+``mcp.json`` registering the relay — so kimi offers the session's ``sys_*`` /
+MCP tools to the model and proxies calls back through the adapter's tool
+dispatch (policy-enforced server-side).
+
+Per-invocation provider routing (``--config-file`` / gateway env vars) is
+**not** wired: upstream kimi has no per-spawn config override. Provider
+configuration lives in ``~/.kimi-code/config.toml`` and is managed out-of-band
+via ``kimi provider add`` (Omnigent-side provider injection is a deferred
+follow-up); the session-scoped home preserves it verbatim.
 """
 
 from __future__ import annotations
@@ -67,9 +76,16 @@ import shutil
 import time
 from collections.abc import AsyncIterator, Mapping, Sequence
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.bridge import ClaudeNativeToolRelay, ToolExecutor
 
 from omnigent.harness_startup_config import resolve_harness_path
-from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
+from omnigent.harnesses.kimi_native.credentials import (
+    KIMI_CODE_HOME_ENV_VAR,
+    resolve_user_kimi_home,
+)
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.inner.executor import (
@@ -421,10 +437,18 @@ class KimiExecutor(Executor):
         # those turns' late-appearing rows instead of gating on the current
         # turn's start (and seeding must not snapshot EOF past them).
         self._first_read_floor_ms: dict[str, int] = {}
-        # Tracks whether we've already warned this session about tools
-        # being declared without a provider-injection bridge (one warning
-        # per session; the tool-injection bridge is a deferred follow-up).
-        self._warned_tools_without_bridge = False
+        # Adapter-injected bridge dispatching one Omnigent tool call
+        # (name, args) into the current turn's TurnContext.
+        self._tool_executor: ToolExecutor | None = None
+        # Omnigent-MCP bridge state: a serve-mcp relay plus the session-scoped
+        # KIMI_CODE_HOME whose mcp.json registers it (None until the first
+        # turn that has both declared tools and a tool executor).
+        self._mcp_relay: ClaudeNativeToolRelay | None = None
+        self._mcp_bridge_dir: Path | None = None
+        self._session_home: Path | None = None
+        # True once bridge setup reached a definitive outcome (started, or
+        # failed and fell back to no tools) — not retried every turn.
+        self._mcp_resolved = False
         # Active subprocess handle, captured so interrupt can target it.
         self._active_process: asyncio.subprocess.Process | None = None
 
@@ -441,6 +465,82 @@ class KimiExecutor(Executor):
 
     # -- helpers -------------------------------------------------------------
 
+    def _effective_kimi_home(self) -> Path:
+        """The Kimi home the spawned subprocess actually uses.
+
+        The session-scoped home while the Omnigent-MCP bridge is active (its
+        private ``sessions/`` store holds this session's wire log), else the
+        user's global home.
+        """
+        return self._session_home or resolve_user_kimi_home()
+
+    def _ensure_omnigent_mcp(self, tools: list[ToolSpec]) -> None:
+        """Bridge the session's Omnigent tools to kimi via MCP, once.
+
+        Starts the shared ``serve-mcp`` relay (proxying each tool call back
+        through the adapter's ``_tool_executor`` → the Omnigent server, where
+        policy is enforced) and builds a session-scoped ``KIMI_CODE_HOME`` —
+        the user's config + auth plus an ``mcp.json`` registering the relay —
+        that :meth:`_build_spawn_env` points the subprocess at. Never fatal:
+        on setup failure the turn runs without Omnigent tools. Retries on a
+        later turn only while the inputs aren't ready yet (no tool executor /
+        no tools); a definitive outcome is cached for the session.
+        """
+        if self._mcp_resolved:
+            return
+        tool_executor = self._tool_executor
+        if tool_executor is None or not tools:
+            return
+        try:
+            from omnigent.harnesses.claude_native.bridge import (
+                prepare_acp_mcp_bridge_dir,
+                start_tool_relay,
+            )
+            from omnigent.harnesses.kimi_native.credentials import build_kimi_session_home
+
+            self._mcp_bridge_dir = prepare_acp_mcp_bridge_dir()
+            self._mcp_relay = start_tool_relay(
+                bridge_dir=self._mcp_bridge_dir,
+                tools=list(tools),
+                tool_executor=tool_executor,
+                loop=asyncio.get_running_loop(),
+            )
+            session_home = self._mcp_bridge_dir / "kimi-code-home"
+            build_kimi_session_home(
+                session_home,
+                bridge_dir=self._mcp_bridge_dir,
+                hooks=False,
+                mcp=True,
+            )
+            self._session_home = session_home
+            _logger.info(
+                "kimi executor: Omnigent MCP relay ready (%d tool(s) bridged via %s)",
+                len(tools),
+                session_home,
+            )
+        except Exception as exc:  # noqa: BLE001 — MCP is additive; never break a turn
+            _logger.warning(
+                "kimi executor: Omnigent MCP bridge setup failed; kimi runs "
+                "without the session's %d declared Omnigent tool(s): %s",
+                len(tools),
+                exc,
+            )
+            self._close_omnigent_mcp()
+        self._mcp_resolved = True
+
+    def _close_omnigent_mcp(self) -> None:
+        """Tear down the relay HTTP server and the session-scoped Kimi home."""
+        relay = self._mcp_relay
+        self._mcp_relay = None
+        if relay is not None:
+            with contextlib.suppress(Exception):
+                relay.close()
+        bridge_dir = self._mcp_bridge_dir
+        self._mcp_bridge_dir = None
+        self._session_home = None
+        if bridge_dir is not None:
+            shutil.rmtree(bridge_dir, ignore_errors=True)
+
     def _build_spawn_env(self) -> dict[str, str]:
         """The env handed to the kimi subprocess.
 
@@ -452,10 +552,15 @@ class KimiExecutor(Executor):
         # Deny-by-default: base + kimi's own families + the spec's
         # env_passthrough. Keeps the documented ambient KIMI_/MOONSHOT_ auth
         # while no longer handing the CLI every other provider's key (#3445).
-        return clean_agent_env(
+        env = clean_agent_env(
             allow_prefixes=("KIMI_", "MOONSHOT_"),
             extra_allowed=declared_passthrough(self._os_env),
         )
+        if self._session_home is not None:
+            # Re-home kimi to the session-scoped home: the user's config +
+            # auth plus the mcp.json that registers the Omnigent tool relay.
+            env[KIMI_CODE_HOME_ENV_VAR] = str(self._session_home)
+        return env
 
     def _sandbox_launch_path(self, spawn_env_names: Sequence[str]) -> str:
         """Return the path to spawn for kimi — sandbox launcher or bare binary.
@@ -505,9 +610,12 @@ class KimiExecutor(Executor):
             resolved_bin = shutil.which(self._binary_path) or self._binary_path
             bin_dir = Path(resolved_bin).resolve(strict=False).parent
             sandbox = with_additional_read_roots(sandbox, [bin_dir])
-            sandbox = with_additional_write_roots(
-                sandbox, [resolve_user_kimi_home(), Path("/tmp")]
-            )
+            write_roots = [resolve_user_kimi_home(), Path("/tmp")]
+            if self._mcp_bridge_dir is not None:
+                # The bridge dir holds the session home kimi writes plus the
+                # relay files its serve-mcp subprocess reads.
+                write_roots.append(self._mcp_bridge_dir)
+            sandbox = with_additional_write_roots(sandbox, write_roots)
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(resolved_bin, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -565,7 +673,7 @@ class KimiExecutor(Executor):
             # first read starts at 0, gated on the recorded floor instead.
             return
         try:
-            wire = _find_wire_log(resolve_user_kimi_home(), session_id)
+            wire = _find_wire_log(self._effective_kimi_home(), session_id)
             if wire is not None:
                 self._wire_offsets[session_id] = wire.stat().st_size
         except Exception:
@@ -588,7 +696,7 @@ class KimiExecutor(Executor):
         if not session_id:
             return None
         try:
-            wire_path = _find_wire_log(resolve_user_kimi_home(), session_id)
+            wire_path = _find_wire_log(self._effective_kimi_home(), session_id)
             if wire_path is None:
                 _warn_once(
                     f"wire-missing:{session_id}",
@@ -710,15 +818,7 @@ class KimiExecutor(Executor):
         system_prompt: str,  # noqa: ARG002 — kimi's own agent spec carries instructions
         config: ExecutorConfig | None = None,  # noqa: ARG002 — per-turn override not yet plumbed
     ) -> AsyncIterator[ExecutorEvent]:
-        if tools and not self._warned_tools_without_bridge:
-            _logger.warning(
-                "kimi executor received %d declared tool(s) but Omnigent has no "
-                "tool-injection bridge for the upstream kimi binary yet (no "
-                "per-spawn --mcp-config-file). The tools will not be exposed to "
-                "kimi for this session (MCP tool-injection is a deferred follow-up).",
-                len(tools),
-            )
-            self._warned_tools_without_bridge = True
+        self._ensure_omnigent_mcp(tools)
 
         if shutil.which(self._binary_path) is None and not Path(self._binary_path).exists():
             yield ExecutorError(
@@ -858,6 +958,10 @@ class KimiExecutor(Executor):
         )
 
     # -- session lifecycle ---------------------------------------------------
+
+    async def close(self) -> None:
+        """Release the Omnigent-MCP relay and its session-scoped Kimi home."""
+        self._close_omnigent_mcp()
 
     async def close_session(self, session_key: str) -> None:  # noqa: ARG002 — per-session id is the kimi UUID, no extra teardown
         """Drop the captured session id so the next turn starts fresh.
