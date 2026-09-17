@@ -2311,7 +2311,9 @@ class UpdateSessionRequest(BaseModel):
         absolute path is the owner's own machine (owner-gated, exactly
         like absolute browsing). The bound runner resolves the target
         against its live environment root and enforces the session's
-        sandbox reach, then the server persists the resolved absolute
+        sandbox reach — a relative path is traversal-rejected and
+        confined under that root, and the target must be an existing
+        directory — then the server persists the resolved absolute
         path. Omitting the field leaves the workspace unchanged.
     :param silent: When ``True``, persist metadata changes but skip
         the runner-side side effects — specifically the

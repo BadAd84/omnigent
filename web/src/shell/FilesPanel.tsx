@@ -14,7 +14,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
 import { updateSession } from "@/lib/sessionsApi";
-import { isOwnerLevel } from "@/lib/permissionsApi";
+import { isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useChatStore } from "@/store/chatStore";
 import {
@@ -310,6 +310,49 @@ export function FilesPanel({
   // workspace they can already read.
   const locationParam = relativizeToWorkspace(browseLocation, workspaceRoot);
 
+  // The session workdir tracks the browsed location with the LATEST intent
+  // winning: each PATCH resolves and persists server-side, so two in flight
+  // could land out of order. Keep one request in flight and let a newer
+  // navigation replace the queued target instead of racing it.
+  const workdirSyncRef = useRef<{
+    inflight: boolean;
+    queued: { conversationId: string; workspace: string } | null;
+  }>({ inflight: false, queued: null });
+
+  const syncWorkdir = useCallback((cid: string, workspace: string) => {
+    const state = workdirSyncRef.current;
+    state.queued = { conversationId: cid, workspace };
+    if (state.inflight) return;
+    state.inflight = true;
+    void (async () => {
+      try {
+        // Sequential on purpose: serialization is what makes the latest
+        // navigation win over a still-in-flight one.
+        /* oxlint-disable no-await-in-loop */
+        while (state.queued) {
+          const target = state.queued;
+          state.queued = null;
+          try {
+            await updateSession(target.conversationId, { workspace: target.workspace });
+          } catch (err) {
+            // The header names the browsed folder the working folder, so a
+            // silent miss would lie. Only the newest intent's failure matters.
+            if (!state.queued) {
+              setBrowseError(
+                `The session's working directory could not follow this folder: ${
+                  err instanceof Error ? err.message : String(err)
+                }`,
+              );
+            }
+          }
+        }
+        /* oxlint-enable no-await-in-loop */
+      } finally {
+        state.inflight = false;
+      }
+    })();
+  }, []);
+
   const navigateTo = useCallback(
     (absolutePath: string) => {
       setBrowseError(null);
@@ -320,15 +363,13 @@ export function FilesPanel({
       }
       setBrowseLocation(next);
       // Re-rooting the browser also repoints the session's working directory so
-      // new shells and turns cd into the browsed folder. Same wire form the tree
-      // uses; fire-and-forget (a viewer's PATCH or offline runner fails harmlessly).
-      if (conversationId) {
-        void updateSession(conversationId, {
-          workspace: relativizeToWorkspace(next, workspaceRoot),
-        }).catch(() => {});
+      // new shells and turns cd into the browsed folder (same wire form the
+      // tree uses). Viewers can't repoint, so their browsing stays panel-local.
+      if (conversationId && isEditorLevel(session?.permissionLevel ?? null)) {
+        syncWorkdir(conversationId, relativizeToWorkspace(next, workspaceRoot));
       }
     },
-    [workspaceRoot, conversationId],
+    [workspaceRoot, conversationId, session?.permissionLevel, syncWorkdir],
   );
 
   // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.

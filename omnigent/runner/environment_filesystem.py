@@ -320,6 +320,53 @@ def resolve_browse_target(
     )
 
 
+def resolve_workdir_target(
+    location: str,
+    root: Path,
+    roots: Sequence[ReachableRoot],
+    *,
+    unconfined: bool,
+) -> Path:
+    """Resolve a wire-form working-directory target and authorize it.
+
+    Same split as :meth:`CallerProcessFilesystem._resolve`: a relative
+    path is normalized, traversal-rejected, and contained under *root*
+    (checked on the RESOLVED path, so a symlink cannot aim it outward);
+    an absolute path takes the browse-authorization route, where the
+    unconfined widening applies. A working directory must also exist and
+    be a directory — persisting anything else leaves every later turn
+    and new shell failing to ``cd``.
+
+    :param location: Wire-form target: ``""`` for the environment root,
+        a relative path under it, or an absolute path.
+    :param root: Environment root directory.
+    :param roots: Grants from :func:`omnigent.inner.sandbox.reachable_roots`.
+    :param unconfined: Result of :func:`omnigent.inner.sandbox.is_unconfined`.
+    :returns: The resolved absolute directory path.
+    :raises InvalidPath: On a malformed or escaping path, or a target
+        that is not an existing directory.
+    :raises PathUnreachable: When an absolute target is out of reach.
+    """
+    if is_absolute_request(location):
+        resolved = resolve_browse_target(location, roots, unconfined=unconfined)
+    else:
+        root_resolved = root.resolve()
+        validated = _validate_path(location)
+        if not validated:
+            resolved = root_resolved
+        else:
+            contained = contained_realpath(
+                os.path.join(str(root_resolved), validated),
+                containment_prefix(root_resolved),
+            )
+            if contained is None:
+                raise InvalidPath(f"Path {location!r} escapes the environment root")
+            resolved = Path(contained)
+    if not resolved.is_dir():
+        raise InvalidPath(f"Path {location!r} is not an existing directory")
+    return resolved
+
+
 def _entry_from_stat(
     _root: Path,
     full_path: Path,

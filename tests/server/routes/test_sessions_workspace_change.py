@@ -107,9 +107,7 @@ def _seed_session(
     return app, conv.id, conversation_store
 
 
-async def test_owner_repoints_workspace_to_absolute_path(
-    db_uri: str, tmp_path: Path
-) -> None:
+async def test_owner_repoints_workspace_to_absolute_path(db_uri: str, tmp_path: Path) -> None:
     """An owner PATCHing an absolute ``workspace`` persists it.
 
     With no runner bound the forward is offline, but an absolute wire-form
@@ -166,9 +164,7 @@ async def test_relative_workspace_change_requires_online_runner(
     assert conv.workspace == "/home/user/project"
 
 
-async def test_absolute_workspace_change_requires_owner(
-    db_uri: str, tmp_path: Path
-) -> None:
+async def test_absolute_workspace_change_requires_owner(db_uri: str, tmp_path: Path) -> None:
     """An absolute ``workspace`` targets the owner's machine, so it is
     owner-gated: an editor collaborator PATCHing an absolute path gets 403
     and nothing is persisted."""
@@ -190,9 +186,7 @@ async def test_absolute_workspace_change_requires_owner(
     assert conv.workspace == "/home/user/project"
 
 
-async def test_relative_workspace_change_requires_edit(
-    db_uri: str, tmp_path: Path
-) -> None:
+async def test_relative_workspace_change_requires_edit(db_uri: str, tmp_path: Path) -> None:
     """Repointing the workspace is an edit to the session, so a read-only
     collaborator PATCHing even a relative (in-workspace) path gets 403 and
     nothing is persisted."""
@@ -212,3 +206,95 @@ async def test_relative_workspace_change_requires_edit(
     conv = store.get_conversation(session_id)
     assert conv is not None
     assert conv.workspace == "/home/user/project"
+
+
+async def test_runner_reach_refusal_surfaces_as_forbidden(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner's out-of-reach verdict is a permission refusal (403).
+
+    Flattening it to 400 would tell the client its request was malformed
+    when the real fact is that the target sits outside the session's
+    reach — the same distinction the browse endpoints preserve.
+    """
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    app, session_id, store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER},
+        workspace="/home/user/project",
+    )
+
+    async def _forward(*args: object, **kwargs: object) -> _RunnerForwardResult:
+        del args, kwargs
+        return _RunnerForwardResult(
+            status_code=403,
+            body='{"error": "forbidden", "detail": "outside this session\'s reach"}',
+        )
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _forward)
+    async with _client(app, _OWNER) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{session_id}",
+            json={"workspace": "/outside/reach"},
+        )
+        assert resp.status_code == 403, resp.text
+
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == "/home/user/project"
+
+
+async def test_failed_persist_rolls_the_runner_back(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A persist failure after the runner applied the change must roll it back.
+
+    The runner moves its live cwd when it answers the forward; if the
+    server then fails to persist, live and stored state diverge — later
+    turns cd somewhere the snapshot does not record. The server must
+    point the runner back at the previously persisted workspace before
+    surfacing the error.
+    """
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+    from omnigent.stores.conversation_store import ConversationNotFoundError
+
+    app, session_id, _store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER},
+        workspace="/home/user/project",
+    )
+
+    forwarded: list[dict[str, object]] = []
+
+    async def _forward(
+        _session_id: str, _router: object, event: dict[str, object], **kwargs: object
+    ) -> _RunnerForwardResult:
+        del kwargs
+        forwarded.append(event)
+        return _RunnerForwardResult(
+            status_code=200,
+            body='{"object": "session.workspace_changed",'
+            ' "workspace": "/home/user/project/subdir"}',
+        )
+
+    def _persist_fails(
+        self: SqlAlchemyConversationStore, conversation_id: str, workspace: str
+    ) -> None:
+        del self, conversation_id, workspace
+        raise ConversationNotFoundError("simulated persist failure")
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _forward)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_workspace", _persist_fails)
+    async with _client(app, _OWNER) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{session_id}",
+            json={"workspace": "subdir"},
+        )
+        assert resp.status_code == 404, resp.text
+
+    assert [e.get("workspace") for e in forwarded] == ["subdir", "/home/user/project"]

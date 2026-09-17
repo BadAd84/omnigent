@@ -38,9 +38,7 @@ from tests.e2e_ui.conftest import open_right_rail
 _FOLDER = "workdir-demo"
 
 
-def _session_workdirs(
-    page: Page, base_url: str, session_id: str
-) -> tuple[str | None, str | None]:
+def _session_workdirs(page: Page, base_url: str, session_id: str) -> tuple[str | None, str | None]:
     """Sample both server-side readouts of the session's working directory.
 
     :param page: Playwright page (its request context reuses the app origin).
@@ -55,9 +53,7 @@ def _session_workdirs(
     if snap.status == 200:
         value = snap.json().get("workspace")
         workspace = value if isinstance(value, str) else None
-    env = page.request.get(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
-    )
+    env = page.request.get(f"{base_url}/v1/sessions/{session_id}/resources/environments/default")
     if env.status == 200:
         metadata = env.json().get("metadata") or {}
         value = metadata.get("root")
@@ -82,9 +78,7 @@ def test_browsing_to_a_folder_changes_the_session_workdir(
     """
     base_url, session_id = terminal_session
 
-    env = page.request.get(
-        f"{base_url}/v1/sessions/{session_id}/resources/environments/default"
-    )
+    env = page.request.get(f"{base_url}/v1/sessions/{session_id}/resources/environments/default")
     assert env.status == 200, env.text()
     root = Path(env.json()["metadata"]["root"])
     folder = root / _FOLDER

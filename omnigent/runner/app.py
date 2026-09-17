@@ -9052,8 +9052,10 @@ def create_runner_app(
         if body_type == "workspace_change":
             # Repoint the session workdir onto a browsed folder. The runner owns
             # its live env root and sandbox reach, so it resolves the wire form
-            # (relative/absolute/empty) to an absolute path, refuses anything out
-            # of reach, updates its workspace cache, and returns the path to persist.
+            # (relative/absolute/empty) exactly as the file browser does — a
+            # relative path is traversal-rejected and contained under the env
+            # root, an absolute one is reach-authorized — and it must name an
+            # existing directory. Returns the resolved path to persist.
             from omnigent.inner.sandbox import (
                 is_unconfined,
                 reachable_roots,
@@ -9062,7 +9064,7 @@ def create_runner_app(
             from omnigent.runner.environment_filesystem import (
                 InvalidPath,
                 PathUnreachable,
-                resolve_browse_target,
+                resolve_workdir_target,
             )
 
             raw_workspace = body.get("workspace") if isinstance(body, dict) else None
@@ -9087,17 +9089,11 @@ def create_runner_app(
                     },
                 )
             root_path = Path(env_root)
-            location = (raw_workspace or "").strip()
-            if not location:
-                candidate = str(root_path)
-            elif os.path.isabs(location):
-                candidate = location
-            else:
-                candidate = str(root_path / location)
             policy = resolve_sandbox(spec_os_env, root_path)
             try:
-                resolved = resolve_browse_target(
-                    candidate,
+                resolved = resolve_workdir_target(
+                    raw_workspace or "",
+                    root_path,
                     reachable_roots(root_path, policy),
                     unconfined=is_unconfined(policy),
                 )

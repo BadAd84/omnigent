@@ -3289,9 +3289,7 @@ def test_set_workspace_persists_and_round_trips(
     )
     assert conv.workspace == "/Users/corey/projects/myapp"
 
-    updated = conversation_store.set_workspace(
-        conv.id, "/Users/corey/projects/myapp/subdir"
-    )
+    updated = conversation_store.set_workspace(conv.id, "/Users/corey/projects/myapp/subdir")
     assert updated.workspace == "/Users/corey/projects/myapp/subdir"
 
     fetched = conversation_store.get_conversation(conv.id)

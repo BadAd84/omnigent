@@ -2557,6 +2557,10 @@ def register_core_routes(
         # and enforce reach; forward, then persist the absolute path it returns.
         # Not silent-gated: this moves the runner's cwd, it adds no pane item.
         if set_workspace:
+            # Captured before the forward: if the persist below fails after the
+            # runner already applied the change, the runner is rolled back here.
+            _prior_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            _prior_workspace = _prior_conv.workspace if _prior_conv is not None else None
             _workspace_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
@@ -2572,12 +2576,16 @@ def register_core_routes(
                     _resolved_workspace = _wf_body["workspace"]
             if _resolved_workspace is None:
                 if _workspace_forward is not None and _workspace_forward.status_code >= 400:
-                    # The runner rejected the location (unreachable / invalid).
-                    # Surface its detail rather than silently persist anything.
+                    # The runner rejected the location. Preserve its verdict:
+                    # out-of-reach (403) is a permission refusal, anything else
+                    # is bad input.
                     raise OmnigentError(
-                        "runner rejected the working-directory change: "
-                        f"{_workspace_forward.body}",
-                        code=ErrorCode.INVALID_INPUT,
+                        f"runner rejected the working-directory change: {_workspace_forward.body}",
+                        code=(
+                            ErrorCode.FORBIDDEN
+                            if _workspace_forward.status_code == 403
+                            else ErrorCode.INVALID_INPUT
+                        ),
                     )
                 if body.workspace and ntpath.isabs(body.workspace):
                     # No runner to resolve against, but an absolute wire-form
@@ -2596,8 +2604,24 @@ def register_core_routes(
                 await asyncio.to_thread(
                     conversation_store.set_workspace, session_id, _resolved_workspace
                 )
-            except ConversationNotFoundError as exc:
-                raise _session_not_found() from exc
+            except Exception as exc:
+                # The runner applied the change when it answered the forward; a
+                # failed persist would leave its live cwd diverged from the
+                # stored snapshot, so point it back at the previously persisted
+                # workspace (best-effort) before surfacing the error.
+                if _workspace_forward is not None and _workspace_forward.status_code == 200:
+                    with contextlib.suppress(Exception):
+                        await _forward_session_change_to_runner(
+                            session_id,
+                            runner_router,
+                            {
+                                "type": "workspace_change",
+                                "workspace": _prior_workspace or "",
+                            },
+                        )
+                if isinstance(exc, ConversationNotFoundError):
+                    raise _session_not_found() from exc
+                raise
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the
