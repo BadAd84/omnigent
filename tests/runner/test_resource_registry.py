@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -25,7 +26,7 @@ from omnigent.runner.resource_registry import (
     _sanitize_session_id,
     _session_workspace,
     _terminal_exit_diagnostics,
-    _trim_terminal_exit_output,
+    trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
 from tests.runner.helpers import make_test_terminal_instance
@@ -151,6 +152,7 @@ def test_list_resources_filters_by_type(tmp_path: Path) -> None:
 async def test_terminal_resource_role_is_private_and_cleared_on_close(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     Terminal role markers stay private and follow close lifecycle.
@@ -222,10 +224,19 @@ async def test_terminal_resource_role_is_private_and_cleared_on_close(
     assert "command" not in view.metadata
     assert "args" not in view.metadata
 
-    closed = await registry.close_terminal("conv_codex", view.id)
+    with caplog.at_level(logging.INFO, logger="omnigent.runner.resource_registry"):
+        closed = await registry.close_terminal("conv_codex", view.id)
 
     assert closed is True
     assert registry.terminal_resource_role("conv_codex", view.id) is None
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_close_requested"
+    )
+    assert record.session_id == "conv_codex"
+    assert record.attributes["terminal_id"] == view.id
+    assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
 
 
 @pytest.mark.asyncio
@@ -311,8 +322,11 @@ async def test_terminal_lifecycle_cannot_change_after_observe(tmp_path: Path) ->
 
 
 @pytest.mark.asyncio
-async def test_auxiliary_terminal_exit_publishes_resource_exit_only(tmp_path: Path) -> None:
+async def test_auxiliary_terminal_exit_publishes_resource_exit_only(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """Auxiliary terminal exit is reported with auxiliary lifecycle metadata."""
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("sidecar", "s1", tmp_path)
@@ -359,6 +373,18 @@ async def test_auxiliary_terminal_exit_publishes_resource_exit_only(tmp_path: Pa
     assert exits[0].cwd == str(tmp_path)
     assert exits[0].last_output == "startup failed\nretry login"
     assert terminal_registry.get("conv_exit", "sidecar", "s1") is None
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.session_id == "conv_exit"
+    assert record.attributes["terminal_lifecycle"] == "auxiliary"
+    assert record.attributes["terminal_instance_id"] == instance.diagnostic_id
+    assert record.attributes["session_status_before_exit"] == "unknown"
+    assert record.attributes["superseded"] is False
+    assert "startup failed" not in str(record.attributes)
+    assert str(tmp_path) not in str(record.attributes)
 
 
 async def _observe_native_agent_terminal_and_capture(
@@ -675,7 +701,9 @@ async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Path) -> None:
+async def test_required_terminal_exit_while_idle_is_clean_shutdown(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A required terminal that exits after going idle is not a failure.
 
     The native agent terminal is long-lived: it goes ``idle`` when its turn
@@ -689,6 +717,7 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Pat
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
     terminal_registry._by_conversation.setdefault("conv_idle", {})[("claude", "main")] = instance
     exits: list[TerminalExitEvent] = []
     exit_published = asyncio.Event()
@@ -717,10 +746,20 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(tmp_path: Pat
     assert len(exits) == 1
     assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
     assert exits[0].session_was_idle is True
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.session_id == "conv_idle"
+    assert record.attributes["terminal_lifecycle"] == "required"
+    assert record.attributes["session_status_before_exit"] == "idle"
 
 
 @pytest.mark.asyncio
-async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -> None:
+async def test_required_terminal_exit_while_running_is_failure(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """A required terminal that vanishes mid-turn is still a failure.
 
     When the last PTY-status edge was ``running``, the pane disappeared while
@@ -732,6 +771,7 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
     terminal_registry = TerminalRegistry()
     registry = SessionResourceRegistry(terminal_registry=terminal_registry)
     instance = make_test_terminal_instance("claude", "main", tmp_path)
+    caplog.set_level(logging.INFO, logger="omnigent.runner.resource_registry")
     terminal_registry._by_conversation.setdefault("conv_run", {})[("claude", "main")] = instance
     exits: list[TerminalExitEvent] = []
     exit_published = asyncio.Event()
@@ -755,15 +795,21 @@ async def test_required_terminal_exit_while_running_is_failure(tmp_path: Path) -
 
     assert len(exits) == 1
     assert exits[0].session_was_idle is False
+    record = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "terminal_exit_observed"
+    )
+    assert record.attributes["session_status_before_exit"] == "running"
 
 
-def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
+def test_trim_terminal_output_drops_whole_leading_lines() -> None:
     # Over the char budget: the first surviving line must be a WHOLE line, never
     # a mid-word fragment (the "rity reasons" cut). The final line — the one that
     # matters — stays intact.
     filler = "\n".join(f"line {i} " + "x" * 80 for i in range(200))
     text = filler + "\n--dangerously-skip-permissions cannot be run for security reasons"
-    trimmed = _trim_terminal_exit_output(text)
+    trimmed = trim_terminal_output(text)
     assert trimmed is not None
     assert len(trimmed) <= _TERMINAL_EXIT_OUTPUT_MAX_CHARS + 60  # + the omitted-lines marker
     assert trimmed.startswith("... omitted ")
@@ -774,11 +820,11 @@ def test_trim_terminal_exit_output_drops_whole_leading_lines() -> None:
     assert first_content.startswith("line ")
 
 
-def test_trim_terminal_exit_output_hard_clips_single_overlong_line() -> None:
+def test_trim_terminal_output_hard_clips_single_overlong_line() -> None:
     # A single line longer than the budget has no line boundary to snap to, so
     # it's clipped from the tail as a last resort.
     line = "y" * (_TERMINAL_EXIT_OUTPUT_MAX_CHARS + 500)
-    trimmed = _trim_terminal_exit_output(line)
+    trimmed = trim_terminal_output(line)
     assert trimmed is not None
     assert len(trimmed) == _TERMINAL_EXIT_OUTPUT_MAX_CHARS
 
@@ -1547,7 +1593,7 @@ async def test_cleanup_session_preserves_live_native_bridge_dir(
     :param monkeypatch: Pytest monkeypatch fixture.
     :returns: None.
     """
-    import omnigent.claude_native_bridge as claude_bridge
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
 
     monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path / "claude-native")
     monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)

@@ -29,6 +29,8 @@ from typing import Any
 
 from playwright.async_api import Route, async_playwright, expect
 
+from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
+
 _HOST_ID = "host_e2e"
 _SESSIONS_RE = re.compile(r"/v1/sessions(\?.*)?$")
 
@@ -162,6 +164,7 @@ async def _register_routes(page, *, created_session_id: str, create_requests: li
     # sessions matcher so it is not captured as a create/scan.
     await page.route(f"**/v1/sessions/{_SCAN_UPLOAD_SESSION}/agent", handle_upload_agent)
     await page.route("**/v1/hosts", handle_hosts)
+    await stub_empty_host_picker_data(page, _HOST_ID)
     await page.route("**/v1/agents", handle_agents)
     await page.route("**/v1/sessions/*/events", handle_events)
     await page.route(_SESSIONS_RE, handle_sessions)
@@ -217,6 +220,8 @@ async def _drive(base_url: str, created_session_id: str) -> None:
 
             # Select Agent A, send, and assert the create POST bound the upload.
             await option(_UPLOAD_ID).click()
+            await page.keyboard.press("Escape")
+            await expect(page.get_by_role("menu")).to_have_count(0)
             await page.get_by_test_id("new-chat-landing-input").fill("which version are you?")
             await page.get_by_test_id("new-chat-landing-submit").click()
 

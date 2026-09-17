@@ -36,6 +36,7 @@ import { useChatStore } from "@/store/chatStore";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import type { BundledLanguage, ThemedToken } from "shiki";
 import { highlightCode } from "@/components/ai-elements/code-block";
+import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
 import ReactMarkdown, { type Components, type Options } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkEmoji from "remark-emoji";
@@ -43,9 +44,8 @@ import rehypeRaw from "rehype-raw";
 import rehypeSanitize, { defaultSchema } from "rehype-sanitize";
 import { rehypeGithubAlerts } from "rehype-github-alerts";
 import rehypeSlug from "rehype-slug";
-import { mermaid } from "@streamdown/mermaid";
-import { MarkdownErrorBoundary } from "@/components/ai-elements/MarkdownErrorBoundary";
-import { Streamdown } from "streamdown";
+import { createMathPlugin } from "@streamdown/math";
+import { MermaidPreview } from "./MermaidPreview";
 import type { Comment } from "@/hooks/useComments";
 import {
   type FileContentResponse,
@@ -103,10 +103,16 @@ const ModelViewer = lazy(() => import("./ModelViewer").then((m) => ({ default: m
 const GUTTER_WIDTH = 48;
 const EMPTY_COMMENTS: Comment[] = [];
 
+// Same TeX math config as chat (see streamdown-security.ts): only `$$…$$` opens
+// math so a lone `$` stays prose. Wraps remark-math + rehype-katex, whose plugin
+// tuples slot straight into react-markdown, so the preview renders formulas the
+// way the chat surface already does.
+const MATH_PLUGIN = createMathPlugin({ singleDollarTextMath: false });
+
 // GFM covers tables, task lists, strikethrough, and autolinks; remark-emoji
 // renders GitHub-style `:shortcode:` emoji as their unicode glyphs so docs read
-// the same here as on GitHub.
-const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji];
+// the same here as on GitHub. remark-math parses `$$…$$` into math nodes.
+const MARKDOWN_REMARK_PLUGINS = [remarkGfm, remarkEmoji, MATH_PLUGIN.remarkPlugin];
 
 // rehype-github-alerts turns `> [!NOTE]` blockquotes into GitHub's
 // `<div class="markdown-alert markdown-alert-note">…` callout markup (GFM
@@ -142,27 +148,18 @@ const MARKDOWN_SANITIZE_SCHEMA = {
 // that HTML; rehype-sanitize then strips anything unsafe (<script>, event
 // handlers, javascript: URLs) so this stays safe to render inline without an
 // iframe. Order matters: alerts transform before sanitize, slug adds IDs to
-// headings, and sanitize runs last, after raw parsing and GFM.
+// headings, and sanitize runs after raw parsing and GFM — only KaTeX comes
+// later, rendering math from the already-sanitized tree.
 const MARKDOWN_REHYPE_PLUGINS: Options["rehypePlugins"] = [
   rehypeRaw,
   rehypeSlug,
   rehypeGithubAlerts,
   [rehypeSanitize, MARKDOWN_SANITIZE_SCHEMA],
+  // After sanitize: sanitize neutralises the untrusted markdown/HTML, leaving the
+  // `language-math` code nodes as plain text; KaTeX then renders that trusted
+  // output. Running KaTeX before sanitize would strip its MathML/spans as unknown.
+  MATH_PLUGIN.rehypePlugin,
 ];
-
-const MERMAID_STREAMDOWN_PLUGINS = { mermaid };
-
-function MermaidPreview({ source }: { source: string }) {
-  return (
-    <div data-testid="mermaid-preview" className="not-prose my-4 overflow-auto">
-      <MarkdownErrorBoundary source={source}>
-        <Streamdown plugins={MERMAID_STREAMDOWN_PLUGINS}>
-          {`\`\`\`mermaid\n${source.replace(/\n$/, "")}\n\`\`\``}
-        </Streamdown>
-      </MarkdownErrorBoundary>
-    </div>
-  );
-}
 
 // Tailwind Preflight applies `img { height: auto }`, which overrides the HTML
 // `width`/`height` *attributes* (presentational hints lose to any author CSS).
@@ -175,7 +172,9 @@ const MARKDOWN_COMPONENTS: Components = {
     const child = isValidElement(children) ? children : null;
     if (
       isValidElement<{ className?: string; children?: ReactNode }>(child) &&
-      child.props.className?.split(/\s+/).includes("language-mermaid")
+      // Match case-insensitively so a cased fence (```Mermaid) renders a diagram
+      // in the read-only preview too, matching the editor's detection.
+      child.props.className?.split(/\s+/).some((c) => c.toLowerCase() === "language-mermaid")
     ) {
       return <MermaidPreview source={String(child.props.children ?? "")} />;
     }
@@ -206,6 +205,10 @@ function MarkdownPreview({
   tocOpen: boolean;
   onTocOpenChange: (open: boolean) => void;
 }) {
+  // Rewrite explicit TeX delimiters (`\(…\)`, `\[…\]`) to `$$…$$` before
+  // rendering, the same as chat, so agent-authored formulas render here too;
+  // remark-math only honours `$` delimiters. Safe outside code/existing math.
+  const rendered = useMemo(() => normalizeExplicitMathDelimiters(content), [content]);
   return (
     <div className="flex h-full">
       <div
@@ -219,7 +222,7 @@ function MarkdownPreview({
           rehypePlugins={MARKDOWN_REHYPE_PLUGINS}
           components={MARKDOWN_COMPONENTS}
         >
-          {content}
+          {rendered}
         </ReactMarkdown>
       </div>
       {tocOpen && (
@@ -431,6 +434,12 @@ export interface CodeViewerProps {
    * itself can't anchor text-selection comments).
    */
   onRequestEditMode?: () => void;
+  /**
+   * 1-based line a chat citation (`path:line`) pointed at. The Monaco surface
+   * reveals it on open instead of parking at the top; the Shiki surfaces
+   * scroll their line row into view.
+   */
+  revealLine?: number | null;
 }
 
 export function CodeViewer({
@@ -452,6 +461,7 @@ export function CodeViewer({
   tocOpen = false,
   onTocToggle,
   onRequestEditMode,
+  revealLine,
 }: CodeViewerProps) {
   const canEdit = useCanEdit(conversationId);
   const activeCommentId = activeSelection?.comment_id;
@@ -539,6 +549,16 @@ export function CodeViewer({
     const lineNum = indexToLine(activeSelection.start_index, rawLines);
     matchLineRefs.current.get(lineNum - 1)?.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [activeSelection]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Land on the cited line for the Shiki (per-line DOM) surfaces. The Monaco
+  // surface handles its own reveal; this covers markdown/HTML source views.
+  // Keyed on content so a late-arriving file body still gets the scroll.
+  useEffect(() => {
+    if (showMonaco || revealLine == null || rawLines.length === 0) return;
+    matchLineRefs.current
+      .get(Math.max(1, Math.min(revealLine, rawLines.length)) - 1)
+      ?.scrollIntoView({ block: "center" });
+  }, [showMonaco, revealLine, rawLines.length]);
 
   useEffect(() => {
     setCurrentMatchIdx(0);
@@ -868,6 +888,7 @@ export function CodeViewer({
           onSaveStatusChange={onSaveStatusChange}
           searchOpen={searchOpen}
           onSearchHandled={handleSearchHandled}
+          revealLine={revealLine}
           comments={comments}
           activeSelection={activeSelection}
           onSetActiveSelection={onSetActiveSelection}
