@@ -335,13 +335,16 @@ class TestBridge:
     def test_cursor_project_key_matches_cursor_workspace_state(self) -> None:
         assert cursor_project_key(Path("/Users/corey.zumar")) == "Users-corey.zumar"
 
+    @pytest.mark.parametrize("custom_dir", [False, True])
     def test_enable_mcp_for_workspace_removes_disabled_entry(
-        self, tmp_path: Path, monkeypatch
+        self, tmp_path: Path, monkeypatch, custom_dir: bool
     ) -> None:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        disabled_path = (
-            tmp_path / ".cursor" / "projects" / "Users-corey.zumar" / "mcp-disabled.json"
-        )
+        monkeypatch.delenv("CURSOR_CONFIG_DIR", raising=False)
+        config = tmp_path / ("isolated-cursor" if custom_dir else ".cursor")
+        if custom_dir:
+            monkeypatch.setenv("CURSOR_CONFIG_DIR", str(config))
+        disabled_path = config / "projects" / "Users-corey.zumar" / "mcp-disabled.json"
         disabled_path.parent.mkdir(parents=True)
         disabled_path.write_text('["omnigent", "other"]\n', encoding="utf-8")
 
@@ -349,11 +352,16 @@ class TestBridge:
 
         assert json.loads(disabled_path.read_text(encoding="utf-8")) == ["other"]
 
+    @pytest.mark.parametrize("custom_dir", [False, True])
     def test_allow_mcp_tools_in_cli_config_adds_specific_allow_rules(
-        self, tmp_path: Path, monkeypatch
+        self, tmp_path: Path, monkeypatch, custom_dir: bool
     ) -> None:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        config_path = tmp_path / ".cursor" / "cli-config.json"
+        monkeypatch.delenv("CURSOR_CONFIG_DIR", raising=False)
+        config = tmp_path / ("isolated-cursor" if custom_dir else ".cursor")
+        if custom_dir:
+            monkeypatch.setenv("CURSOR_CONFIG_DIR", str(config))
+        config_path = config / "cli-config.json"
         config_path.parent.mkdir(parents=True)
         config_path.write_text(
             '{"permissions": {"allow": ["Shell(ls)", "Mcp(omnigent:sys_os_read)"]}}\n',

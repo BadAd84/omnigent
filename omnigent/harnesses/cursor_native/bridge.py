@@ -497,10 +497,15 @@ def cursor_project_key(workspace: Path) -> str:
     return str(workspace).strip("/").replace("/", "-") or "root"
 
 
+def cursor_config_dir() -> Path:
+    """Return the configuration directory shared with the Cursor CLI."""
+    return Path(os.environ.get("CURSOR_CONFIG_DIR") or Path.home() / ".cursor")
+
+
 def enable_mcp_for_workspace(workspace: Path) -> None:
     """Ensure Cursor does not keep the Omnigent MCP disabled for this workspace."""
     disabled_path = (
-        Path.home() / ".cursor" / "projects" / cursor_project_key(workspace) / "mcp-disabled.json"
+        cursor_config_dir() / "projects" / cursor_project_key(workspace) / "mcp-disabled.json"
     )
     try:
         raw = json.loads(disabled_path.read_text(encoding="utf-8"))
@@ -516,7 +521,7 @@ def enable_mcp_for_workspace(workspace: Path) -> None:
 
 def allow_mcp_tools_in_cli_config() -> None:
     """Allow Omnigent MCP tool calls in Cursor's CLI permission config."""
-    path = Path.home() / ".cursor" / "cli-config.json"
+    path = cursor_config_dir() / "cli-config.json"
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError):

@@ -3525,6 +3525,7 @@ def _build_host_daemon_env(
     from omnigent.host.connect import (
         _RUNNER_ENV_ALLOWLIST,
         _RUNNER_ENV_ALLOWLIST_PREFIXES,
+        RUNNER_ENV_PASSTHROUGH_ENV_VAR,
     )
     from omnigent.host.identity import (
         HOST_ID_ENV_VAR,
@@ -3565,6 +3566,11 @@ def _build_host_daemon_env(
             or key in identity_env_vars
             or key.startswith(daemon_env_prefixes)
         }
+    # Explicit runner overrides must survive the CLI→daemon hop too.
+    for name in os.environ.get(RUNNER_ENV_PASSTHROUGH_ENV_VAR, "").split(","):
+        name = name.strip()
+        if name and name in os.environ:
+            env[name] = os.environ[name]
     # The daemon outlives the dispatch that spawned it and is reused by later
     # invocations, so a dispatch-scoped caller trace context must not stick to
     # it — a reused daemon would funnel every later run into the first

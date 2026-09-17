@@ -12,6 +12,7 @@ cursor-agent path is exercised by the e2e gate, not here.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import sqlite3
@@ -289,6 +290,28 @@ class TestReadNewItems:
 
 
 class TestDiscoverStore:
+    @pytest.mark.parametrize("custom_dir", [False, True])
+    def test_discovers_and_preseeds_in_configured_directory(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, custom_dir: bool
+    ) -> None:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.delenv("CURSOR_CONFIG_DIR", raising=False)
+        config = tmp_path / ".cursor"
+        if custom_dir:
+            config = tmp_path / "isolated-cursor"
+            monkeypatch.setenv("CURSOR_CONFIG_DIR", str(config))
+        workspace = str(tmp_path / "workspace")
+        store = self._seed_chat(config / "chats", workspace, _CHAT_ID, 5000)
+        with contextlib.closing(
+            _make_store(store, [("reply", _assistant([{"type": "text", "text": "hello"}]))])
+        ):
+            assert fwd._discover_store(workspace, launch_epoch_ms=4000) == store
+            bridge = tmp_path / "bridge"
+            assert fwd.preseed_resume_state(bridge, workspace, _CHAT_ID, 6000)
+            state = fwd._read_state(bridge)
+            assert state.store_path == str(store)
+            assert state.last_rowid == 1
+
     def _seed_chat(self, root: Path, workspace: str, chat_id: str, created_ms: int) -> Path:
         chat = root / hashlib.md5(workspace.encode()).hexdigest() / chat_id
         chat.mkdir(parents=True)

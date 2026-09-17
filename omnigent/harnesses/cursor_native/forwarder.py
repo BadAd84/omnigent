@@ -49,7 +49,11 @@ from typing import cast
 import httpx
 
 from omnigent.harnesses.cursor_native import status as cursor_native_status
-from omnigent.harnesses.cursor_native.bridge import FORK_HISTORY_CLOSE_TAG, FORK_HISTORY_OPEN_TAG
+from omnigent.harnesses.cursor_native.bridge import (
+    FORK_HISTORY_CLOSE_TAG,
+    FORK_HISTORY_OPEN_TAG,
+    cursor_config_dir,
+)
 from omnigent.inner.native_attachments import ATTACHMENT_MARKER_STRIP_PATTERN
 from omnigent.native._native_post_delivery import post_may_have_been_delivered
 
@@ -354,8 +358,8 @@ def preseed_resume_state(
 
 
 def _cursor_chats_root() -> Path:
-    """Return ``~/.cursor/chats`` for the process's HOME (shared with the TUI)."""
-    return Path.home() / ".cursor" / "chats"
+    """Return the chat directory shared with the Cursor CLI."""
+    return cursor_config_dir() / "chats"
 
 
 def _workspace_hash(workspace: str) -> str:

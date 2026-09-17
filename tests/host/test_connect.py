@@ -2382,41 +2382,38 @@ def test_dispatch_trace_context_reaches_runner_but_not_daemon(
         assert DISPATCH_TRACESTATE_ENV_VAR not in daemon_env
 
 
+@pytest.mark.parametrize("server", [None, "https://server.example.com"])
+@pytest.mark.parametrize(
+    "name", ["DATABRICKS_LINEAR_API_KEY", "CURSOR_LOCAL_AGENT_API_KEY", "CURSOR_CONFIG_DIR"]
+)
 def test_build_runner_env_passthrough_survives_remote_daemon_hop(
     monkeypatch: pytest.MonkeyPatch,
+    server: str | None,
+    name: str,
 ) -> None:
-    """OMNIGENT_RUNNER_ENV_PASSTHROUGH forwards a named var through BOTH hops.
-
-    In ``--server`` mode the env crosses two strips: CLI→daemon
-    (``_build_host_daemon_env``) then daemon→runner (``_build_runner_env``). The
-    control var must survive the first hop or the second never sees the names it
-    lists. A named var travels via the ``DATABRICKS_`` prefix on the first hop and
-    the passthrough on the second, so it must reach the runner; an unnamed secret
-    must not.
-    """
+    """Explicit overrides survive both hops; unnamed secrets stay filtered."""
     from omnigent.cli import _build_host_daemon_env
 
     monkeypatch.setenv("PATH", "/usr/bin")
-    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", "DATABRICKS_LINEAR_API_KEY")
-    monkeypatch.setenv("DATABRICKS_LINEAR_API_KEY", "lin-secret")
+    monkeypatch.setenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", f" {name}, , MISSING_TEST_VAR ")
+    monkeypatch.delenv("MISSING_TEST_VAR", raising=False)
+    monkeypatch.setenv(name, "explicit-value")
     monkeypatch.setenv("DATABRICKS_UNNAMED", "should-not-forward")
 
-    server = "https://example.databricksapps.com"
     daemon_env = _build_host_daemon_env(server_url=server)
-    # The first hop must keep the control var (regression guard for the remote no-op).
-    assert daemon_env["OMNIGENT_RUNNER_ENV_PASSTHROUGH"] == "DATABRICKS_LINEAR_API_KEY"
+    assert daemon_env[name] == "explicit-value"
+    assert "MISSING_TEST_VAR" not in daemon_env
 
     runner_env = _build_runner_env(
         daemon_env,
-        server_url=server,
+        server_url=server or "http://localhost:6767",
         runner_id="runner_abc",
         binding_token="tok",
         workspace="/ws",
         parent_pid=42,
     )
 
-    # The named var reaches the runner; an unnamed one does not.
-    assert runner_env["DATABRICKS_LINEAR_API_KEY"] == "lin-secret"
+    assert runner_env[name] == "explicit-value"
     assert "DATABRICKS_UNNAMED" not in runner_env
 
 
