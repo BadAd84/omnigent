@@ -2109,6 +2109,41 @@ async def test_hello_advertises_frame_capabilities() -> None:
     assert not {kind for kind in advertised if kind.endswith("_result")}
 
 
+def test_advertised_capabilities_match_the_dispatcher() -> None:
+    """``ADVERTISED_FRAME_CAPABILITIES`` tracks ``_dispatch_host_frame`` exactly.
+
+    The list is hand-maintained: a handler added to the dispatcher without
+    updating it is silently un-advertised, so a capability-gating server would
+    409 a frame this daemon actually serves. Derive the dispatcher's handled
+    request kinds from its source and require set equality.
+    """
+    import inspect
+    import re
+
+    from omnigent.host.connect import ADVERTISED_FRAME_CAPABILITIES
+
+    source = inspect.getsource(HostProcess._dispatch_host_frame)
+    handled_classes = {
+        name
+        for name in re.findall(r"\bHost([A-Z]\w+?)Frame\b", source)
+        # Results are sent, not served; the connection error is inbound-only.
+        if not name.endswith("Result") and name != "ConnectionError"
+    }
+
+    def _kind(class_stem: str) -> str:
+        snake = re.sub(r"(?<!^)(?=[A-Z])", "_", class_stem).lower()
+        # HostFsWriteFrame is the one class whose wire kind isn't its name.
+        return "host." + ("fs_write_request" if snake == "fs_write" else snake)
+
+    handled = {_kind(name) for name in handled_classes}
+    advertised = {kind.value for kind in ADVERTISED_FRAME_CAPABILITIES}
+    assert advertised == handled, (
+        f"advertised-but-unserved: {sorted(advertised - handled)}; "
+        f"served-but-unadvertised: {sorted(handled - advertised)} — update "
+        "ADVERTISED_FRAME_CAPABILITIES alongside _dispatch_host_frame"
+    )
+
+
 async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     """
     Verify that _handle_stop terminates a tracked runner and
