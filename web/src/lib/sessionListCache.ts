@@ -340,13 +340,22 @@ export function clearRecentlyCreated(): void {
 }
 
 /**
+ * Drop one row from the keep-alive map — e.g. an optimistic unarchive whose
+ * PATCH failed, so the row must stop being re-injected and fall back to
+ * archived. Safe to call for an id that isn't tracked.
+ */
+export function unmarkRecentlyCreated(id: string): void {
+  recentlyCreatedSessions.delete(id);
+}
+
+/**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
  * refetch (which lags the search index). A new row sorts newest-first, so page 0
  * is its home. Skips: search lists (membership unknown), archived/wrong-project
  * rows, sub-agent children (`parent_session_id` — they live off the sidebar),
- * and ids the caller excludes via `skip` (e.g. an optimistic delete or
- * archive in flight). `candidates` should already exclude rows the list holds.
+ * and ids the caller excludes via `skip` (e.g. an optimistic delete in flight).
+ * `candidates` should already exclude rows the list holds.
  */
 export function insertNewRowsIntoPages(
   data: ConversationsInfiniteData | undefined,
@@ -388,20 +397,18 @@ export function insertNewRowsIntoPages(
   return { data: { ...data, pages: [nextFirst, ...rest] }, inserted: rows };
 }
 
-/**
- * Drop rows with the given ids from one infinite query's cached pages.
- *
- * Page cursors are recomputed from the surviving rows: `last_id` of the
- * final page is the `after=` anchor `fetchNextPage` sends, and a deleted
- * anchor id makes the server's keyset lookup miss (the next page comes
- * back empty). An emptied page gets null cursors — infinite scroll then
- * pauses until the next reconcile refetch rebuilds the pages, which
- * beats paginating from a dead anchor.
- *
- * @param data - The cached infinite data, or `undefined`.
- * @param ids - Conversation ids to remove.
- * @returns The (possibly identical) data and whether anything was removed.
- */
+// Only known legacy row-ID cursors can be repaired after removing their anchor.
+// All other continuation tokens must round-trip unchanged, even on empty pages.
+export function lastIdAfterFiltering(
+  original: ConversationsPage,
+  rows: Conversation[],
+  emptyCursor: string | null = null,
+): string | null {
+  if (!original.data.some((row) => row.id === original.last_id)) return original.last_id;
+  return rows.at(-1)?.id ?? emptyCursor;
+}
+
+/** Drop matching rows while preserving opaque continuation metadata. */
 export function removeIdsFromPages(
   data: ConversationsInfiniteData | undefined,
   ids: Set<string>,
@@ -416,7 +423,7 @@ export function removeIdsFromPages(
       ...page,
       data: nextData,
       first_id: nextData[0]?.id ?? null,
-      last_id: nextData[nextData.length - 1]?.id ?? null,
+      last_id: lastIdAfterFiltering(page, nextData),
     };
   });
   if (!changed) return { data, removed: false };
@@ -519,10 +526,13 @@ export function overlayTitleIntoCaches(
  *
  * Patched in place rather than invalidated, for the same reason rename/delete
  * are: GET /v1/sessions may be served from a search index that lags the PATCH,
- * so an immediate refetch races the reindex and bounces the row back. List
- * fetches and push deltas landing inside that lag window are pinned to
- * `archived: true` by the tombstone the archive mutations set (see
- * `markSessionTombstones` in useConversations).
+ * so an immediate refetch races the reindex and bounces the row back. The
+ * server-confirmed state converges via the WS stream and the reconcile poll.
+ *
+ * ponytail: a reconcile poll firing inside the reindex-lag window (before the
+ * index reflects the archive) can briefly bounce the row back; it self-heals on
+ * the next poll. Add a fetch-time flag override (like `withoutDeletingSessions`)
+ * if metrics show the bounce.
  */
 export function overlayArchivedIntoCaches(
   queryClient: QueryClient,
