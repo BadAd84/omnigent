@@ -46,6 +46,7 @@ from omnigent.errors import (
     ErrorPhase,
     OmnigentError,
     is_cancelled_rpc_error,
+    is_permission_denied_rpc_error,
 )
 from omnigent.extensions import ExtensionPluginState
 from omnigent.extensions.assets import (
@@ -2133,6 +2134,35 @@ def create_app(
                 ),
             )
             return await _handle_omnigent_error(request, cancelled)
+        if is_permission_denied_rpc_error(exc):
+            # A backing service refused the call (e.g. a workspace-hierarchy
+            # 403 surfacing as gRPC PERMISSION_DENIED through a channel
+            # proxy): an access outcome, not a fault. Answer the coded 403
+            # naming the resource instead of an unhandled 500 whose traceback
+            # repeats on every client retry. Matched structurally, like the
+            # cancellation above, because the deployed build vendors grpc.
+            denied = OmnigentError(
+                f"Access to {request.url.path} was denied by a backing "
+                "service. Verify you still have access to the underlying "
+                "workspace resource, or ask a workspace admin to grant it.",
+                code=ErrorCode.UPSTREAM_PERMISSION_DENIED,
+            )
+            _logger.warning(
+                "Upstream call denied by a backing service: %s",
+                exc,
+                exc_info=exc,
+                extra=_error_audit_extra(
+                    request,
+                    phase="denied",
+                    code=str(denied.code),
+                    http_status=str(denied.http_status),
+                    error_category=denied.category.value,
+                    error_impact=denied.impact.value,
+                    error_phase=denied.phase.value,
+                    error_type=type(exc).__name__,
+                ),
+            )
+            return await _handle_omnigent_error(request, denied)
         # UNKNOWN, not SERVER: an uncaught exception has no code that confirms the
         # fault is ours. Booking it as server would inflate our fault rate; the
         # exception type is logged as a signature to rank for promotion to a real
@@ -2162,70 +2192,6 @@ def create_app(
                 },
             },
         )
-
-    try:
-        # Optional dependency: only deployments whose store backends speak
-        # gRPC (e.g. a workspace hierarchy service) can raise RpcError, and
-        # those environments always ship grpcio.
-        import grpc
-    except ImportError:  # pragma: no cover - exercised only without grpcio
-        grpc = None  # type: ignore[assignment]
-
-    if grpc is not None:
-
-        @app.exception_handler(grpc.RpcError)
-        async def _handle_grpc_error(
-            request: Request,
-            exc: Exception,
-        ) -> JSONResponse:
-            """
-            Map a backend gRPC access denial to a handled 403/401.
-
-            A store backend reached over gRPC can answer ``PERMISSION_DENIED``
-            or ``UNAUTHENTICATED``. Those are access outcomes, not server
-            faults: answer a handled 403/401 naming the resource instead of
-            collapsing to an unhandled 500 that logs a full traceback on every
-            client retry. Any other gRPC status keeps the unhandled-500 path.
-
-            :param request: The incoming request; its path names the denied
-                resource in the response message and the audit log.
-            :param exc: The gRPC error raised by the backend call.
-            :returns: A 403/401 JSON response for access denials, otherwise
-                the standard 500 from the catch-all.
-            """
-            code_of = getattr(exc, "code", None)
-            status = code_of() if callable(code_of) else None
-            mapped: tuple[str, int] | None = {
-                grpc.StatusCode.PERMISSION_DENIED: (ErrorCode.FORBIDDEN, 403),
-                grpc.StatusCode.UNAUTHENTICATED: (ErrorCode.UNAUTHORIZED, 401),
-            }.get(status)
-            if mapped is None:
-                return await _handle_unhandled_exception(request, exc)
-            error_code, http_status = mapped
-            details_of = getattr(exc, "details", None)
-            details = details_of() if callable(details_of) else None
-            # Warning without a stack: the denial is the whole story, and the
-            # 500 arm's per-retry tracebacks buried real errors in the log.
-            _logger.warning(
-                "gRPC %s from a backend service on %s: %s",
-                status.name,
-                request.url.path,
-                details,
-                extra=_error_audit_extra(
-                    request,
-                    phase="denied",
-                    code=str(error_code),
-                    http_status=str(http_status),
-                ),
-            )
-            if error_code == ErrorCode.FORBIDDEN:
-                message = f"Access to {request.url.path} was denied by a backing service."
-            else:
-                message = f"A backing service rejected the credentials for {request.url.path}."
-            return JSONResponse(
-                status_code=http_status,
-                content={"error": {"code": error_code, "message": message}},
-            )
 
     def _host_is_online(host_id: str) -> bool:
         """

@@ -15,8 +15,9 @@ caught by any of the server's typed exception handlers
 
 with the traceback in the log and nothing naming the resource or a remedy. In
 the web SPA the sidebar session list renders "Failed to load: 500 Internal
-Server Error". The fix maps this class of gRPC ``PERMISSION_DENIED`` to a
-handled 403 (``ErrorCode.FORBIDDEN``) instead.
+Server Error". The fix maps this class of gRPC ``PERMISSION_DENIED`` — matched
+structurally in the catch-all, so a vendored grpc matches too — to a handled
+403 (``ErrorCode.UPSTREAM_PERMISSION_DENIED``) instead.
 
 The reproduction environment
 ============================
@@ -34,9 +35,9 @@ backend is the stand-in.
 What this asserts
 =================
 The tight fix target is the HTTP contract: ``GET /v1/sessions`` must return a
-handled ``403 forbidden`` rather than the unhandled ``500 internal_error``. This
-test fails today (it observes the 500) and passes once the gRPC
-``PERMISSION_DENIED`` is mapped to a handled 403. The browser drive renders the
+handled ``403 upstream_permission_denied`` rather than the unhandled
+``500 internal_error``. This test fails today (it observes the 500) and passes
+once the gRPC ``PERMISSION_DENIED`` is mapped to a handled 403. The browser drive renders the
 real user-visible failure (the sidebar's "Failed to load" state) so the journey
 can be filmed.
 """
@@ -226,7 +227,7 @@ def test_whs_permission_denied_is_handled_not_500(
     # 2. Pin the fix target on the server contract. Today the gRPC
     #    PERMISSION_DENIED escapes to _handle_unhandled_exception and the
     #    endpoint answers 500 internal_error; once mapped to a handled error it
-    #    must answer 403 forbidden (naming the resource), never a raw 500.
+    #    must answer a coded 403 naming the resource, never a raw 500.
     resp = httpx.get(f"{whs_403_server}/v1/sessions", params={"limit": 30}, timeout=15.0)
     body = resp.json()
     error_code = body.get("error", {}).get("code")
@@ -239,6 +240,6 @@ def test_whs_permission_denied_is_handled_not_500(
         f"expected a handled 403 for a workspace-hierarchy permission denial, "
         f"got {resp.status_code}. Body: {body!r}"
     )
-    assert error_code == "forbidden", (
-        f"expected error code 'forbidden', got {error_code!r}. Body: {body!r}"
+    assert error_code == "upstream_permission_denied", (
+        f"expected error code 'upstream_permission_denied', got {error_code!r}. Body: {body!r}"
     )
