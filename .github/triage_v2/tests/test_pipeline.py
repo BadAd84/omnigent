@@ -8,6 +8,7 @@ import pytest
 
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
+from issue_prioritization.bug_review import BugActionability, BugReview
 from issue_prioritization.classification import Classification
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.domain import Impact, IssueType
@@ -123,6 +124,40 @@ def test_pipeline_reuses_persisted_classification_and_includes_maintainers() -> 
     assert {item.result.score for item in run.ranked} == {Decimal("72.00")}
     assert scores.runs == [run]
     assert artifacts.runs == [run]
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("cached_review", [False, True])
+def test_bug_review_switch_refreshes_incompatible_cached_classifications(enabled, cached_review):
+    issue = _bronze(1)
+    review = BugReview(BugActionability.ACTIONABLE, "Concrete session failure.")
+    cached = Classification(
+        issue_number=1,
+        issue_type=IssueType.BUG,
+        impact=Impact.MEDIUM,
+        area_keys=(),
+        component_labels=(),
+        reasoning="Has mitigation",
+        content_hash=issue.content().content_hash,
+        reported_type=IssueType.BUG,
+        bug_review=review if cached_review else None,
+    )
+    classifier = FakeClassifier(replace(cached, bug_review=review if enabled else None))
+    sink = CaptureSink()
+    pipeline = IssuePrioritizationPipeline(
+        source=FakeSource([issue]),
+        classifier=classifier,
+        classifications=FakeClassifications({1: cached}),
+        scores=sink,
+        artifacts=sink,
+        engine=ScoreEngine(ScoringConfig.default(), AreaCatalog({}, {})),
+        review_bugs=enabled,
+    )
+
+    run = pipeline.run("switch-preview")
+
+    assert classifier.calls == int(enabled != cached_review)
+    assert (run.ranked[0].issue.bug_review is not None) == enabled
 
 
 def test_pipeline_reclassifies_changed_content() -> None:

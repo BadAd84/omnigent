@@ -52,6 +52,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=list(PipelineMode), default=PipelineMode.DRY_RUN)
     parser.add_argument("--regrade", default="false")
+    parser.add_argument("--review-bugs", default="false")
     parser.add_argument(
         "--adopt-legacy-bot-priorities",
         "--adopt_legacy_bot_priorities",
@@ -138,7 +139,9 @@ def main() -> None:
         )
     pipeline = IssuePrioritizationPipeline(
         source=SparkIssueSource(spark, args.source_table, args.github_repo),
-        classifier=serving_endpoint_classifier(args.model_endpoint, areas),
+        classifier=serving_endpoint_classifier(
+            args.model_endpoint, areas, review_bugs=_enabled(args.review_bugs)
+        ),
         classifications=SparkClassificationRepository(spark, args.classifications_table),
         scores=SparkScoreSink(spark, args.scores_table, args.latest_scores_view),
         artifacts=VolumeArtifactSink(args.artifact_dir, config),
@@ -146,6 +149,7 @@ def main() -> None:
         mutation_planner=planner,
         mutation_sink=mutation_sink,
         classification_progress=_print_classification_progress,
+        review_bugs=_enabled(args.review_bugs),
     )
     run = pipeline.run(
         args.run_id,

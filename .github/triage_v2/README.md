@@ -116,6 +116,63 @@ later author comment reopens the issue and, while V2 is enabled, runs it again.
 Reopening remains available during a V2 rollback so closed reports are not
 trapped behind the classifier switch.
 
+## Bug review prototype
+
+The optional bug review checks actionability separately from readability. It
+applies only to issues classified as Bug; Feature and Docs retain their existing
+behavior. Enable it locally with `issue-priority-event --review-bugs` alongside
+the arguments in the no-write example above. Keep `--mode dry_run` to preview
+the proposed labels and comment in `event.json` and `comment.md`.
+
+- **Actionable, already clear:** normal triage, without an additional summary.
+- **Actionable, hard to read:** the existing bot-owned comment gains a concise
+  problem summary and, when supplied by the author, clearer reproduction steps.
+  The original issue is untouched. Reassessment updates the same comment.
+- **Missing evidence or an explicitly speculative failure:** `needs-info` with
+  the specific missing details and the existing seven-day expiry/reopen process.
+  This prototype does not introduce immediate closure. Security and duplicate
+  exemptions and the expiry worker's pinned-issue protection still apply.
+
+The model must connect a trigger or reachable condition to incorrect behavior
+and a concrete consequence. Code analysis and intermittent observations can
+qualify; jargon, suspected AI authorship, and low impact are not rejection
+criteria. For valid reports, poor readability is repaired in the comment rather
+than used to request more information.
+
+Each refined reproduction step carries an exact supporting `source_quote` in
+the artifact; the parser rejects quotes absent from the supplied report. This
+checks provenance, not semantic correctness or reproducibility. The prompt
+forbids invented steps and preserves uncertainty; the comment identifies the
+steps as restated and unverified. When only code analysis is supplied, it can
+summarize the predicted problem without inventing a reproduction recipe.
+
+Run the nine synthetic scenarios against a configured serving endpoint:
+
+```bash
+uv run --frozen --project .github/triage_v2 python .github/triage_v2/evaluate_bug_review.py \
+  --model-endpoint <endpoint> \
+  --profile <profile> \
+  --output-dir /tmp/bug-review-preview
+```
+
+Use a new or empty output directory for each run; existing previews are never
+reused. This command makes model calls but has no GitHub client or write path. Compare
+each case's `input.json` with `comment.md`; `results.json` records the expected
+decision checks. Review summaries for ordinary language, retained uncertainty,
+and reproduction steps faithful to the inputs. The fixtures cover clear and
+verbose valid bugs, unsupported claims, code analysis, intermittent failures,
+Feature/Docs exclusions, and prompt injection. Passing these examples is not a
+measurement of precision across real issues.
+
+Production defaults remain off. The event workflow reads
+`ISSUE_TRIAGE_BUG_REVIEW_ENABLED` (default `false`). The periodic bundle uses the
+`review_bugs` variable/job parameter (default `false`); configure both together
+so periodic assessments do not overwrite event assessments with the old rubric.
+The periodic pipeline refreshes cached bugs when this option changes in either
+direction. It persists the optional review in `bug_review_json`; existing rows
+without it remain readable. No deployment or repository-variable change is
+needed to run a local preview.
+
 ## Databricks dry-run
 
 The bundle defines a paused trigger on updates to `github_issues_bronze`. It

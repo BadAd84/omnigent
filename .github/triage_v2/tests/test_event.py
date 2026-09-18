@@ -137,6 +137,7 @@ def test_event_artifact_contains_classification_and_mutation(tmp_path) -> None:
     assert "<!-- omnigent-issue-prioritization-v2" in payload["comment"]["body"]
     assert '"base_score":60.0' in payload["comment"]["body"]
     assert {path.name for path in tmp_path.iterdir()} == {
+        "comment.md",
         "config.json",
         "event.json",
         "mutations.json",

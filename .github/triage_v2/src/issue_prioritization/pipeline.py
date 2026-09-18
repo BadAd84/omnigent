@@ -13,6 +13,7 @@ from issue_prioritization.classification import (
     Classifier,
     reported_issue_type,
 )
+from issue_prioritization.domain import IssueType
 from issue_prioritization.mutations import MutationPlan, MutationPlanner
 from issue_prioritization.scoring import ScoreEngine
 
@@ -76,6 +77,7 @@ class IssuePrioritizationPipeline:
         mutation_planner: MutationPlanner | None = None,
         mutation_sink: MutationSink | None = None,
         classification_progress: Callable[[int, int], None] | None = None,
+        review_bugs: bool = False,
     ) -> None:
         self.source = source
         self.classifier = classifier
@@ -86,6 +88,7 @@ class IssuePrioritizationPipeline:
         self.mutation_planner = mutation_planner
         self.mutation_sink = mutation_sink
         self.classification_progress = classification_progress
+        self.review_bugs = review_bugs
 
     def run(
         self,
@@ -104,6 +107,10 @@ class IssuePrioritizationPipeline:
             if regrade
             or not (cached := existing.get(issue.number))
             or cached.content_hash != contents[issue.number].content_hash
+            or (
+                cached.issue_type == IssueType.BUG
+                and self.review_bugs != (cached.bug_review is not None)
+            )
         }
         if self.classification_progress:
             self.classification_progress(0, len(refresh))

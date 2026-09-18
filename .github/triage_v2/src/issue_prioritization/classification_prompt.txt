@@ -33,8 +33,8 @@ investigate the claimed failure through any one of:
 - code analysis naming a reachable path and its concrete incorrect impact.
 
 Mark a bug needs_info only when the report lacks enough evidence to investigate.
-For example, a code-quality concern that does not claim incorrect behavior is
-usually a Feature, not an incomplete Bug. A defensive code-path report can be
+$bug_type_guidance
+A defensive code-path report can be
 sufficient when it explains reachability and impact; never reject it merely
 because nobody ran the path end to end. Populate missing_information with every
 concrete category the author needs to add.
@@ -80,6 +80,8 @@ candidates are supplied, return none, null, [], and 0.0 for duplicate fields.
 
 Allowed areas:
 $allowed_areas
+
+$bug_review_rubric
 
 Issue #$issue_number
 Title: $title

@@ -6,9 +6,11 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 
 from issue_prioritization.artifacts import RankedIssue
+from issue_prioritization.bug_review import BugActionability
 from issue_prioritization.domain import (
     EvidenceKind,
     InformationStatus,
+    IssueType,
     MissingInformation,
     Priority,
 )
@@ -26,6 +28,10 @@ _MISSING_INFORMATION_TEXT = {
     ),
     MissingInformation.DIAGNOSTIC_EVIDENCE: (
         "logs, screenshots, or session IDs that show the failure"
+    ),
+    MissingInformation.USER_IMPACT: (
+        "the concrete consequence for users, such as a failed action, incorrect result, "
+        "or reliability, performance, or security problem"
     ),
 }
 _EVIDENCE_TEXT = {
@@ -65,6 +71,7 @@ def build_triage_comment(
             marker,
             "🤖 **Automated triage**",
             "",
+            *_bug_review_lines(item),
             f"- **Bot assessment:** {item.issue.impact.label} impact",
             *priority_lines,
             *information_lines,
@@ -74,6 +81,42 @@ def build_triage_comment(
             "Maintainers can override the priority label.",
         )
     )
+
+
+def _bug_review_lines(item: RankedIssue) -> tuple[str, ...]:
+    issue = item.issue
+    review = issue.bug_review
+    if issue.issue_type != IssueType.BUG or review is None:
+        return ()
+    if review.actionability != BugActionability.ACTIONABLE:
+        return (f"**More evidence needed:** {_plain_text(review.reason)}", "")
+    clarification = review.clarification
+    if clarification is None or issue.information_status != InformationStatus.SUFFICIENT:
+        return ()
+    lines = ["**Problem in plain English**", "", _plain_text(clarification.summary), ""]
+    if clarification.reproduction_steps:
+        lines.extend(
+            (
+                "**Steps to reproduce (restated from the report)**",
+                "",
+                *(
+                    f"{index}. {_plain_text(step.text)}"
+                    for index, step in enumerate(clarification.reproduction_steps, start=1)
+                ),
+                "",
+                "These steps have not been independently verified.",
+                "",
+            )
+        )
+    else:
+        lines.extend(("No reproduction steps have been inferred from the report.", ""))
+    return tuple(lines)
+
+
+def _plain_text(value: str) -> str:
+    text = _SPACE.sub(" ", value).strip()
+    text = text.replace("@", "@\u200b").replace("<", "&lt;").replace(">", "&gt;")
+    return re.sub(r"([\\`*_{}\[\]()#!|])", r"\\\1", text)
 
 
 def preserve_needs_info_deadline(body: str, existing_body: str) -> str:

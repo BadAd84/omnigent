@@ -16,6 +16,8 @@ resources:
           default: ${var.scheduled_mode}
         - name: regrade
           default: "false"
+        - name: review_bugs
+          default: ${var.review_bugs}
         - name: adopt_legacy_bot_priorities
           default: ${var.scheduled_adopt_legacy_bot_priorities}
       tasks:
@@ -26,6 +28,7 @@ resources:
             named_parameters:
               mode: "{{job.parameters.mode}}"
               regrade: "{{job.parameters.regrade}}"
+              review-bugs: "{{job.parameters.review_bugs}}"
               adopt-legacy-bot-priorities: "{{job.parameters.adopt_legacy_bot_priorities}}"
               run-id: "{{job.run_id}}"
               source-table: ${var.catalog}.${var.schema}.${var.source_table}

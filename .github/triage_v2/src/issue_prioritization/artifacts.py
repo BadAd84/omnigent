@@ -87,6 +87,7 @@ def _row(item: RankedIssue) -> dict[str, object]:
         "evidence_kind": issue.evidence_kind.value,
         "information_status": issue.information_status.value,
         "missing_information": [item.value for item in issue.missing_information],
+        "bug_review": issue.bug_review.as_dict() if issue.bug_review else None,
         "score": float(result.score),
         "current_priority": issue.current_priority.value if issue.current_priority else None,
         "proposed_priority": result.priority.value,

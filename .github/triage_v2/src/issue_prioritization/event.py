@@ -171,6 +171,9 @@ def write_event_status(
             "evidence_kind": classification.evidence_kind.value,
             "information_status": classification.information_status.value,
             "missing_information": [item.value for item in classification.missing_information],
+            "bug_review": classification.bug_review.as_dict()
+            if classification.bug_review
+            else None,
         },
         "score": _score_payload(decision),
         "mutation": _mutation_payload(plan),
@@ -190,6 +193,7 @@ def write_event_status(
         "intake": _intake_payload(intake_plan) if intake_plan is not None else None,
     }
     (output_dir / "event.json").write_text(json.dumps(payload, indent=2) + "\n")
+    (output_dir / "comment.md").write_text(payload["comment"]["body"] + "\n")
     (output_dir / "mutations.json").write_text(
         json.dumps([_mutation_payload(plan)], indent=2) + "\n"
     )
@@ -288,6 +292,9 @@ def main() -> None:
     parser.add_argument("--maintainers", type=Path)
     parser.add_argument("--close-duplicates", action="store_true")
     parser.add_argument("--post-duplicate-comments", action="store_true")
+    parser.add_argument(
+        "--review-bugs", action="store_true", help="Enable the bug review prototype"
+    )
     args = parser.parse_args()
     if args.issue_number <= 0:
         raise ValueError("issue_number must be positive")
@@ -322,6 +329,7 @@ def main() -> None:
             args.model_endpoint,
             areas,
             duplicate_candidates=duplicate_candidates,
+            review_bugs=args.review_bugs,
         ),
         config,
         areas,

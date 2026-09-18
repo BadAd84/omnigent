@@ -5,11 +5,13 @@ from decimal import Decimal
 from types import SimpleNamespace
 
 from issue_prioritization.artifacts import RankedIssue
+from issue_prioritization.bug_review import BugActionability, BugClarification, BugReview
 from issue_prioritization.classification import Classification
 from issue_prioritization.databricks_io import (
     SparkBotStateRepository,
     SparkClassificationRepository,
     SparkScoreSink,
+    _classification_from_row,
 )
 from issue_prioritization.domain import (
     Impact,
@@ -91,6 +93,27 @@ def test_classification_schema_handles_empty_arrays() -> None:
     assert spark.schemas[0].count("ARRAY<STRING>") == 3
     assert spark.rows[0][0]["issue_type"] == "Bug"
     assert spark.rows[0][0]["evidence_kind"] == "none"
+
+
+def test_classification_repository_preserves_bug_review():
+    spark = FakeSpark()
+    review = BugReview(
+        BugActionability.ACTIONABLE, "Concrete failure.", BugClarification("The session stalls.")
+    )
+    classification = Classification(
+        issue_number=1,
+        issue_type=IssueType.BUG,
+        impact=Impact.MEDIUM,
+        area_keys=(),
+        component_labels=(),
+        reasoning="Has mitigation",
+        content_hash="hash",
+        bug_review=review,
+    )
+    SparkClassificationRepository(spark, "main.team.classifications").upsert([classification])
+
+    assert "bug_review_json STRING" in spark.schemas[0]
+    assert _classification_from_row(SimpleNamespace(**spark.rows[0][0])).bug_review == review
 
 
 def test_classification_repository_reads_and_updates_legacy_severity_schema() -> None:

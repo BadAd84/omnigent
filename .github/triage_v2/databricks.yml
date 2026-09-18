@@ -36,6 +36,9 @@ variables:
   model_endpoint:
     description: Model Serving endpoint used for impact classification.
     default: ""
+  review_bugs:
+    description: Enable the bug actionability and readability prototype.
+    default: "false"
   github_repo:
     default: omnigent-ai/omnigent
   github_secret_scope:

@@ -9,6 +9,7 @@ from string import Template
 from typing import Protocol
 
 from issue_prioritization.areas import AreaCatalog
+from issue_prioritization.bug_review import BugActionability, BugReview
 from issue_prioritization.domain import (
     EvidenceKind,
     Impact,
@@ -72,6 +73,7 @@ class Classification:
     similar_issues: tuple[int, ...] = ()
     duplicate_confidence: float = 0.0
     duplicate_reasoning: str = ""
+    bug_review: BugReview | None = None
 
 
 class Classifier(Protocol):
@@ -84,13 +86,18 @@ class PromptClassifier:
         query: Callable[[str], str],
         areas: AreaCatalog,
         duplicate_candidates: tuple[dict[str, object], ...] = (),
+        *,
+        review_bugs: bool = False,
     ) -> None:
         self.query = query
         self.areas = areas
         self.duplicate_candidates = duplicate_candidates
+        self.review_bugs = review_bugs
 
     def classify(self, issue: IssueContent) -> Classification:
-        response = self.query(build_prompt(issue, self.areas, self.duplicate_candidates))
+        response = self.query(
+            build_prompt(issue, self.areas, self.duplicate_candidates, review_bugs=self.review_bugs)
+        )
         value = _parse_json_object(response)
         area_keys = tuple(
             key for key in _string_list(value.get("area_keys")) if key in self.areas.by_key
@@ -102,6 +109,15 @@ class PromptClassifier:
         evidence_kind, information_status, missing_information = _information_assessment(
             issue_type, value
         )
+        bug_review = None
+        if self.review_bugs and issue_type == IssueType.BUG:
+            bug_review = BugReview.from_mapping(value.get("bug_review"))
+            actionable = bug_review.actionability == BugActionability.ACTIONABLE
+            if actionable != (information_status == InformationStatus.SUFFICIENT):
+                raise ValueError("bug actionability disagrees with information status")
+            if actionable and missing_information:
+                raise ValueError("an actionable bug cannot require missing information")
+            bug_review.validate_source(issue.body[:12000])
         return Classification(
             issue_number=issue.number,
             issue_type=issue_type,
@@ -120,6 +136,7 @@ class PromptClassifier:
             similar_issues=tuple(_int_list(value.get("similar_issues"))),
             duplicate_confidence=_confidence(value.get("duplicate_confidence")),
             duplicate_reasoning=str(value.get("duplicate_reasoning") or ""),
+            bug_review=bug_review,
         )
 
 
@@ -127,6 +144,8 @@ def build_prompt(
     issue: IssueContent,
     areas: AreaCatalog,
     duplicate_candidates: tuple[dict[str, object], ...] = (),
+    *,
+    review_bugs: bool = False,
 ) -> str:
     area_lines = [
         f"- {area.key}: label={area.issue_label}. {area.definition}"
@@ -139,6 +158,20 @@ def build_prompt(
         labels=", ".join(issue.labels) if issue.labels else "none",
         author=issue.author,
         body=issue.body[:12000],
+        bug_type_guidance=(
+            "An alleged failure remains a Bug even when its trigger or impact is speculative "
+            "or unsupported; use the bug review below to assess it. Reclassify as Feature "
+            "only when the author actually requests a new capability or refactoring, rather "
+            "than merely alleging a possible failure. Missing evidence is not a feature request."
+            if review_bugs
+            else "For example, a code-quality concern that does not claim incorrect behavior "
+            "is usually a Feature, not an incomplete Bug."
+        ),
+        bug_review_rubric=(
+            files("issue_prioritization").joinpath("bug_review_prompt.txt").read_text()
+            if review_bugs
+            else ""
+        ),
         duplicate_candidates=(
             json.dumps(duplicate_candidates, ensure_ascii=False, indent=2)
             if duplicate_candidates
@@ -148,7 +181,7 @@ def build_prompt(
 
 
 def _parse_json_object(value: str) -> Mapping[str, object]:
-    cleaned = value.replace("```json", "").replace("```", "").strip()
+    cleaned = value.strip()
     decoder = json.JSONDecoder()
     for index, character in enumerate(cleaned):
         if character != "{":
