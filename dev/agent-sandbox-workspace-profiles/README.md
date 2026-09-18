@@ -88,9 +88,19 @@ Selection compares the **complete** canonical repository/branch/destination
 set. Repository order does not matter when the derived destinations remain the
 same. Destinations follow the existing workspace rules, including owner-based
 disambiguation for repositories with the same basename. A subset, extra
-repository, different branch, omitted branch, or different destination does not
-match. Such requests use the normal generic launcher behavior. Keep that
-fallback's configured image and pool free of repository seeds.
+repository, different branch, or different destination does not match. Such
+requests use the normal generic launcher behavior. Keep that fallback's
+configured image and pool free of repository seeds.
+
+The UI's **Default** branch selection omits a branch. When the repository set
+could match a profile, the server resolves omitted branches through the session
+owner's GitHub connection, including Vault decryption and token refresh. It
+selects a profile only if every resolved branch matches. Metadata failures or
+missing connections use the generic fallback; branches are never guessed.
+Explicit branches do not need this lookup. GitHub metadata has a 10-second
+shared deadline and 5-second request deadlines; credential resolution inherits
+the existing store/client timeouts. This lookup does not replace authorization
+during activation.
 
 Agent/harness selection is independent of the repository profile; the image
 must still support the requested harness. Profiles use shared pool semantics,
@@ -133,9 +143,11 @@ their existing broker paths.
 
 1. Connect a test user's GitHub account with access to every profile repository.
    Record the Ready spare's Pod UID before requesting a session.
-2. Create a managed session with exactly the catalog's repositories and explicit
-   branches. Confirm its claim uses the profile pool and its allocated Pod UID
-   was recorded before the request.
+2. Create a managed session with exactly the catalog's repositories and matching
+   branches. The UI's **Default** selection works when GitHub's current default
+   matches the profile. Confirm its claim uses the profile pool and its allocated
+   Pod UID was recorded before the request. Seeded sessions report
+   **Preparing workspace**, while generic sessions report **Cloning repository**.
 3. Inspect repository HEADs and create an uncommitted workspace marker. Suspend
    and wake the session; confirm its Sandbox/PVC and marker survive. Wake checks
    repository access again and preserves existing work without resetting it.
@@ -151,7 +163,9 @@ Run automated prototype checks with:
 ```
 
 Retained allocations recover their original profile from UID-verified Sandbox
-metadata. Changing current defaults does not migrate them. Keep historical
+metadata. Wake binds omitted branches to that retained profile without looking
+up current GitHub defaults, so a later default-branch change does not migrate or
+reset existing work. Keep historical
 profile definitions available: a missing definition or incompatible
 manifest/image fails wake without deleting its workspace. Infrastructure
 compatibility checks still apply.
@@ -159,7 +173,7 @@ compatibility checks still apply.
 Distinct catalog versions with the same repository/branch/destination set are
 currently ambiguous for new allocation and are rejected. There is no separate
 active/historical selector. Submodules and Git LFS are rejected. Only GitHub
-repositories and explicit branches are supported, and fresh activation still
+repositories are supported, and fresh activation still
 requires broker and GitHub connectivity. Access is based on the owner's GitHub
 repository permissions; separate team scopes and per-profile infrastructure
 settings are not implemented. This remains an operator-driven

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -34,6 +35,44 @@ def install_factory(
     managed_hosts._kubernetes_launcher_factory = build
 
 
+def install_default_branch_resolution() -> None:
+    """Wire each opted-in app to its own configured credential store and client."""
+    from omnigent.experimental.workspace_profiles.defaults import GitHubDefaultBranchResolver
+    from omnigent.server import app as server_app
+
+    original = server_app.create_app
+
+    def bind_factory(
+        factory: Callable[[], SandboxHostLauncher], resolver: GitHubDefaultBranchResolver
+    ) -> Callable[[], SandboxHostLauncher]:
+        def build() -> SandboxHostLauncher:
+            launcher = factory()
+            if isinstance(launcher, WorkspaceProfileLauncher):
+                launcher.configure_default_branches(resolver)
+            return launcher
+
+        return build
+
+    def build_app(*args: Any, **kwargs: Any) -> Any:
+        resolver = GitHubDefaultBranchResolver()
+        deployment = kwargs.get("sandbox_config")
+        if deployment is not None:
+            kwargs["sandbox_config"] = replace(
+                deployment,
+                configs=tuple(
+                    replace(entry, launcher_factory=bind_factory(entry.launcher_factory, resolver))
+                    if entry.provider == "agent_sandbox"
+                    else entry
+                    for entry in deployment.configs
+                ),
+            )
+        app = original(*args, **kwargs)
+        resolver.configure(app.state.github_store, app.state.github_client)
+        return app
+
+    server_app.create_app = build_app
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--profiles", type=Path, required=True)
@@ -48,6 +87,7 @@ def main() -> None:
     profiles = load_profiles(args.profiles)
     if args.command == "serve":
         install_factory(profiles)
+        install_default_branch_resolution()
         from omnigent.cli import cli
 
         server_args = args.server_args

@@ -4,13 +4,15 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from typing import Any
 
 import click
 
 from omnigent.experimental.workspace_profiles.profiles import (
     WorkspaceProfile,
+    canonical_github_url,
     parse_profiles,
     profile_matches,
     select_profile,
@@ -22,11 +24,36 @@ from omnigent.onboarding.sandboxes.agent_sandbox_warm_pool import (
     AgentSandboxWarmPoolLauncher,
     WarmPoolHandle,
 )
-from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxLaunchRequest
+from omnigent.onboarding.sandboxes.types import (
+    RepoWorkspace,
+    SandboxLaunchRequest,
+    clone_dir_names,
+)
 
 WORKSPACE_PROFILE_ANNOTATION = "omnigent.ai/workspace-profile"
 MANIFEST_SHA_ANNOTATION = "omnigent.ai/workspace-manifest-sha"
 _RUNTIME_MODULE = "omnigent.experimental.workspace_profiles.runtime"
+DefaultBranchResolver = Callable[[str, Sequence[str]], Mapping[str, str]]
+
+
+def _profile_repositories(
+    profile: WorkspaceProfile, repos: Sequence[RepoWorkspace]
+) -> tuple[RepoWorkspace, ...] | None:
+    """Bind omitted branches to a known profile without discovering current defaults."""
+    branches = {(repo.url, repo.directory): repo.branch for repo in profile.manifest.repos}
+    try:
+        bound = tuple(
+            replace(
+                repo,
+                branch=branches[(canonical_github_url(repo.url), directory)]
+                if repo.branch is None
+                else repo.branch,
+            )
+            for repo, directory in zip(repos, clone_dir_names(repos), strict=True)
+        )
+    except (KeyError, ValueError):
+        return None
+    return bound if profile_matches(profile, bound) else None
 
 
 class WorkspaceProfileLauncher(AgentSandboxWarmPoolLauncher):
@@ -37,6 +64,7 @@ class WorkspaceProfileLauncher(AgentSandboxWarmPoolLauncher):
         *,
         profiles: Sequence[WorkspaceProfile],
         profile_name: str | None = None,
+        default_branch_resolver: DefaultBranchResolver | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -46,6 +74,7 @@ class WorkspaceProfileLauncher(AgentSandboxWarmPoolLauncher):
         self._generic_pool = self._warm_pool
         self._request: SandboxLaunchRequest | None = None
         self._selected_profile: WorkspaceProfile | None = None
+        self._default_branch_resolver = default_branch_resolver
         if profile_name is not None:
             self._use_profile(self._configured_profile(profile_name))
 
@@ -80,10 +109,36 @@ class WorkspaceProfileLauncher(AgentSandboxWarmPoolLauncher):
         super().prepare_launch_request(request)
         self._request = request
 
+    def configure_default_branches(self, resolver: DefaultBranchResolver) -> None:
+        """Bind the containing server's owner-aware GitHub integration."""
+        self._default_branch_resolver = resolver
+
+    def _selection_repositories(self, request: SandboxLaunchRequest) -> Sequence[RepoWorkspace]:
+        if self._default_branch_resolver is None or all(
+            repo.branch is not None for repo in request.repos
+        ):
+            return request.repos
+        if not any(_profile_repositories(profile, request.repos) for profile in self._profiles):
+            return request.repos
+        urls = tuple(
+            dict.fromkeys(
+                canonical_github_url(repo.url) for repo in request.repos if repo.branch is None
+            )
+        )
+        defaults = self._default_branch_resolver(request.owner, urls)
+        return tuple(
+            replace(repo, branch=defaults.get(canonical_github_url(repo.url)))
+            if repo.branch is None
+            else repo
+            for repo in request.repos
+        )
+
     def provision(self, name: str) -> str:
         try:
             selected = (
-                select_profile(self._profiles, self._request.repos) if self._request else None
+                select_profile(self._profiles, self._selection_repositories(self._request))
+                if self._request
+                else None
             )
         except ValueError as exc:
             raise click.ClickException(str(exc)) from exc
@@ -94,6 +149,11 @@ class WorkspaceProfileLauncher(AgentSandboxWarmPoolLauncher):
         if self._selected_profile is None:
             return super()._bootstrap_command(mode)
         return ["python3", "-I", "-m", "omnigent.host.warm_bootstrap", mode]
+
+    def _workspace_preparation_stage(self) -> str:
+        if self._selected_profile is not None:
+            return "preparing_workspace"
+        return super()._workspace_preparation_stage()
 
     def template_spec(
         self,
@@ -175,21 +235,23 @@ class WorkspaceProfileLauncher(AgentSandboxWarmPoolLauncher):
         if sandbox_id.startswith("wp1:"):
             try:
                 self._allocation(WarmPoolHandle.parse(sandbox_id))
-                self._require_repositories(repos)
+                repos = self._require_repositories(repos)
             finally:
                 self._close_clients()
         else:
             self._use_profile(None)
         return super().start_host(sandbox_id, repos=repos, **kwargs)
 
-    def _require_repositories(self, repos: Sequence[RepoWorkspace]) -> None:
-        if self._selected_profile is not None and not profile_matches(
-            self._selected_profile, repos
-        ):
+    def _require_repositories(self, repos: Sequence[RepoWorkspace]) -> Sequence[RepoWorkspace]:
+        if self._selected_profile is None:
+            return repos
+        bound = _profile_repositories(self._selected_profile, repos)
+        if bound is None:
             raise click.ClickException(
                 "Requested repositories do not exactly match the retained workspace seed. "
                 "Create a new session for a different repository set."
             )
+        return bound
 
     def _workspace_prep_command(
         self,
@@ -199,12 +261,12 @@ class WorkspaceProfileLauncher(AgentSandboxWarmPoolLauncher):
         host_id: str,
         host_config: dict[str, object] | None = None,
     ) -> list[str]:
+        repos = self._require_repositories(repos)
         command = super()._workspace_prep_command(
             workspace, repos, server_url, host_id, host_config
         )
         if self._selected_profile is None:
             return command
-        self._require_repositories(repos)
         payload = {
             "manifest_sha": self._selected_profile.manifest_sha,
             "prepare_command": command,

@@ -173,6 +173,9 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
     def _bootstrap_command(self, mode: str) -> list[str]:
         return _bootstrap_command(mode)
 
+    def _workspace_preparation_stage(self) -> str:
+        return "cloning"
+
     def _workspace_prep_command(
         self,
         workspace: str,
@@ -707,7 +710,7 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
                         if observed.get("generation") != generation:
                             raise
                     if on_stage and repos:
-                        on_stage("cloning")
+                        on_stage(self._workspace_preparation_stage())
                 elif status.get("generation") != generation:
                     raise click.ClickException(
                         "Warm Sandbox is already activated for another host generation."
