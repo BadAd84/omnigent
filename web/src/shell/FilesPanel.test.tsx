@@ -67,7 +67,7 @@ vi.mock("./WorkspacePicker", async (importOriginal) => ({
 // react-query provider or network in these component tests.
 vi.mock("@tanstack/react-query", async (importOriginal) => ({
   ...(await importOriginal<typeof ReactQueryModule>()),
-  useQueryClient: () => ({ setQueryData: vi.fn() }),
+  useQueryClient: () => ({ invalidateQueries: vi.fn() }),
 }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
   ...(await importOriginal<typeof SessionsApiModule>()),

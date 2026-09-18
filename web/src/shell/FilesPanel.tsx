@@ -380,11 +380,13 @@ export function FilesPanel({
             const target = state.queued;
             state.queued = null;
             try {
-              const updated = await updateSession(cid, { workspace: target });
-              // Refresh the long-lived session snapshot so a later remount
-              // reconciles from the workspace this PATCH just persisted, not
-              // a stale pre-navigation value.
-              queryClient.setQueryData(["session", cid], updated);
+              await updateSession(cid, { workspace: target });
+              // Invalidate rather than write the PATCH response into the
+              // cache: this key's GET carries liveness/permission enrichment
+              // the PATCH projection lacks, and overwriting it degrades the
+              // shell's session-derived gates. The refetch reconciles a later
+              // remount from the workspace this PATCH just persisted.
+              void queryClient.invalidateQueries({ queryKey: ["session", cid] });
               workdirSyncErrorCache.delete(cid);
             } catch (err) {
               // The header names the browsed folder the working folder, so a
