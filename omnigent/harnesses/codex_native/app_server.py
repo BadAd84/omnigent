@@ -69,6 +69,7 @@ from omnigent.inner.databricks_executor import (
 )
 from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug, codex_spawn_model
 from omnigent.process_logging import log_info_once, log_once, redact_log_text
+from omnigent.util.reasoning_effort import CODEX_NATIVE_EFFORTS
 
 _logger = logging.getLogger(__name__)
 
@@ -469,24 +470,70 @@ def _sync_codex_developer_instructions(
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
 
 
-def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
-    """Return Codex's replacement for *model*, when the catalog declares one."""
-    if not isinstance(catalog, dict):
-        return None
-    models = catalog.get("models")
+def _codex_model_catalog_entry(catalog: object, model: str) -> dict[str, object] | None:
+    """Return the catalog entry naming *model*, across both Codex schemas."""
+    if isinstance(catalog, dict):
+        models = catalog.get("models")
+    else:
+        models = catalog
     if not isinstance(models, list):
         return None
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+    model_key = comparable_model_id(model)
     for entry in models:
-        if not isinstance(entry, dict) or entry.get("slug") != model:
+        if not isinstance(entry, dict):
             continue
-        upgrade = entry.get("upgrade")
-        if not isinstance(upgrade, dict):
-            return None
-        target = upgrade.get("model") or upgrade.get("id")
-        if isinstance(target, str) and target and target != model:
-            return target
-        return None
+        names = (entry.get("slug"), entry.get("id"), entry.get("model"))
+        if not any(
+            isinstance(name, str) and comparable_model_id(name) == model_key for name in names
+        ):
+            continue
+        return entry
     return None
+
+
+def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
+    """Return Codex's replacement for *model*, when the catalog declares one."""
+    entry = _codex_model_catalog_entry(catalog, model)
+    if entry is None:
+        return None
+    upgrade_info = entry.get("upgradeInfo")
+    if isinstance(upgrade_info, dict):
+        target = upgrade_info.get("model") or upgrade_info.get("id")
+    else:
+        upgrade = entry.get("upgrade")
+        if isinstance(upgrade, dict):
+            target = upgrade.get("model") or upgrade.get("id")
+        else:
+            target = upgrade
+    if not isinstance(target, str):
+        return None
+    from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+    if target and comparable_model_id(target) != comparable_model_id(model):
+        return target
+    return None
+
+
+def _codex_model_upgrade_metadata_is_malformed(entry: dict[str, object]) -> bool:
+    """Return whether declared migration metadata lacks a usable target."""
+    upgrade_info = entry.get("upgradeInfo")
+    if upgrade_info is not None:
+        if not isinstance(upgrade_info, dict):
+            return True
+        target = upgrade_info.get("model") or upgrade_info.get("id")
+        return not isinstance(target, str) or not target
+
+    upgrade = entry.get("upgrade")
+    if upgrade is None:
+        return False
+    if isinstance(upgrade, str):
+        return not upgrade
+    if isinstance(upgrade, dict):
+        target = upgrade.get("model") or upgrade.get("id")
+        return not isinstance(target, str) or not target
+    return True
 
 
 def _acknowledge_codex_model_migration(codex_home: Path, model: str, target: str) -> None:
@@ -723,7 +770,9 @@ class CodexAppServerClient:
         response = await future
         error = response.get("error")
         if error:
-            raise CodexAppServerResponseError(error)
+            exc = CodexAppServerResponseError(error)
+            exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
+            raise exc
         return response
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
@@ -810,6 +859,13 @@ class CodexAppServerClient:
             await self._events.put(message)
 
 
+def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -> bool:
+    """Recognize both JSON-RPC and serde errors from older parameter schemas."""
+    return exc.code == -32602 or (
+        exc.code == -32600 and f"unknown field `{field}`" in (exc.message or "")
+    )
+
+
 async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonObject]:
     """Read every visible model from an initialized Codex app-server client.
 
@@ -819,11 +875,21 @@ async def list_codex_model_options(client: CodexAppServerClient) -> list[_JsonOb
     """
     options: list[_JsonObject] = []
     cursor: str | None = None
+    include_hidden_supported = True
     while True:
-        params: CodexParams = {"includeHidden": False}
+        params: CodexParams = {"includeHidden": False} if include_hidden_supported else {}
         if cursor is not None:
             params["cursor"] = cursor
-        response = await client.request("model/list", params)
+        try:
+            response = await client.request("model/list", params)
+        except CodexAppServerResponseError as exc:
+            if not include_hidden_supported or not _codex_rejects_request_field(
+                exc, "includeHidden"
+            ):
+                raise
+            # Older servers list visible models by default but reject this field.
+            include_hidden_supported = False
+            continue
         result = response.get("result")
         if not isinstance(result, dict):
             raise ValueError("Codex model/list result must be an object")
@@ -1010,6 +1076,43 @@ async def _wait_for_discovery_listener(
     raise TimeoutError("Timed out waiting for Codex model discovery app-server")
 
 
+def _codex_config_identity(source_home: Path) -> tuple[object, ...]:
+    """Invalidate cached CLI answers when configuration or its catalog changes."""
+    from omnigent.models.model_catalog_store import binary_identity
+
+    picker_config = _codex_picker_config(source_home)
+    return (
+        str(source_home.resolve()),
+        binary_identity(str(source_home / "config.toml")),
+        binary_identity(picker_config.get("model_catalog_json")),
+        binary_identity(str(source_home / "auth.json")),
+    )
+
+
+def _codex_picker_config(source_home: Path) -> dict[str, str]:
+    """Read the CLI settings needed to reproduce its model picker.
+
+    ``profile`` rides along because the minimal bridge copies profile
+    definitions without the active selector, and an active profile's
+    ``model`` decides the CLI's effective default.
+    """
+    try:
+        config = tomlkit.parse((source_home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    picker = {
+        key: str(value)
+        for key in ("model", "model_catalog_json", "profile")
+        if isinstance(value := config.get(key), str) and value
+    }
+    if catalog := picker.get("model_catalog_json"):
+        path = Path(catalog).expanduser()
+        picker["model_catalog_json"] = str(
+            path if path.is_absolute() else (source_home / path).resolve()
+        )
+    return picker
+
+
 def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     """
     Persistent probe ``CODEX_HOME`` for one provider configuration.
@@ -1030,14 +1133,36 @@ def _probe_codex_home(config_overrides: Sequence[str]) -> Path:
     :param config_overrides: The probe's ``-c`` overrides.
     :returns: The created ``CODEX_HOME`` directory.
     """
-    key = hashlib.sha256("\n".join(config_overrides).encode("utf-8")).hexdigest()[:12]
+    # The source home joins the key so switching accounts (a different
+    # ``CODEX_HOME``) never reuses another source's bridged ``auth.json``
+    # symlink or account-specific cached state under identical overrides.
+    source_home = _codex_home_config_source_from_env()
+    key = hashlib.sha256(
+        "\n".join((str(source_home.resolve()), *config_overrides)).encode("utf-8")
+    ).hexdigest()[:12]
     home = Path.home() / ".omnigent" / "cache" / "codex-model-probe" / key
     home.mkdir(mode=0o700, parents=True, exist_ok=True)
     # The bridge skips files that already exist, and config.toml is copied
     # (not symlinked), so drop the copy to re-read an edited source config.
     with contextlib.suppress(OSError):
         (home / "config.toml").unlink(missing_ok=True)
-    _populate_codex_home_config(home, _codex_home_config_source_from_env(), minimal_config=True)
+    # The probe drives the same native codex binary as a session launch, so
+    # keep the full native effort ladder instead of clamping max/ultra.
+    _populate_codex_home_config(
+        home,
+        source_home,
+        minimal_config=True,
+        supported_efforts=CODEX_NATIVE_EFFORTS,
+    )
+    # A custom catalog replaces Codex's built-in choices, including visibility.
+    picker_config = _codex_picker_config(source_home)
+    if picker_config:
+        config_path = home / "config.toml"
+        document = (
+            tomlkit.parse(config_path.read_text()) if config_path.exists() else tomlkit.document()
+        )
+        document.update(picker_config)
+        config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
     return home
 
 
@@ -1045,8 +1170,12 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
     """
     Reduce ``model/list`` rows to exactly one ``isDefault`` marker.
 
-    The launch-pinned model wins when a row names it (either spelling);
-    otherwise Codex's own first default stands. Rows are otherwise verbatim.
+    The launch-pinned model wins when a row names it (either spelling).
+    A pinned model no visible row names (a hidden configured default is
+    explicitly supported) marks NO default: crowning a different visible
+    model would let the launch path pin a model the configuration never
+    selected. Only an unpinned launch keeps Codex's own first default.
+    Rows are otherwise verbatim.
 
     Codex's own ``isDefault`` is its built-in preference, which says nothing
     about the model this session launched on, so a picker that trusted it
@@ -1072,7 +1201,12 @@ def mark_launch_default(rows: list[_JsonObject], pinned_model: str | None) -> li
                 if isinstance(spelling, str) and comparable_model_id(spelling) == pinned_key:
                     pinned_index = index
                     break
-    default_index = pinned_index if pinned_index is not None else codex_default_index
+    if pinned_key is not None:
+        # The effective model is authoritative even when hidden from the
+        # visible rows; never substitute a model the config did not select.
+        default_index = pinned_index
+    else:
+        default_index = codex_default_index
     if default_index is not None:
         marked[default_index]["isDefault"] = True
     return marked
@@ -1084,17 +1218,10 @@ async def probe_codex_model_options(
     """
     Ask a session-configured Codex app-server for its own model list.
 
-    The harness is the source of truth for what a session's ``/model``
-    picker would offer, so the probe boots ``codex app-server`` with the
-    SAME materialization a session launch gets — for every launch shape.
-    A Databricks profile contributes its provider overrides (gateway base
-    URL + minted auth + model pin) and ``DATABRICKS_HOST``; other provider
-    shapes carry their resolved ``-c`` overrides verbatim; the plain
-    Codex-login shape probes bare, which yields the ACCOUNT's visible
-    catalog: the probe home is isolated (never the user's real
-    ``~/.codex``) but links the real ``auth.json`` in the way a session
-    launch does, so login-gated entries and the account default match what
-    a live session will offer.
+    The persistent probe home bridges credentials, provider settings and
+    the configured catalog/default. Codex's model/list determines visible
+    choices; config/read resolves the effective default under the session's
+    provider overrides. No thread is started.
 
     :param codex_path: Optional Codex executable override.
     :param launch: An already-resolved ``model=None`` launch shape. When
@@ -1143,12 +1270,36 @@ async def probe_codex_model_options(
         )
         await client.connect()
         rows = await list_codex_model_options(client)
+        if pinned_model is None:
+            pinned_model = await _read_codex_probe_default(client)
     finally:
         if client is not None:
             with contextlib.suppress(Exception):
                 await client.close()
         await _stop_codex_model_discovery_process(discovery)
     return mark_launch_default(rows, pinned_model)
+
+
+async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
+    """Read Codex's effective default; older servers retain their model/list default."""
+    try:
+        try:
+            response = await client.request("config/read", {"includeLayers": False})
+        except CodexAppServerResponseError as exc:
+            if not _codex_rejects_request_field(exc, "includeLayers"):
+                raise
+            response = await client.request("config/read", {})
+    except CodexAppServerResponseError as exc:
+        if exc.code not in {-32601, -32602} and not (
+            exc.code == -32600 and "unknown variant `config/read`" in (exc.message or "")
+        ):
+            raise
+        _logger.info("Codex config/read unavailable; keeping the model/list default")
+        return None
+    result = response.get("result")
+    config = result.get("config") if isinstance(result, dict) else None
+    model = config.get("model") if isinstance(config, dict) else None
+    return model if isinstance(model, str) and model else None
 
 
 def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | None = None) -> str:
@@ -1175,11 +1326,26 @@ def codex_catalog_fingerprint(launch: NativeCodexLaunch, *, codex_path: str | No
     profile_host = _read_databrickscfg_host(launch.profile) if launch.profile is not None else None
     return fingerprint_of(
         "codex-native",
+        "isolated-picker-v3",
+        _codex_config_identity(_codex_home_config_source_from_env()),
         (launch.profile, (profile_host or "").rstrip("/")) if launch.profile is not None else None,
         launch.model,
         tuple(launch.config_overrides),
         binary_identity(codex_path or _find_codex_cli()),
     )
+
+
+def fresh_codex_launch_catalog(
+    *, codex_path: str | None = None, launch: NativeCodexLaunch
+) -> list[_JsonObject] | None:
+    """Return a fresh persisted catalog for one launch shape, without probing."""
+    from omnigent.models import model_catalog_store
+
+    fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
+    rows = model_catalog_store.read_catalog("codex-native", fingerprint)
+    if rows is None or model_catalog_store.catalog_is_stale("codex-native", fingerprint):
+        return None
+    return rows
 
 
 async def _codex_launch_catalog(
@@ -1196,9 +1362,9 @@ async def _codex_launch_catalog(
         return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
 
-    async def _probe() -> list[_JsonObject] | None:
+    async def _probe(*, allow_empty: bool) -> list[_JsonObject] | None:
         try:
-            return await asyncio.wait_for(
+            rows = await asyncio.wait_for(
                 probe_codex_model_options(codex_path=codex_path, launch=launch),
                 timeout=_MODEL_CATALOG_PROBE_TIMEOUT_SECONDS,
             )
@@ -1207,9 +1373,23 @@ async def _codex_launch_catalog(
             # persistently failing probe doesn't flood the logs.
             log_once(_logger, logging.WARNING, "codex catalog probe failed", exc_info=True)
             return None
+        if rows or allow_empty:
+            return rows
+        # The probe answered empty while the store already holds a useful
+        # answer. A hidden-only custom catalog is a real (empty, cacheable)
+        # answer on cold discovery, but an empty refresh must not erase a
+        # previously useful stored answer — the runner treats it as a failed
+        # re-probe and keeps serving the stored rows.
+        return None
 
+    # Empty answers are cacheable when they confirm what is known: cold
+    # discovery (no entry) and a refresh of an already-empty entry persist
+    # [], advancing the timestamp so stale reads stop re-probing. Only a
+    # refresh of a previously useful NONEMPTY answer treats empty as a
+    # failed re-probe, leaving the stored rows serving.
+    allow_empty = not model_catalog_store.read_catalog("codex-native", fingerprint)
     read = model_catalog_store.reprobe_catalog if reprobe else model_catalog_store.ensure_catalog
-    return await read("codex-native", fingerprint, _probe)
+    return await read("codex-native", fingerprint, lambda: _probe(allow_empty=allow_empty))
 
 
 async def codex_launch_catalog(
@@ -1220,7 +1400,8 @@ async def codex_launch_catalog(
 
     Reads the on-disk catalog for the ``model=None`` launch shape; a miss
     pays one session-shaped probe (real auth linked in) and persists the
-    answer for every later consumer.
+    answer — including a hidden-only catalog's honest empty answer — for
+    every later consumer.
 
     :param codex_path: Optional Codex executable override.
     :param launch: An already-resolved ``model=None`` launch shape. When
@@ -1328,6 +1509,9 @@ class CodexNativeAppServer:
     :param pinned_effort: Session-persisted reasoning effort written as
         ``model_reasoning_effort`` into the per-session ``config.toml`` at
         start, or ``None`` to keep the copied config's value.
+    :param model_catalog_rows: Fresh rows from the shared, launch-shaped
+        ``model/list`` catalog. When present, startup derives migration
+        acknowledgements locally instead of spawning ``codex debug models``.
     :param trust_project: Whether to trust :attr:`cwd` in the private
         session config before startup. Runner-owned headless sessions set
         this because nobody can answer Codex's project-trust TUI prompt.
@@ -1345,6 +1529,9 @@ class CodexNativeAppServer:
         surfaces it to Omnigent (which posts a single durable banner). Prevents
         re-posting the same notice on every subsequent ensure. Not a
         constructor input.
+    :param reconcile_process_registry: Whether startup synchronously performs
+        host-global crash registry maintenance. Runner-owned launches delegate
+        it to the host janitor; standalone callers keep the safe default.
     """
 
     codex_path: str
@@ -1366,12 +1553,14 @@ class CodexNativeAppServer:
     policy_notice_pending: bool = False
     pinned_model: str | None = None
     pinned_effort: str | None = None
+    model_catalog_rows: list[_JsonObject] | None = None
     process_registry_tag: str | None = None
     process_owner_lock: CodexNativeProcessOwnerLock | None = None
     codex_cli_version: tuple[int, int, int] | None = None
     trust_project: bool = False
     trust_all_hooks: bool = False
     router_hooks_registered: bool = False
+    reconcile_process_registry: bool = True
 
     async def start(self) -> None:
         """
@@ -1419,12 +1608,18 @@ class CodexNativeAppServer:
         config_source = _codex_home_config_source_from_env()
         model_migration_target: str | None = None
         if self.trust_project and self.pinned_model:
-            catalog = await asyncio.to_thread(
-                read_codex_model_catalog,
-                self.codex_path,
-                config_source,
-                timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
-            )
+            catalog: object = self.model_catalog_rows
+            catalog_entry = _codex_model_catalog_entry(catalog, self.pinned_model)
+            # ``model/list`` excludes hidden rows. A selected legacy model may
+            # therefore be absent even from a fresh snapshot. A present row
+            # with malformed migration metadata is also unsafe to trust.
+            if catalog_entry is None or _codex_model_upgrade_metadata_is_malformed(catalog_entry):
+                catalog = await asyncio.to_thread(
+                    read_codex_model_catalog,
+                    self.codex_path,
+                    config_source,
+                    timeout=_MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS,
+                )
             model_migration_target = _codex_model_upgrade_target(catalog, self.pinned_model)
         # Off the loop: this copies/symlinks a home AND (on a Smart Routing
         # session) shells out to ``codex debug models`` with a 10s timeout. Run
@@ -1436,6 +1631,7 @@ class CodexNativeAppServer:
             config_source,
             inject_hooks=self.router_hooks_registered,
             extend_model_catalog=codex_extended_catalog_requested(self.env),
+            supported_efforts=CODEX_NATIVE_EFFORTS,
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
@@ -1498,7 +1694,8 @@ class CodexNativeAppServer:
                     ap_server_url=self.ap_server_url,
                     ap_auth_headers=self.ap_auth_headers or {},
                 )
-        reconcile_codex_native_process_registry()
+        if self.reconcile_process_registry:
+            reconcile_codex_native_process_registry()
         resolved_listen = self.listen_url or f"unix://{self.socket_path}"
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
         tagged_argv0 = (
@@ -1554,27 +1751,33 @@ class CodexNativeAppServer:
         # blocking session creation (fail-open). ``BaseException`` on the
         # outer guard so a cancellation mid-trust still tears down.
         try:
-            await self._wait_until_ready()
-            if self.policy_hook_disabled_reason is None:
+            startup_client = await self._wait_until_ready()
+            try:
+                if self.policy_hook_disabled_reason is None:
+                    try:
+                        await self._trust_policy_hooks(client=startup_client)
+                    except Exception as exc:  # noqa: BLE001 - degrade, never block startup
+                        self._disable_policy_hook(f"Codex policy hook could not be trusted: {exc}")
+            finally:
                 try:
-                    await self._trust_policy_hooks()
-                except Exception as exc:  # noqa: BLE001 - degrade, never block startup
-                    self._disable_policy_hook(f"Codex policy hook could not be trusted: {exc}")
+                    await startup_client.close()
+                except Exception:  # noqa: BLE001 - a dead control socket cannot undo trust
+                    _logger.warning("Could not close Codex startup client", exc_info=True)
         except BaseException:
             await self.close()
             raise
 
-    async def _trust_policy_hooks(self) -> None:
+    async def _trust_policy_hooks(self, *, client: CodexAppServerClient | None = None) -> None:
         """
         Mark the registered Omnigent policy hook as trusted.
 
         A freshly-written non-managed hook is ``untrusted`` and codex
         silently skips untrusted hooks — for a policy gate that is a
-        fail-open. This connects a transient app-server client and runs
-        the same ``hooks/list`` → ``config/batchWrite`` trust flow codex's
-        own TUI uses, then verifies the hook is trusted. ``--listen`` may
-        be a unix socket (local CLI) or a loopback websocket (host
-        runner); both transports are handled.
+        fail-open. It reuses the initialized startup client when supplied;
+        direct callers get a transient client. The same ``hooks/list`` →
+        ``config/batchWrite`` trust flow codex's own TUI uses then verifies
+        the hook is trusted. ``--listen`` may be a unix socket (local CLI) or
+        a loopback websocket (host runner); both transports are handled.
 
         :returns: None.
         :raises RuntimeError: If the policy hook is missing from the
@@ -1583,18 +1786,21 @@ class CodexNativeAppServer:
             The message is augmented with codex's captured configuration
             error (see :meth:`_codex_config_error_hint`) when present.
         """
-        if self.listen_url and self.listen_url.startswith("ws://"):
-            client = CodexAppServerClient(
-                ws_url=self.listen_url,
-                client_name="omnigent-policy-trust",
-            )
-        else:
-            client = CodexAppServerClient(
-                self.socket_path,
-                client_name="omnigent-policy-trust",
-            )
-        await client.connect()
+        owns_client = client is None
+        if client is None:
+            if self.listen_url and self.listen_url.startswith("ws://"):
+                client = CodexAppServerClient(
+                    ws_url=self.listen_url,
+                    client_name="omnigent-policy-trust",
+                )
+            else:
+                client = CodexAppServerClient(
+                    self.socket_path,
+                    client_name="omnigent-policy-trust",
+                )
         try:
+            if owns_client:
+                await client.connect()
             await trust_native_policy_hooks(client, cwd=str(self.cwd))
             # Routing hooks live in the same generated file but under a
             # different module, so they need their own trust pass. Best
@@ -1636,7 +1842,8 @@ class CodexNativeAppServer:
         except RuntimeError as exc:
             raise RuntimeError(f"{exc}{self._codex_config_error_hint()}") from exc
         finally:
-            await client.close()
+            if owns_client:
+                await client.close()
 
     def _codex_config_error_hint(self) -> str:
         """
@@ -1728,12 +1935,12 @@ class CodexNativeAppServer:
         self.process_registry_tag = None
         self.process_owner_lock = None
 
-    async def _wait_until_ready(self) -> None:
+    async def _wait_until_ready(self) -> CodexAppServerClient:
         """
         Wait until the app-server socket accepts an initialized
-        client.
+        client, and return that connection for startup RPCs.
 
-        :returns: None.
+        :returns: Connected app-server client. The caller owns it.
         :raises RuntimeError: If the app-server exits or never
             becomes ready before the timeout.
         """
@@ -1743,6 +1950,7 @@ class CodexNativeAppServer:
             if self.proc is not None and self.proc.returncode is not None:
                 detail = " | ".join((self.recent_stderr or [])[-5:])
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
+            client: CodexAppServerClient | None = None
             try:
                 if self.listen_url and self.listen_url.startswith("ws://"):
                     client = CodexAppServerClient(
@@ -1755,10 +1963,17 @@ class CodexNativeAppServer:
                         client_name="omnigent-probe",
                     )
                 await client.connect()
-                await client.close()
-                return
+                return client
+            except asyncio.CancelledError:
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.close()
+                raise
             except Exception as exc:  # noqa: BLE001 - readiness retry boundary
                 last_error = exc
+                if client is not None:
+                    with contextlib.suppress(Exception):
+                        await client.close()
                 await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
         detail = " | ".join((self.recent_stderr or [])[-5:])
         raise RuntimeError(
@@ -2477,6 +2692,8 @@ def build_codex_native_server(
     trust_project: bool = False,
     trust_all_hooks: bool = False,
     reasoning_effort: str | None = None,
+    model_catalog_rows: list[_JsonObject] | None = None,
+    reconcile_process_registry: bool = True,
 ) -> CodexNativeAppServer:
     """
     Build a configured native Codex app-server process wrapper.
@@ -2525,6 +2742,12 @@ def build_codex_native_server(
         the private ``config.toml`` at start (see
         :func:`_pin_codex_config_effort`), e.g. ``"ultra"``. ``None`` keeps
         the copied config's value.
+    :param model_catalog_rows: Fresh rows from the shared launch-shaped
+        ``model/list`` catalog, used to avoid a redundant migration probe.
+    :param reconcile_process_registry: Whether startup performs the global
+        crash registry sweep. Runner-owned launches disable this because the
+        host janitor owns it; standalone callers keep the
+        synchronous safety default.
     :returns: Configured app-server process wrapper.
     :raises ImportError: If no Codex CLI is available.
     :raises OSError: If Databricks routing was requested but no
@@ -2589,8 +2812,10 @@ def build_codex_native_server(
         python_executable=python_executable,
         pinned_model=pinned_model,
         pinned_effort=reasoning_effort,
+        model_catalog_rows=model_catalog_rows,
         trust_project=trust_project,
         trust_all_hooks=trust_all_hooks,
+        reconcile_process_registry=reconcile_process_registry,
     )
 
 
@@ -3033,10 +3258,8 @@ def resolve_native_codex_launch(
        legacy ``executor.profile`` / ``executor.config.profile`` — resolved
        through :func:`~omnigent.runtime.workflow._resolve_provider_for_build`
        itself, the same resolver the in-process harness uses, so a spec that
-       routes in-process routes natively too (a spec ``ApiKeyAuth`` resolves
-       to ``None`` for every harness — the resolver leaves bare keys to the
-       claude-sdk / openai-agents builders — so codex-native falls through
-       exactly as in-process codex does);
+       routes in-process routes natively too. A spec ``ApiKeyAuth`` routes
+       through a synthesized key provider with its declared endpoint;
 
     1. an explicit per-family default provider →
        - ``key`` / ``gateway`` / ``local`` → provider ``-c`` overrides
@@ -3047,7 +3270,8 @@ def resolve_native_codex_launch(
          ``auth.json``) fall through to the first other configured provider
          that can route, so a real credential is not shadowed by a dead
          subscription default;
-    2. else a global Databricks ``auth:`` block → ucode;
+    2. else a global ``auth:`` block → ucode for Databricks, or provider
+       overrides for an inline API key;
     3. else an ambient-detected provider (first run without configure);
     4. else the codex CLI's own login.
 
@@ -3073,7 +3297,11 @@ def resolve_native_codex_launch(
         default_provider_for_harness,
         load_config,
     )
-    from omnigent.runtime.workflow import _load_global_auth, _resolve_provider_for_build
+    from omnigent.runtime.workflow import (
+        _load_global_auth,
+        _resolve_provider_for_build,
+        _synthesize_codex_api_key_provider,
+    )
     from omnigent.spec.types import DatabricksAuth
 
     explicit = load_config()
@@ -3093,17 +3321,8 @@ def resolve_native_codex_launch(
         or spec.executor.profile
         or spec.executor.config.get("profile")
     ):
-        # Spec-level credential (issue #2744): resolve it through the same
-        # resolver the in-process codex harness uses, so switching a working
-        # spec from ``harness: codex`` to ``codex-native`` keeps its auth
-        # working. A named provider that is undeclared raises loud here
-        # instead of parking the TUI on the sign-in screen for a 30s timeout.
-        # A spec ``ApiKeyAuth`` resolves to ``None`` for every harness (the
-        # shared resolver leaves bare keys to the claude-sdk / openai-agents
-        # builders; the in-process codex builder has no ApiKeyAuth branch
-        # either), so codex-native falls through to the machine-level chain
-        # below exactly as in-process codex does — as does a spec credential
-        # that cannot route openai.
+        # Share credential resolution with the in-process harness so spec
+        # auth, including inline keys, takes precedence over machine defaults.
         spec_entry = _resolve_provider_for_build(spec, harness_type="codex", for_launch=True)
         if spec_entry is not None:
             if spec_entry.kind == SUBSCRIPTION_KIND:
@@ -3162,14 +3381,9 @@ def resolve_native_codex_launch(
                 summary=f"Databricks ucode profile {global_auth.profile!r} (global auth block)",
             )
         if global_auth is not None:
-            return NativeCodexLaunch(
-                config_overrides=[],
-                model=model,
-                profile=None,
-                summary="Codex CLI login (global auth block, non-Databricks; no provider routing)",
-                login_required=not _codex_login_usable(),
-            )
-        entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
+            entry = _synthesize_codex_api_key_provider(global_auth)
+        else:
+            entry = default_provider_for_harness(effective_config_with_detected(explicit), "codex")
 
     if (
         entry is None
@@ -3200,14 +3414,9 @@ def resolve_native_codex_launch(
     from omnigent.host.databricks_credential import api_key_auth_precludes_broker
 
     if entry is None and not api_key_auth_precludes_broker(spec):
-        # Managed connect host: no spec/global/ambient provider, but the owner
-        # linked Databricks via the connect flow (host-only [omnigent] profile +
-        # broker sidecar). Route Codex through the workspace gateway, minting the
-        # bearer via the broker — the Codex counterpart to
-        # _connect_broker_claude_config. ucode configure (host boot) populated
-        # ucode state, so the model resolves to a served id. An explicit spec
-        # ApiKeyAuth resolves to None above too, but Codex threads that key
-        # itself, so it must not be rerouted through the owner's gateway.
+        # Use the managed host's Databricks broker only when no provider or
+        # explicit API-key auth selected a route. Host boot populated ucode
+        # state so the model resolves to a served id.
         from omnigent.host.databricks_credential import (
             HOST_DATABRICKS_PROFILE,
             broker_token_command,
@@ -3538,13 +3747,16 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
     """
     Build terminal env overrides for the native Codex TUI.
 
+    The terminal and app-server share resource attributes for telemetry attribution.
+
     :param app_server: Running app-server wrapper.
     :returns: Environment variables for the terminal process.
     """
     return {
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
-        if key in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN"}
+        if key
+        in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 
