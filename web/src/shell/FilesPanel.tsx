@@ -10,6 +10,7 @@ import {
   SlidersHorizontalIcon,
   XIcon,
 } from "lucide-react";
+import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useParams } from "@/lib/routing";
 import { useSession } from "@/hooks/useSession";
@@ -314,7 +315,10 @@ export function FilesPanel({
     if (browseLocation !== null || browseLocationCache.get(conversationId)) return;
     const saved = session?.workspace?.replace(/\/$/, "") ?? "";
     const root = workspaceRoot.replace(/\/$/, "");
-    if (!saved || saved === root || !saved.startsWith(`${root}/`)) return;
+    if (!saved || saved === root) return;
+    // An out-of-root workspace browses absolutely, which the server
+    // owner-gates — seeding it for a collaborator would 403 their tree.
+    if (!saved.startsWith(`${root}/`) && !isOwnerLevel(session?.permissionLevel ?? null)) return;
     browseLocationCache.set(conversationId, saved);
     setBrowseLocation(saved);
   }, [conversationId, workspaceRoot, session, sessionLoading, browseLocation]);
@@ -331,44 +335,58 @@ export function FilesPanel({
   // winning: each PATCH resolves and persists server-side, so two in flight
   // could land out of order. Keep one request in flight and let a newer
   // navigation replace the queued target instead of racing it.
-  const workdirSyncRef = useRef<{
-    inflight: boolean;
-    queued: { conversationId: string; workspace: string } | null;
-  }>({ inflight: false, queued: null });
+  // Keyed per conversation: the panel survives session switches, and one
+  // shared slot would let session B's navigation overwrite session A's
+  // still-queued target. Each conversation queues and drains independently.
+  const workdirSyncRef = useRef(new Map<string, { inflight: boolean; queued: string | null }>());
+  const queryClient = useQueryClient();
 
-  const syncWorkdir = useCallback((cid: string, workspace: string) => {
-    const state = workdirSyncRef.current;
-    state.queued = { conversationId: cid, workspace };
-    if (state.inflight) return;
-    state.inflight = true;
-    void (async () => {
-      try {
-        // Sequential on purpose: serialization is what makes the latest
-        // navigation win over a still-in-flight one.
-        /* oxlint-disable no-await-in-loop */
-        while (state.queued) {
-          const target = state.queued;
-          state.queued = null;
-          try {
-            await updateSession(target.conversationId, { workspace: target.workspace });
-          } catch (err) {
-            // The header names the browsed folder the working folder, so a
-            // silent miss would lie. Only the newest intent's failure matters.
-            if (!state.queued) {
-              setBrowseError(
-                `The session's working directory could not follow this folder: ${
-                  err instanceof Error ? err.message : String(err)
-                }`,
-              );
+  const syncWorkdir = useCallback(
+    (cid: string, workspace: string) => {
+      const states = workdirSyncRef.current;
+      let state = states.get(cid);
+      if (!state) {
+        state = { inflight: false, queued: null };
+        states.set(cid, state);
+      }
+      state.queued = workspace;
+      if (state.inflight) return;
+      state.inflight = true;
+      void (async () => {
+        try {
+          // Sequential on purpose: serialization is what makes the latest
+          // navigation win over a still-in-flight one.
+          /* oxlint-disable no-await-in-loop */
+          while (state.queued !== null) {
+            const target = state.queued;
+            state.queued = null;
+            try {
+              const updated = await updateSession(cid, { workspace: target });
+              // Refresh the long-lived session snapshot so a later remount
+              // reconciles from the workspace this PATCH just persisted, not
+              // a stale pre-navigation value.
+              queryClient.setQueryData(["session", cid], updated);
+            } catch (err) {
+              // The header names the browsed folder the working folder, so a
+              // silent miss would lie. Only the newest intent's failure on
+              // the conversation being shown matters.
+              if (state.queued === null && browseForRef.current === cid) {
+                setBrowseError(
+                  `The session's working directory could not follow this folder: ${
+                    err instanceof Error ? err.message : String(err)
+                  }`,
+                );
+              }
             }
           }
+          /* oxlint-enable no-await-in-loop */
+        } finally {
+          state.inflight = false;
         }
-        /* oxlint-enable no-await-in-loop */
-      } finally {
-        state.inflight = false;
-      }
-    })();
-  }, []);
+      })();
+    },
+    [queryClient],
+  );
 
   const navigateTo = useCallback(
     (absolutePath: string) => {
