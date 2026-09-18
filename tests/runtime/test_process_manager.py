@@ -20,6 +20,7 @@ from omnigent.runner.identity import RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR
 from omnigent.runtime.harnesses.process_manager import (
     HarnessProcessManager,
     _build_harness_spawn_env,
+    _cwd_env_key,
     _HarnessEndpoint,
     _model_env_key,
     _SubprocessEntry,
@@ -92,6 +93,61 @@ async def test_get_client_respawns_only_when_model_changes(
     # Each respawn closed the prior process first (opus, then sonnet); the
     # cache-hit and the env=None turn close nothing.
     assert closes == ["claude-opus-4-6", "claude-sonnet-4-6"], closes
+
+    final = pm._entries.get(conv)
+    if final is not None:
+        await final.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_get_client_respawns_only_when_cwd_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``get_client`` respawns iff a different working directory is requested.
+
+    The cwd is baked into the subprocess env at spawn (``HARNESS_<H>_CWD``),
+    so after a session workspace change the next turn's spawn env carries a
+    new cwd and must respawn — otherwise the cached process keeps running
+    turns from the old directory. Same-cwd and no-cwd turns must keep the
+    running process.
+
+    :param monkeypatch: Pytest monkeypatch fixture used to mock the
+        subprocess-spawn boundary.
+    """
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    spawns: list[str | None] = []
+    closes: list[str | None] = []
+
+    async def _fake_spawn(conv: str, harness: str, env: dict[str, str] | None) -> _SubprocessEntry:
+        cwd = (env or {}).get(_cwd_env_key(harness))
+        spawns.append(cwd)
+        return _SubprocessEntry(
+            process=_AliveProc(),  # type: ignore[arg-type]  # stand-in process
+            client=httpx.AsyncClient(),
+            endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake-cwd.sock")),
+            harness=harness,
+            cwd=cwd,
+        )
+
+    async def _fake_close(entry: _SubprocessEntry) -> None:
+        closes.append(entry.cwd)
+        await entry.client.aclose()
+
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+
+    conv, harness = "conv_cwd", "claude-sdk"
+    key = _cwd_env_key(harness)  # HARNESS_CLAUDE_SDK_CWD
+
+    await pm.get_client(conv, harness, env={key: "/ws"})  # spawn at /ws
+    await pm.get_client(conv, harness, env={key: "/ws"})  # same → cache hit
+    await pm.get_client(conv, harness, env={key: "/ws/sub"})  # re-rooted → respawn
+    await pm.get_client(conv, harness, env=None)  # no cwd env → keep running process
+
+    assert spawns == ["/ws", "/ws/sub"], spawns
+    assert closes == ["/ws"], closes
 
     final = pm._entries.get(conv)
     if final is not None:

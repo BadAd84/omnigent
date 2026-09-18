@@ -14,12 +14,15 @@ from __future__ import annotations
 
 import uuid
 from pathlib import Path
+from typing import Any
 
 import httpx
+import pytest
 from fastapi import FastAPI
 
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
 from omnigent.runner import create_runner_app
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
 from tests.runner.helpers import NullServerClient
@@ -127,3 +130,51 @@ async def test_empty_location_resolves_to_the_env_root(tmp_path: Path) -> None:
     resp = await _post_workspace_change(_app_rooted_at(tmp_path), "")
     assert resp.status_code == 200, resp.text
     assert resp.json()["workspace"] == str(tmp_path.resolve())
+
+
+async def test_new_terminal_opens_in_the_changed_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A shell created after ``workspace_change`` roots at the new workdir.
+
+    The feature's promise is that new shells open in the browsed folder, so
+    terminal creation must read the live session workspace — rooting at the
+    static default env root would leave every new shell in the old directory.
+    """
+    (tmp_path / "sub").mkdir()
+    app = _app_rooted_at(tmp_path)
+
+    captured: dict[str, Any] = {}
+
+    async def _capture_launch(self: SessionResourceRegistry, **kwargs: Any) -> Any:
+        captured.update(kwargs)
+        raise RuntimeError("probe: launch captured")
+
+    monkeypatch.setattr(SessionResourceRegistry, "launch_auxiliary_terminal", _capture_launch)
+
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        create = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": uuid.uuid4().hex},
+        )
+        assert create.status_code == 201, create.text
+        change = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "workspace_change", "workspace": "sub"},
+        )
+        assert change.status_code == 200, change.text
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/resources/terminals",
+            json={"terminal": "probe-shell", "session_key": "aux1"},
+        )
+        # The capturing fake aborts the launch; the assertion below is about
+        # what the route asked the registry to launch, not the launch result.
+        assert resp.status_code == 500, resp.text
+
+    env_spec = captured["spec"]
+    assert env_spec.os_env.cwd == str((tmp_path / "sub").resolve()), (
+        f"New terminal must root at the changed workspace, got {env_spec.os_env.cwd!r}"
+    )
+    assert captured["cwd_override"] is None

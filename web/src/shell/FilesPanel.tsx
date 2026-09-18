@@ -355,8 +355,12 @@ export function FilesPanel({
 
   const navigateTo = useCallback(
     (absolutePath: string) => {
-      setBrowseError(null);
       const next = absolutePath === workspaceRoot ? null : absolutePath;
+      // The picker reports its current directory on mount, so an unchanged
+      // location must not re-root (or PATCH the workdir). A prior sync
+      // failure still lets a same-location click retry.
+      if (next === browseLocation && !browseError) return;
+      setBrowseError(null);
       if (conversationId) {
         if (next === null) browseLocationCache.delete(conversationId);
         else browseLocationCache.set(conversationId, next);
@@ -369,7 +373,14 @@ export function FilesPanel({
         syncWorkdir(conversationId, relativizeToWorkspace(next, workspaceRoot));
       }
     },
-    [workspaceRoot, conversationId, session?.permissionLevel, syncWorkdir],
+    [
+      workspaceRoot,
+      browseLocation,
+      browseError,
+      conversationId,
+      session?.permissionLevel,
+      syncWorkdir,
+    ],
   );
 
   // Stable so memo(TreeNodeRow) isn't busted on every FilesPanel re-render.

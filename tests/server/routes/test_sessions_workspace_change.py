@@ -20,6 +20,7 @@ directly. Requests go through ``httpx.ASGITransport`` (no lifespan).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import httpx
@@ -298,3 +299,88 @@ async def test_failed_persist_rolls_the_runner_back(
         assert resp.status_code == 404, resp.text
 
     assert [e.get("workspace") for e in forwarded] == ["subdir", "/home/user/project"]
+
+
+def _py313_strict_ntpath_isabs(path: str) -> bool:
+    """``ntpath.isabs`` as Python 3.13 implements it: drive-rooted or UNC only.
+
+    3.13 stopped reporting rooted-but-driveless forms (``"/etc"``, ``"\\etc"``)
+    as absolute, so a gate relying on ``ntpath.isabs`` alone fails open there.
+    """
+    return bool(re.match(r"^(\\\\|//|[A-Za-z]:[\\/])", path))
+
+
+@pytest.mark.parametrize(
+    "path,expected",
+    [
+        ("/etc", True),
+        ("/home/user/project", True),
+        ("\\\\server\\share", True),
+        ("C:\\Users\\alice", True),
+        ("C:/Users/alice", True),
+        ("\\etc", True),
+        ("src", False),
+        ("src/app", False),
+        ("", False),
+    ],
+    ids=[
+        "posix_abs",
+        "posix_abs_deep",
+        "unc",
+        "drive_backslash",
+        "drive_slash",
+        "rooted_backslash",
+        "relative",
+        "relative_subpath",
+        "empty",
+    ],
+)
+def test_is_absolute_workspace_fails_closed_on_py313_ntpath(
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    expected: bool,
+) -> None:
+    """The owner gate's absolute classification holds under 3.13 semantics.
+
+    An absolute workspace is owner-gated; classifying one as relative would
+    admit it at the edit tier. Simulate Python 3.13's stricter
+    ``ntpath.isabs`` and assert the classification still fails closed for
+    every absolute form on every supported interpreter.
+    """
+    import ntpath
+
+    from omnigent.server.routes.sessions.routes_core import _is_absolute_workspace
+
+    monkeypatch.setattr(ntpath, "isabs", _py313_strict_ntpath_isabs)
+    assert _is_absolute_workspace(path) is expected
+
+
+async def test_absolute_workspace_stays_owner_gated_under_py313_ntpath(
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An editor's absolute PATCH is still 403 when ``ntpath.isabs`` is strict.
+
+    Route-level twin of the classification test: under 3.13 semantics an
+    absolute POSIX path must not slip through the edit-tier gate.
+    """
+    import ntpath
+
+    monkeypatch.setattr(ntpath, "isabs", _py313_strict_ntpath_isabs)
+    app, session_id, store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER, _EDITOR: LEVEL_EDIT},
+        workspace="/home/user/project",
+    )
+    async with _client(app, _EDITOR) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{session_id}",
+            json={"workspace": "/etc"},
+        )
+        assert resp.status_code == 403, resp.text
+
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == "/home/user/project"

@@ -462,6 +462,11 @@ class _SubprocessEntry:
         :meth:`HarnessProcessManager.get_client` re-spawns on a
         later model change. Harnesses in
         :data:`_LIVE_MODEL_CONFIG_HARNESSES` apply it in-process.
+    :param cwd: The ``HARNESS_<H>_CWD`` value this subprocess was
+        spawned with (or ``None`` when the spawn env set no cwd).
+        The working directory is likewise fixed at spawn, so a later
+        turn requesting a different one (a session workspace change)
+        re-spawns the subprocess.
     """
 
     def __init__(
@@ -471,12 +476,14 @@ class _SubprocessEntry:
         endpoint: _HarnessEndpoint,
         harness: str,
         model: str | None = None,
+        cwd: str | None = None,
     ) -> None:
         self.process = process
         self.client = client
         self.endpoint = endpoint
         self.harness = harness
         self.model = model
+        self.cwd = cwd
         self.last_used_at: float = 0.0
 
 
@@ -494,6 +501,21 @@ def _model_env_key(harness: str) -> str:
         ``"claude-sdk"`` or ``"HARNESS_CODEX_MODEL"`` for ``"codex"``.
     """
     return f"HARNESS_{harness.upper().replace('-', '_')}_MODEL"
+
+
+def _cwd_env_key(harness: str) -> str:
+    """
+    Return the per-harness cwd env-var key for *harness*.
+
+    Mirrors the ``HARNESS_<H>_CWD`` convention the spawn-env builders use,
+    so the process manager can tell whether a later turn's spawn env
+    requests a different working directory (a session workspace change)
+    than the running subprocess was started with.
+
+    :param harness: Canonical harness name, e.g. ``"claude-sdk"``.
+    :returns: The env-var key, e.g. ``"HARNESS_CLAUDE_SDK_CWD"``.
+    """
+    return f"HARNESS_{harness.upper().replace('-', '_')}_CWD"
 
 
 _LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
@@ -825,6 +847,24 @@ class HarnessProcessManager:
                     await self._close_entry(entry)
                     entry = None
                     respawn_reason = "harness_respawn_model_switch"
+            if entry is not None and harness != "any":
+                # The working directory is baked into the subprocess env at
+                # spawn (``HARNESS_<H>_CWD``), so a session workspace change
+                # must respawn — otherwise the cached process keeps running
+                # turns from the old directory.
+                requested_cwd = (env or {}).get(_cwd_env_key(harness))
+                if requested_cwd is not None and requested_cwd != entry.cwd:
+                    _logger.info(
+                        "harness %s for conversation %s: cwd changed %r -> %r; respawning",
+                        harness,
+                        conversation_id,
+                        entry.cwd,
+                        requested_cwd,
+                    )
+                    replaced_response_id = self._in_flight_response_ids.get(conversation_id)
+                    await self._close_entry(entry)
+                    entry = None
+                    respawn_reason = "harness_respawn_workspace_change"
             if entry is None:
                 if harness == "any":
                     raise NoLiveHarnessError(
@@ -1291,11 +1331,13 @@ class HarnessProcessManager:
                 client=client,
                 endpoint=endpoint,
                 harness=harness,
-                # Record the model this subprocess was spawned with so a later
-                # turn requesting a different model (e.g. after ``/model``)
-                # triggers a respawn in ``get_client`` — the model is a fixed
-                # process env var, not re-read per turn.
+                # Record the model and cwd this subprocess was spawned with so
+                # a later turn requesting a different value (e.g. after
+                # ``/model`` or a workspace change) triggers a respawn in
+                # ``get_client`` — both are fixed process env vars, not
+                # re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
+                cwd=(env or {}).get(_cwd_env_key(harness)),
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:

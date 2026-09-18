@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import ntpath
+import posixpath
 import secrets
 import time
 from collections.abc import Callable
@@ -218,6 +219,22 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+
+def _is_absolute_workspace(path: str) -> bool:
+    """Whether a workspace wire-form names an absolute location on any platform.
+
+    Gates the owner-only tier for workspace changes, so it must fail closed:
+    ``ntpath.isabs`` alone stopped admitting rooted POSIX forms (``"/etc"``)
+    and rooted-backslash forms on Python 3.13, which would let an editor slip
+    an absolute path through the edit-tier check. Check the POSIX rule, the
+    Windows drive/UNC rule, and a rooted backslash explicitly.
+
+    :param path: Client-supplied workspace wire form, e.g. ``"src"`` or
+        ``"/etc"``.
+    :returns: ``True`` when the path is absolute under any platform's rules.
+    """
+    return posixpath.isabs(path) or ntpath.isabs(path) or path.startswith("\\")
 
 
 def register_core_routes(
@@ -1996,7 +2013,7 @@ def register_core_routes(
             # is owner-gated. Tiers are monotonic, so compose with max().
             workspace_level = (
                 LEVEL_OWNER
-                if (body.workspace is not None and ntpath.isabs(body.workspace))
+                if (body.workspace is not None and _is_absolute_workspace(body.workspace))
                 else LEVEL_EDIT
             )
             required_level = max(required_level, workspace_level)
@@ -2587,7 +2604,7 @@ def register_core_routes(
                             else ErrorCode.INVALID_INPUT
                         ),
                     )
-                if body.workspace and ntpath.isabs(body.workspace):
+                if body.workspace and _is_absolute_workspace(body.workspace):
                     # No runner to resolve against, but an absolute wire-form
                     # path is already the canonical target on the owner's
                     # machine, so persist it as-is (owner-gated above).
