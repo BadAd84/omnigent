@@ -785,11 +785,12 @@ Once the set is genuinely green:
    conclude the token is "expired" or "read-only" from an empty env var — it is
    present on the machine, just not exported to your shell.
 4. **Open a ready-for-review PR** with `gh pr create` (not a draft — the repo's
-   automated review runs on ready PRs). If the target repository provides
-   `.github/pull_request_template.md`, copy it to `.omnigent/pr-body.md` and edit
-   that file. Otherwise create `.omnigent/pr-body.md` with concise **Related
-   issue**, **Summary**, and **Test Plan** sections. Pass the finished file to
-   `gh pr create --body-file .omnigent/pr-body.md`. The
+   automated review runs on ready PRs). Create `.omnigent/` if needed. If the
+   target repository provides `.github/pull_request_template.md`, copy it to
+   `.omnigent/pr-body.md` and edit that file. Otherwise create
+   `.omnigent/pr-body.md` with concise **Related issue**, **Summary**, and **Test
+   Plan** sections. Pass the finished file to `gh pr create --body-file
+   .omnigent/pr-body.md`. The
    workflow-owned publisher also restores this file from the resolve artifact
    bundle if it has to finish publication after your session ends, so write it
    before the GitHub call or final handoff. Link the bug in the template's
@@ -1525,12 +1526,14 @@ Field meanings:
 - `session_id` — the repro session you consumed, carried through so the chain is
   traceable.
 
-Your work ends the same way on **both paths**: the PR you're landing (one you
-opened, or an existing in-repo PR you reviewed and kept) has a preview, green CI, a
-clean automated review, a live-validation command, and the maintainer tagged (Step
-4) — or you've hit the round cap and left an honest summary. The difference is only
-how a fix lands (push directly, or — for an unpushable fork PR that needs changes —
-take over into your own PR carrying the contributor's commits), and that the author
-path opens a PR while the review path adopts an existing one. `skip_push` and
-`needs_more_info` runs end earlier, with no PR to land. Either way, **you do not
-merge.**
+Directly published author runs and review runs end the same way: the PR you're
+landing (one you opened, or an existing in-repo PR you reviewed and kept) has a
+preview, green CI, a clean automated review, a live-validation command, and the
+maintainer tagged (Step 4) — or you've hit the round cap and left an honest
+summary. The difference is only how a fix lands (push directly, or — for an
+unpushable fork PR that needs changes — take over into your own PR carrying the
+contributor's commits), and that the direct author path opens a PR while the
+review path adopts an existing one. Workflow-owned author publication ends after
+the validated body, deferred validation prompt, and final handoff are prepared;
+the publisher owns the post-publication loop. `skip_push` and `needs_more_info`
+runs end earlier, with no PR to land. In every mode, **you do not merge.**
