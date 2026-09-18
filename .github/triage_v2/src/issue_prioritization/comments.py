@@ -49,8 +49,10 @@ def build_triage_comment(
     labels_after: tuple[str, ...],
     evaluated_at: datetime | None = None,
 ) -> str:
-    needs_info = item.issue.information_status == InformationStatus.NEEDS_INFO and not any(
-        value.startswith("needs_info_") for value in plan.blocked
+    needs_info = (
+        item.issue.information_status == InformationStatus.NEEDS_INFO
+        and not plan.close_as_non_actionable
+        and not any(value.startswith("needs_info_") for value in plan.blocked)
     )
     deadline = (
         evaluated_at + timedelta(days=NEEDS_INFO_DAYS) if needs_info and evaluated_at else None
@@ -61,8 +63,29 @@ def build_triage_comment(
         "content_hash": item.issue.classification_content_hash,
         "information_status": item.issue.information_status.value,
         "needs_info_deadline": deadline.date().isoformat() if deadline else None,
+        "close_reason": "no_observed_user_impact" if plan.close_as_non_actionable else None,
     }
     marker = f"<!-- {COMMENT_MARKER} {json.dumps(metadata, separators=(',', ':'))} -->"
+    if plan.close_as_non_actionable:
+        review = item.issue.bug_review
+        if review is None:
+            raise ValueError("a non-actionable closure requires a bug review")
+        return "\n".join(
+            (
+                marker,
+                "🤖 **Automated triage**",
+                "",
+                "Closing as **not planned** because this report does not describe an "
+                "observed user-facing failure.",
+                "",
+                _plain_text(review.reason),
+                "",
+                "We prioritize bugs that affect users; code-path analysis alone is not enough. "
+                "If you encounter this problem, reply with what you did, what happened, and "
+                "relevant logs or session details. An author follow-up will reopen the issue "
+                "for review.",
+            )
+        )
     priority_lines = _priority_lines(item, plan, labels_after)
     reasoning = _safe_reasoning(item.issue.classification_reasoning)
     information_lines = _information_lines(item, deadline)
@@ -122,7 +145,7 @@ def _plain_text(value: str) -> str:
 def preserve_needs_info_deadline(body: str, existing_body: str) -> str:
     metadata = _comment_metadata(body)
     existing_metadata = _comment_metadata(existing_body)
-    if not metadata or not existing_metadata:
+    if not metadata or not existing_metadata or metadata.get("close_reason"):
         return body
     if (
         metadata.get("information_status") != InformationStatus.NEEDS_INFO

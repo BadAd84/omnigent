@@ -8,6 +8,7 @@ from typing import Protocol
 
 from issue_prioritization.artifacts import RankedIssue, rank_issues
 from issue_prioritization.bronze import BronzeIssue
+from issue_prioritization.bug_review import BUG_REVIEW_VERSION
 from issue_prioritization.classification import (
     Classification,
     Classifier,
@@ -109,7 +110,14 @@ class IssuePrioritizationPipeline:
             or cached.content_hash != contents[issue.number].content_hash
             or (
                 cached.issue_type == IssueType.BUG
-                and self.review_bugs != (cached.bug_review is not None)
+                and (
+                    self.review_bugs != (cached.bug_review is not None)
+                    or (
+                        self.review_bugs
+                        and cached.bug_review is not None
+                        and cached.bug_review.rubric_version != BUG_REVIEW_VERSION
+                    )
+                )
             )
         }
         if self.classification_progress:

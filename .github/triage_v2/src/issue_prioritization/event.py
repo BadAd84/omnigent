@@ -235,7 +235,9 @@ def _mutation_payload(plan: MutationPlan) -> dict[str, object]:
             "components": list(plan.target.components),
             "issue_type": plan.target.issue_type,
             "needs_info": plan.target.needs_info,
+            "close_as_non_actionable": plan.target.close_as_non_actionable,
         },
+        "close_as_non_actionable": plan.close_as_non_actionable,
         "labels_add": list(plan.labels_add),
         "labels_remove": list(plan.labels_remove),
         "blocked": list(plan.blocked),
@@ -344,7 +346,7 @@ def main() -> None:
         mode,
     )
     intake_plan = None
-    if args.intake:
+    if args.intake and not run.mutations[0].close_as_non_actionable:
         live_issue = client.issue_data(issue.number)
         intake_plan = plan_intake(
             issue,

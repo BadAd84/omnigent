@@ -128,7 +128,10 @@ def test_pipeline_reuses_persisted_classification_and_includes_maintainers() -> 
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("cached_review", [False, True])
-def test_bug_review_switch_refreshes_incompatible_cached_classifications(enabled, cached_review):
+@pytest.mark.parametrize("cached_version", [1, 2])
+def test_bug_review_switch_refreshes_incompatible_cached_classifications(
+    enabled, cached_review, cached_version
+):
     issue = _bronze(1)
     review = BugReview(BugActionability.ACTIONABLE, "Concrete session failure.")
     cached = Classification(
@@ -140,7 +143,7 @@ def test_bug_review_switch_refreshes_incompatible_cached_classifications(enabled
         reasoning="Has mitigation",
         content_hash=issue.content().content_hash,
         reported_type=IssueType.BUG,
-        bug_review=review if cached_review else None,
+        bug_review=replace(review, rubric_version=cached_version) if cached_review else None,
     )
     classifier = FakeClassifier(replace(cached, bug_review=review if enabled else None))
     sink = CaptureSink()
@@ -156,8 +159,12 @@ def test_bug_review_switch_refreshes_incompatible_cached_classifications(enabled
 
     run = pipeline.run("switch-preview")
 
-    assert classifier.calls == int(enabled != cached_review)
+    assert classifier.calls == int(
+        enabled != cached_review or (enabled and cached_review and cached_version != 2)
+    )
     assert (run.ranked[0].issue.bug_review is not None) == enabled
+    if enabled:
+        assert run.ranked[0].issue.bug_review.rubric_version == 2
 
 
 def test_pipeline_reclassifies_changed_content() -> None:

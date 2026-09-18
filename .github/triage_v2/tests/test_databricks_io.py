@@ -77,6 +77,7 @@ def test_dry_run_artifact_contains_complete_mutation_plan(tmp_path) -> None:
         "components": ["comp:db"],
         "issue_type": None,
         "needs_info": None,
+        "close_as_non_actionable": False,
     }
     assert payload[0]["labels_add"] == ["P1-high", "comp:db"]
     assert payload[0]["labels_remove"] == ["P2-medium", "severity:S2"]

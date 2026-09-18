@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.resources import files
 from string import Template
 from typing import Protocol
 
 from issue_prioritization.areas import AreaCatalog
-from issue_prioritization.bug_review import BugActionability, BugReview
+from issue_prioritization.bug_review import BUG_REVIEW_VERSION, BugActionability, BugReview
 from issue_prioritization.domain import (
     EvidenceKind,
     Impact,
@@ -111,12 +111,22 @@ class PromptClassifier:
         )
         bug_review = None
         if self.review_bugs and issue_type == IssueType.BUG:
-            bug_review = BugReview.from_mapping(value.get("bug_review"))
+            bug_review = replace(
+                BugReview.from_mapping(value.get("bug_review")), rubric_version=BUG_REVIEW_VERSION
+            )
             actionable = bug_review.actionability == BugActionability.ACTIONABLE
             if actionable != (information_status == InformationStatus.SUFFICIENT):
                 raise ValueError("bug actionability disagrees with information status")
             if actionable and missing_information:
                 raise ValueError("an actionable bug cannot require missing information")
+            non_actionable = bug_review.actionability == BugActionability.NON_ACTIONABLE
+            if evidence_kind == EvidenceKind.CODE_ANALYSIS and not non_actionable:
+                raise ValueError("code-only evidence requires a non_actionable bug review")
+            if non_actionable and evidence_kind not in (
+                EvidenceKind.CODE_ANALYSIS,
+                EvidenceKind.NONE,
+            ):
+                raise ValueError("a non_actionable bug cannot claim observed failure evidence")
             bug_review.validate_source(issue.body[:12000])
         return Classification(
             issue_number=issue.number,
@@ -158,6 +168,16 @@ def build_prompt(
         labels=", ".join(issue.labels) if issue.labels else "none",
         author=issue.author,
         body=issue.body[:12000],
+        code_analysis_guidance=(
+            "Code analysis alone is not usable evidence of an observed user-facing failure. "
+            "Apply the bug review below: close source-only concerns as non_actionable, even "
+            "when they explain a reachable path and predict a concrete consequence."
+            if review_bugs
+            else "Code analysis naming a reachable path and its concrete incorrect impact "
+            "can also be sufficient. A defensive code-path report can be sufficient when "
+            "it explains reachability and impact; never reject it merely because nobody "
+            "ran the path end to end."
+        ),
         bug_type_guidance=(
             "An alleged failure remains a Bug even when its trigger or impact is speculative "
             "or unsupported; use the bug review below to assess it. Reclassify as Feature "

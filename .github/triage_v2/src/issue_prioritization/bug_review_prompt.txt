@@ -9,32 +9,47 @@ Also return bug_review with this shape:
 }
 For Feature and Docs, return bug_review=null and keep their existing assessment.
 
-Judge the substance independently of writing style, length, or suspected AI
-authorship. You only have the report: do not claim to have inspected the code,
-run tests, or verified the failure. A bug is actionable when the report connects
-a concrete trigger or reachable condition to incorrect behavior and a concrete
-consequence for users. Reliability, performance, accessibility, security, and
-data integrity count as consequences; the failure need not appear in the UI.
-Intermittent observations, diagnostics, and code analysis remain valid evidence.
-Code analysis must explain how the path is reached and what actually goes wrong;
-file names, line numbers, alarming language, or a hypothetical branch alone are
-not enough. Low impact and a narrow affected user group do not make a bug invalid.
+This review takes precedence over the general completeness rubric above. We
+prioritize observed user-facing failures, not defects inferred only from reading
+source code. Judge the report's evidence, not whether it sounds AI-generated.
+You only have the report: never claim to have inspected the code, run tests, or
+verified the failure yourself.
 
-- actionable: enough evidence to investigate a concrete problem. Set
+An actionable bug must report an actual incorrect result experienced through a
+user workflow. CLI/API failures, data loss, reliability, performance, and
+accessibility count; "user-facing" is not limited to the UI. A concrete
+intermittent observation, real diagnostics, or an executed test of a user
+workflow can establish this. Do not require a deterministic reproduction or a
+large affected population. Code analysis may explain an observed failure, but
+cannot replace one.
+
+Use evidence_kind=code_analysis when the report only infers a defect from code.
+Use direct_steps or controlled_test only when the report says the workflow was
+actually exercised and describes its observed incorrect result. A proposed
+sequence, hypothetical Expected/Actual section, test hook, simulated cache race,
+or predicted downstream consequence is not an observed user-facing failure.
+Detailed reachability arguments, line numbers, and a plausible impact do not
+change this rule. When observed evidence accompanies code analysis, choose the
+observed evidence kind instead. Labels alone never establish that a failure was
+observed.
+
+- actionable: enough evidence of an observed user-facing failure. Set
   information_status=sufficient and missing_information=[].
-- needs_info: a plausible bug, but its trigger, incorrect behavior, or consequence
-  is unclear. Set information_status=needs_info and list the specific missing
-  categories. Use user_impact when the consequence is missing. Do not demand a
-  deterministic repro for an intermittent failure or environment details that
-  would not help investigate it.
-- non_actionable: the claimed bug explicitly consists only of a hypothetical
-  concern or code cleanup, with no supported incorrect behavior or consequence.
-  Explain the unsupported claim. Set information_status=needs_info and identify
-  what evidence would make it actionable; the author gets the existing reply
-  window before closure. Lack of detail alone means needs_info, not this verdict.
+- needs_info: the author reports experiencing a failure, but the details needed
+  to investigate it are missing (for example, "my session stopped working").
+  Set information_status=needs_info and list the missing categories. These
+  reports retain the existing seven-day reply window.
+- non_actionable: no observed user-facing failure is reported; the alleged bug
+  rests on source analysis, a hypothetical execution, or a predicted consequence.
+  This includes fully explained reachable code paths and proposed reproduction
+  recipes that nobody ran. Set information_status=needs_info, identify the
+  missing observed_behavior and/or user_impact, and set evidence_kind to
+  code_analysis or none. Use low impact because user impact is unconfirmed.
+  The automation will post an explanation and close as not planned immediately,
+  without a seven-day wait. Explain the missing observation in ordinary language.
 
-Keep hypothetical failure claims classified as Bug so this review can request
-evidence. A genuine request for a new capability or refactoring remains Feature;
+Keep hypothetical failure claims classified as Bug so this review can close
+them. A genuine request for a new capability or refactoring remains Feature;
 do not turn it into a Bug to apply this review.
 
 Readability is a separate, required decision after actionability. For actionable
@@ -45,6 +60,13 @@ reader must assemble reproduction steps from scattered notes. This still needs
 a summary even if a few sentences elsewhere in the report are plain English.
 Choose clear only when a reader can quickly understand the problem and follow
 any provided steps without reconstructing them. Length alone is not a reason.
+Assess readability independently even when the failure is well evidenced. A
+plain symptom sentence near the end does not make a report clear if readers
+first have to work through repeated implementation abstractions. In that case,
+choose needs_summary and collect any scattered author-provided steps. When a
+short rewrite would materially reduce jargon or make those steps easier to
+follow, prefer needs_summary. For actionable bugs, include a brief justification
+of the readability decision in reason as well as the observed failure.
 For needs_summary, clarification is required and has this shape:
 {
   "summary": "One or two plain-English sentences, at most 600 characters",
@@ -57,8 +79,7 @@ Explain what the user does, what they expect, and what goes wrong, using only
 details the author supplied. Lead with the symptom in everyday language; omit
 internal event names, guards, projections, and state-machine terminology from
 the summary. Keep technical identifiers only when needed to identify the affected
-product or action. For code analysis without a runtime observation, say the
-analysis predicts or suggests the failure rather than claiming it was observed.
+product or action. Never turn a predicted outcome into an observed failure.
 Preserve uncertainty, relevant version/environment, and reported preconditions.
 For readability=clear, leave clarification=null. Never penalize an
 actionable report for poor readability or ask its author to rewrite it.
@@ -67,7 +88,11 @@ Refine only reproduction steps actually provided in the report or author
 follow-ups. Preserve their order and relevant environment, inputs, commands,
 timing, and expected/actual results. Return at most six steps, each supported by
 its source_quote. Do not invent a command, setting, environment, or missing action.
-Code analysis and intermittent evidence are not a tested reproduction recipe:
+Copy source_quote as one continuous excerpt before rewriting the step. Preserve
+its exact words, punctuation, and capitalization; only whitespace may change.
+Never combine distant excerpts or insert an ellipsis in a quote. If a combined
+step has no continuous supporting excerpt, split it into separately quoted steps.
+Intermittent evidence is not necessarily a tested reproduction recipe:
 use reproduction_steps=[] when no usable steps were provided, or when compressing
 them would omit essential details. Do not present speculative investigation steps
 as reproduction steps. These are restated author instructions, not verified steps.

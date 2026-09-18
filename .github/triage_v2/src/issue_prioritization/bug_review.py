@@ -4,6 +4,8 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
+BUG_REVIEW_VERSION = 2
+
 
 class BugActionability(StrEnum):
     ACTIONABLE = "actionable"
@@ -28,6 +30,7 @@ class BugReview:
     actionability: BugActionability
     reason: str
     clarification: BugClarification | None = None
+    rubric_version: int = BUG_REVIEW_VERSION
 
     @classmethod
     def from_mapping(cls, value: object) -> BugReview:
@@ -56,7 +59,7 @@ class BugReview:
             clarification = BugClarification(
                 _text(raw.get("summary"), "summary", 600), tuple(parsed_steps)
             )
-        review = cls(actionability, reason, clarification)
+        review = cls(actionability, reason, clarification, int(value.get("rubric_version", 1)))
         if value.get("readability") != review.readability:
             raise ValueError("bug readability disagrees with actionability or clarification")
         return review

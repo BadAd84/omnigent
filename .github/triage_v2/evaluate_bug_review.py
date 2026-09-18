@@ -54,11 +54,20 @@ def main() -> None:
         destination.mkdir(parents=True, exist_ok=True)
         (destination / "input.json").write_text(json.dumps(case, indent=2) + "\n")
         try:
+            classifier = serving_endpoint_classifier(
+                args.model_endpoint, areas, workspace, review_bugs=True
+            )
+            query = classifier.query
+
+            def record_response(prompt):
+                response = query(prompt)
+                (destination / "model_response.txt").write_text(response)
+                return response
+
+            classifier.query = record_response
             run, classification, _, _ = prioritize_issue(
                 issue,
-                serving_endpoint_classifier(
-                    args.model_endpoint, areas, workspace, review_bugs=True
-                ),
+                classifier,
                 config,
                 areas,
                 manifest,
@@ -76,6 +85,7 @@ def main() -> None:
                 "actionability": actionability,
                 "clarification": clarification is not None,
                 "has_steps": bool(clarification and clarification.reproduction_steps),
+                "close_as_non_actionable": run.mutations[0].close_as_non_actionable,
             }
             passed = (
                 actual["type"] == case["expected_type"]
@@ -86,6 +96,7 @@ def main() -> None:
                 )
                 and actual["clarification"] == case["expected_clarification"]
                 and ("expected_steps" not in case or actual["has_steps"] == case["expected_steps"])
+                and actual["close_as_non_actionable"] == case.get("expected_close", False)
             )
             result = {"name": case["name"], "passed": passed, "actual": actual}
         except Exception as error:
