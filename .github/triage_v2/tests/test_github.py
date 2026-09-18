@@ -316,7 +316,8 @@ def test_legacy_priority_uses_the_latest_label_actor() -> None:
     ).is_bot_owned(1, "P2-medium")
 
 
-def test_client_loads_a_live_open_issue() -> None:
+@pytest.mark.parametrize("state,include_closed", [("open", False), ("closed", True)])
+def test_client_loads_a_live_issue(state, include_closed) -> None:
     payload = {
         "number": 7,
         "title": "Session fails",
@@ -326,7 +327,7 @@ def test_client_loads_a_live_open_issue() -> None:
         "labels": [{"name": "bug"}],
         "created_at": "2026-08-06T00:00:00Z",
         "reactions": {"+1": 3},
-        "state": "open",
+        "state": state,
     }
 
     def transport(method, path, body):
@@ -334,7 +335,7 @@ def test_client_loads_a_live_open_issue() -> None:
 
     client = GitHubClient("token", "org/repo", transport)
 
-    issue = client.open_issue(7)
+    issue = client.issue_for_triage(7, include_closed=include_closed)
 
     assert issue is not None
     assert issue.number == 7
@@ -362,7 +363,7 @@ def test_client_includes_only_author_follow_up_comments() -> None:
     def transport(method, path, body):
         return comments if "/comments" in path else payload
 
-    issue = GitHubClient("token", "org/repo", transport).open_issue(7)
+    issue = GitHubClient("token", "org/repo", transport).issue_for_triage(7)
 
     assert issue is not None
     assert "The session ID is abc-123." in issue.body
@@ -373,10 +374,11 @@ def test_client_includes_only_author_follow_up_comments() -> None:
 def test_client_ignores_closed_issues_and_pull_requests() -> None:
     payload = {"state": "closed"}
     client = GitHubClient("token", "org/repo", lambda method, path, body: payload)
-    assert client.open_issue(7) is None
+    assert client.issue_for_triage(7) is None
 
     payload = {"state": "open", "pull_request": {}}
-    assert client.open_issue(7) is None
+    assert client.issue_for_triage(7) is None
+    assert client.issue_for_triage(7, include_closed=True) is None
 
 
 def test_client_lists_and_closes_labeled_open_issues() -> None:

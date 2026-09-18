@@ -124,6 +124,21 @@ behavior. Enable it locally with `issue-priority-event --review-bugs` alongside
 the arguments in the no-write example above. Keep `--mode dry_run` to preview
 the proposed labels and comment in `event.json` and `comment.md`.
 
+To preview a branch through GitHub Actions, dispatch Issue Triage with writes
+disabled. Add `include_closed=true` to evaluate a closed issue without reopening
+it; the local CLI equivalent is `--include-closed`, which rejects apply mode.
+
+```bash
+gh workflow run issue-triage.yml --repo omnigent-ai/omnigent \
+  --ref <branch> -f issue_number=<number> \
+  -f apply_labels=false -f post_comment=false \
+  -f review_bugs=true -f include_closed=true
+```
+
+Manual V2 dry runs check out the selected branch revision. Download the
+`issue-priority-v2-<number>-<run-id>` artifact to inspect `comment.md` and
+`event.json`; the latter records the checked-out commit and the dry-run mode.
+
 - **Actionable, already clear:** normal triage, without an additional summary.
 - **Actionable, hard to read:** the existing bot-owned comment gains a concise
   problem summary and, when supplied by the author, clearer reproduction steps.

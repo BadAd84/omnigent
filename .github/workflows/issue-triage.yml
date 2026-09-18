@@ -54,6 +54,10 @@ on:
         description: Enable the optional bug review for this V2 run
         type: boolean
         default: false
+      include_closed:
+        description: Preview closed issues with V2 (requires apply_labels=false)
+        type: boolean
+        default: false
 
 permissions:
   issues: write
@@ -800,4 +804,5 @@ jobs:
       manual_dispatch: ${{ github.event_name == 'workflow_dispatch' }}
       post_duplicate_comments: ${{ github.event_name == 'workflow_dispatch' && inputs.post_comment }}
       review_bugs: ${{ github.event_name == 'workflow_dispatch' && inputs.review_bugs }}
+      include_closed: ${{ github.event_name == 'workflow_dispatch' && inputs.include_closed }}
     secrets: inherit

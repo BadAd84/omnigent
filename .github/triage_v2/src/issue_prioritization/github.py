@@ -217,9 +217,13 @@ class GitHubClient:
             page += 1
         return tuple(issues[:limit])
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+    def issue_for_triage(
+        self, issue_number: int, *, include_closed: bool = False
+    ) -> BronzeIssue | None:
         value = self.issue_data(issue_number)
-        if value.get("state") != "open" or "pull_request" in value:
+        if "pull_request" in value or (
+            value.get("state") != "open" and not (include_closed and value.get("state") == "closed")
+        ):
             return None
         author = value.get("user")
         author_login = str(author.get("login", "")) if isinstance(author, dict) else ""
