@@ -13,6 +13,8 @@ import {
   useWorkspaceEnvironment,
   useWorkspaceFileSearch,
 } from "@/hooks/useWorkspaceChangedFiles";
+import type * as ReactQueryModule from "@tanstack/react-query";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import type * as WorkspaceChangedFilesModule from "@/hooks/useWorkspaceChangedFiles";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
@@ -64,11 +66,11 @@ vi.mock("./WorkspacePicker", async (importOriginal) => ({
 // snapshot) and PATCHes the session on re-root; neither needs a live
 // react-query provider or network in these component tests.
 vi.mock("@tanstack/react-query", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@tanstack/react-query")>()),
+  ...(await importOriginal<typeof ReactQueryModule>()),
   useQueryClient: () => ({ setQueryData: vi.fn() }),
 }));
 vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("@/lib/sessionsApi")>()),
+  ...(await importOriginal<typeof SessionsApiModule>()),
   updateSession: vi.fn(async () => ({}) as never),
 }));
 vi.mock("@/hooks/useSession", () => ({

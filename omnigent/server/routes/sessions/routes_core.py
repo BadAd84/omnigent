@@ -246,34 +246,6 @@ def _is_absolute_workspace(path: str) -> bool:
     return posixpath.isabs(path) or ntpath.isabs(path) or path.startswith("\\")
 
 
-_workspace_change_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
-    weakref.WeakValueDictionary()
-)
-
-
-def _workspace_change_lock(session_id: str) -> asyncio.Lock:
-    """Per-session lock ordering a workspace change's forward + persist.
-
-    The runner forward and the workspace persist are two steps; two concurrent
-    PATCHes could interleave them and leave the runner's live cwd permanently
-    diverged from the stored workspace (runner applied B last, store persisted
-    A last). Serializing the pair per session makes the last persisted value
-    the last one the runner applied. In-process only — coordinating
-    cross-replica writers would need versioned updates. Weak values let a
-    session's lock vanish once no change holds or awaits it.
-
-    :param session_id: Session whose workspace changes are ordered.
-    :returns: The session's lock.
-    """
-    lock = _workspace_change_locks.get(session_id)
-    if lock is None:
-        # No await between the miss and the store, so two coroutines on the
-        # event loop cannot both create a lock for the same session.
-        lock = asyncio.Lock()
-        _workspace_change_locks[session_id] = lock
-    return lock
-
-
 async def _reset_runner_and_clear_todos_after_switch(
     session_id: str, conversation_store: ConversationStore
 ) -> None:
@@ -311,6 +283,34 @@ def register_core_routes(
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
 ) -> None:
     """Register the core session routes on router."""
+    # Closure-scoped (per registered app), so imported sessions with colliding
+    # ids on a multi-tenant pod share at most a lock, never a value.
+    _workspace_change_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+        weakref.WeakValueDictionary()
+    )
+
+    def _workspace_change_lock(session_id: str) -> asyncio.Lock:
+        """Per-session lock ordering a workspace change's forward + persist.
+
+        The runner forward and the workspace persist are two steps; two
+        concurrent PATCHes could interleave them and leave the runner's live
+        cwd permanently diverged from the stored workspace (runner applied B
+        last, store persisted A last). Serializing the pair per session makes
+        the last persisted value the last one the runner applied. In-process
+        only — coordinating cross-replica writers would need versioned
+        updates. Weak values let a session's lock vanish once no change holds
+        or awaits it.
+
+        :param session_id: Session whose workspace changes are ordered.
+        :returns: The session's lock.
+        """
+        lock = _workspace_change_locks.get(session_id)
+        if lock is None:
+            # No await between the miss and the store, so two coroutines on
+            # the event loop cannot both create a lock for the same session.
+            lock = asyncio.Lock()
+            _workspace_change_locks[session_id] = lock
+        return lock
 
     async def _schedule_managed_launch(
         request: Request,

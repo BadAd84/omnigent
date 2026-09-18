@@ -518,9 +518,7 @@ async def test_concurrent_changes_persist_the_last_applied_workspace(
         applied.append(workspace)
         return _RunnerForwardResult(
             status_code=200,
-            body=_json.dumps(
-                {"object": "session.workspace_changed", "workspace": workspace}
-            ),
+            body=_json.dumps({"object": "session.workspace_changed", "workspace": workspace}),
         )
 
     real_set_workspace = SqlAlchemyConversationStore.set_workspace
