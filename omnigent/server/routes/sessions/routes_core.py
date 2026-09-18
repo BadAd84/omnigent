@@ -621,7 +621,7 @@ def register_core_routes(
         # the spec and cache sub_agent_name before the first turn.
         # Without this, the runner doesn't know this session exists
         # until the first forwarded event.
-        conv = conversation_store.get_conversation(resp.id)
+        conv = await asyncio.to_thread(conversation_store.get_conversation, resp.id)
         # Mark the terminal spin-up flag at creation — the earliest
         # possible point — for a host-launched terminal-first session
         # (claude-native / codex-native). The runner's own pending emit
@@ -2312,7 +2312,8 @@ def register_core_routes(
                 # resolve the spec and cache it before the first turn.
                 # This is the design doc's "Server POST /v1/sessions
                 # (to runner)" step from §7 Flow: session creation.
-                conv = conversation_store.get_conversation(
+                conv = await asyncio.to_thread(
+                    conversation_store.get_conversation,
                     session_id,
                 )
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
