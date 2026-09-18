@@ -181,12 +181,14 @@ RUN set -eu; \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 
-# Precompile bytecode (venv deps + editable omnigent source under /build) so
-# cold imports read .pyc rather than recompiling: host start, and the warm-pool
-# readiness probe that runs a fresh interpreter every second.
-# PYTHONDONTWRITEBYTECODE stays on at runtime. `|| true`: an uncompilable
-# dependency must not fail the build.
-RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv /build/omnigent || true
+# Precompile bytecode so cold imports read .pyc rather than recompiling: host
+# start, and the warm-pool readiness probe that runs a fresh interpreter every
+# second. PYTHONDONTWRITEBYTECODE stays on at runtime. Third-party deps compile
+# best-effort (`|| true`); the editable first-party source (omnigent + the SDKs
+# under /build) compiles strictly so a total failure can't silently drop the win.
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv || true
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash \
+      /build/omnigent /build/sdks/python-client /build/sdks/ui
 
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
 
@@ -220,10 +222,13 @@ USER 0
 
 COPY --from=server-builder /opt/venv /opt/venv
 COPY --from=server-builder /build /build
-# Precompile bytecode (venv deps + editable omnigent source) so server cold
-# starts read .pyc instead of recompiling; PYTHONDONTWRITEBYTECODE stays on at
-# runtime. `|| true`: an uncompilable dependency must not fail the build.
-RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv /build/omnigent || true
+# Precompile bytecode so server cold starts read .pyc instead of recompiling;
+# PYTHONDONTWRITEBYTECODE stays on at runtime. Third-party deps compile
+# best-effort (`|| true`); the editable first-party source (omnigent + the SDKs
+# under /build) compiles strictly so a total failure can't silently drop the win.
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv || true
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash \
+      /build/omnigent /build/sdks/python-client /build/sdks/ui
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app

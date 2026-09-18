@@ -395,9 +395,15 @@ RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
 # every second) otherwise pay full compilation each time, since
 # PYTHONDONTWRITEBYTECODE stays on at runtime. unchecked-hash .pyc survive the
 # COPY mtime reset and are trusted without a source check in this immutable
-# image. `|| true`: a dependency that cannot compile only misses the optimization
-# for itself, so it must not fail the build.
+# image. Third-party deps compile best-effort (`|| true`: a rare uncompilable
+# file must not fail the build); the first-party packages then compile strictly,
+# so a total failure (e.g. a broken interpreter path) can't silently drop the
+# optimization for our own code.
 RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv || true
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash \
+      /opt/venv/lib/python*/site-packages/omnigent \
+      /opt/venv/lib/python*/site-packages/omnigent_client \
+      /opt/venv/lib/python*/site-packages/omnigent_ui_sdk
 
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
@@ -445,10 +451,14 @@ RUN apt-get update \
 # path. Copying these to /app/ would break the import paths silently.
 COPY --from=server-builder /opt/venv /opt/venv
 COPY --from=server-builder /build /build
-# Precompile bytecode (venv deps + the editable omnigent source under /build) so
-# server cold starts read .pyc instead of recompiling; PYTHONDONTWRITEBYTECODE
-# stays on at runtime and unchecked-hash .pyc are trusted as-is in the image.
-RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv /build/omnigent || true
+# Precompile bytecode so server cold starts read .pyc instead of recompiling;
+# PYTHONDONTWRITEBYTECODE stays on at runtime and unchecked-hash .pyc are trusted
+# as-is in the image. Third-party deps compile best-effort (`|| true`); the
+# editable first-party source (omnigent + the SDKs, which live under /build, not
+# /opt/venv) compiles strictly so a total failure can't silently drop the win.
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv || true
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash \
+      /build/omnigent /build/sdks/python-client /build/sdks/ui
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app
