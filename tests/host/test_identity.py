@@ -10,9 +10,11 @@ import yaml
 
 from omnigent.host.identity import (
     CONFIG_PATH,
-    identity_config_path,
+    host_config_path,
+    host_identity_env_override_active,
     load_host_identity_if_present,
     load_or_create_host_identity,
+    reset_host_id,
 )
 
 
@@ -23,7 +25,7 @@ def test_identity_scoped_to_data_dir(tmp_path: Path, monkeypatch: pytest.MonkeyP
     instance = tmp_path / "instance-a"
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(instance))
 
-    assert identity_config_path() == instance / "config.yaml"
+    assert host_config_path() == instance / "config.yaml"
     identity = load_or_create_host_identity()
     assert (instance / "config.yaml").exists()
     assert load_or_create_host_identity().host_id == identity.host_id
@@ -51,7 +53,17 @@ def test_default_data_dir_keeps_the_legacy_identity_file(
 ) -> None:
     """Without a data-dir override, identity stays in the legacy config file."""
     monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
-    assert identity_config_path() == CONFIG_PATH
+    monkeypatch.delenv("OMNIGENT_CONFIG_HOME", raising=False)
+    assert host_config_path() == CONFIG_PATH
+
+
+def test_data_dir_wins_over_config_home_for_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Identity is instance state: the data dir outranks the config home."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "instance"))
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "cfg-home"))
+    assert host_config_path() == tmp_path / "instance" / "config.yaml"
 
 
 def test_env_override_wins_over_data_dir_scoping(
@@ -88,6 +100,37 @@ def test_create_identity_when_no_config(tmp_path: Path) -> None:
 
     # Name defaults to machine hostname.
     assert identity.name == socket.gethostname()
+
+
+def test_default_config_path_honors_config_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default identity lookup must stay inside ``OMNIGENT_CONFIG_HOME``."""
+    from omnigent.host import identity as identity_module
+
+    fallback_path = tmp_path / "fallback" / "config.yaml"
+    fallback_path.parent.mkdir(parents=True)
+    fallback_path.write_text(
+        yaml.safe_dump(
+            {
+                "host": {
+                    "host_id": "d6d0ccebce7b4b706d21e23696bb462a",
+                    "name": "fallback-host",
+                }
+            }
+        )
+    )
+    config_home = tmp_path / "isolated"
+    monkeypatch.setattr(identity_module, "CONFIG_PATH", fallback_path)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    # The config-home fallback only applies without a data-dir override.
+    monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+
+    identity = load_or_create_host_identity()
+
+    assert identity.name == socket.gethostname()
+    assert (config_home / "config.yaml").exists()
+    assert yaml.safe_load(fallback_path.read_text())["host"]["name"] == "fallback-host"
 
 
 def test_load_existing_identity(tmp_path: Path) -> None:
@@ -343,3 +386,117 @@ def test_if_present_config_non_uuid_host_id_returns_none(tmp_path: Path) -> None
     )
 
     assert load_host_identity_if_present(config_path) is None
+
+
+def test_reset_host_id_mints_fresh_id_and_keeps_name(tmp_path: Path) -> None:
+    """Resetting replaces host_id but preserves the host name and other config.
+
+    This is the recovery path for a host registration owned by another
+    identity (HTTP 409): the machine must come back as a NEW host id while
+    keeping its human-readable name and unrelated config keys.
+    """
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "host": {"host_id": "a" * 32, "name": "my-laptop"},
+                "server": "https://example.databricksapps.com",
+            }
+        )
+    )
+
+    old_id, new_id = reset_host_id(config_path)
+
+    assert old_id == "a" * 32
+    assert new_id != old_id
+    assert len(new_id) == 32
+    int(new_id, 16)  # raises ValueError if not valid hex
+
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == new_id
+    assert cfg["host"]["name"] == "my-laptop", "reset must not clobber the host name"
+    assert cfg["server"] == "https://example.databricksapps.com", (
+        "reset must not touch unrelated config keys"
+    )
+
+
+def test_reset_host_id_without_existing_identity_creates_one(tmp_path: Path) -> None:
+    """Resetting on a machine with no persisted identity still yields a valid one."""
+    config_path = tmp_path / "config.yaml"
+
+    old_id, new_id = reset_host_id(config_path)
+
+    assert old_id is None
+    assert len(new_id) == 32
+    cfg = yaml.safe_load(config_path.read_text())
+    assert cfg["host"]["host_id"] == new_id
+    assert cfg["host"]["name"] == socket.gethostname()
+
+
+def test_reset_host_id_next_load_returns_the_new_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """After a reset, the normal load path picks up the fresh id."""
+    # The load path honors the managed-host env override; clear it so the
+    # test reads the file identity regardless of the ambient environment.
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    config_path = tmp_path / "config.yaml"
+    before = load_or_create_host_identity(config_path)
+
+    _old, new_id = reset_host_id(config_path)
+    after = load_or_create_host_identity(config_path)
+
+    assert after.host_id == new_id
+    assert after.host_id != before.host_id
+    assert after.name == before.name
+
+
+def test_reset_host_id_write_is_atomic_and_preserves_config_on_dump_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure mid-write leaves the original config intact, not truncated.
+
+    reset-id is a recovery command run when things are already broken, so a
+    crash while serializing the new config must not destroy the existing one.
+    The atomic temp-file-plus-rename write guarantees the target is only
+    replaced once the new content is fully written.
+    """
+    config_path = tmp_path / "config.yaml"
+    original = yaml.safe_dump({"host": {"host_id": "a" * 32, "name": "my-laptop"}})
+    config_path.write_text(original)
+
+    # Blow up during serialization, after the target still holds the original.
+    def _boom(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr("omnigent.host.identity.yaml.safe_dump", _boom)
+
+    with pytest.raises(RuntimeError, match="disk full"):
+        reset_host_id(config_path)
+
+    # The original config survives untouched, and no temp file is left behind.
+    assert config_path.read_text() == original
+    leftovers = [p for p in tmp_path.iterdir() if p.name != "config.yaml"]
+    assert leftovers == [], f"atomic write left temp files behind: {leftovers}"
+
+
+def test_host_identity_env_override_active_reflects_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The override predicate is true when either identity env var is set.
+
+    ``reset_host_id`` writes the config file, but the load path returns the
+    env identity without reading it — so the CLI must detect the override and
+    refuse rather than report a reset that the next load would ignore.
+    """
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
+    assert host_identity_env_override_active() is False
+
+    monkeypatch.setenv("OMNIGENT_HOST_ID", "b" * 32)
+    assert host_identity_env_override_active() is True
+
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.setenv("OMNIGENT_HOST_NAME", "managed-host")
+    assert host_identity_env_override_active() is True

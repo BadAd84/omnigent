@@ -25,7 +25,7 @@ import logging
 import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlsplit, urlunsplit
 
 from omnigent.process_logging import data_dir
 
@@ -77,40 +77,70 @@ def normalize_daemon_target(server_url: str | None, *, base_dir: Path | None = N
 
     :param server_url: Requested server URL, or ``None`` / empty for local mode.
     :param base_dir: Data-directory override; defaults to :func:`data_dir`.
-    :returns: ``"local"`` for the data dir's own instance, else the URL
-        without a trailing slash.
+    :returns: ``"local"`` for local mode or a loopback spelling of the data
+        dir's tracked server, else a canonical server URL.
     """
     if not server_url:
         return _LOCAL_DAEMON_MARKER
-    target = server_url.rstrip("/")
-    if _is_tracked_local_server_url(target, base_dir=base_dir):
+
+    fallback_target = server_url.rstrip("/")
+    try:
+        parsed = urlsplit(server_url)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return fallback_target
+    if not parsed.scheme or hostname is None:
+        return fallback_target
+
+    scheme = parsed.scheme.lower()
+    hostname = hostname.lower()
+    if _is_tracked_local_server(scheme, hostname, port, base_dir=base_dir):
         return _LOCAL_DAEMON_MARKER
-    return target
+    if ":" in hostname:
+        hostname = f"[{hostname}]"
+    if port is None or (scheme, port) in {("http", 80), ("https", 443)}:
+        port_suffix = ""
+    else:
+        port_suffix = f":{port}"
+
+    raw_userinfo, separator, _ = parsed.netloc.rpartition("@")
+    userinfo = f"{raw_userinfo}@" if separator else ""
+    netloc = f"{userinfo}{hostname}{port_suffix}"
+    path = parsed.path.rstrip("/")
+    return urlunsplit((scheme, netloc, path, parsed.query, parsed.fragment))
 
 
 _LOOPBACK_HOSTNAMES = frozenset({"127.0.0.1", "localhost", "::1"})
+_DEFAULT_SCHEME_PORTS = {"http": 80, "https": 443}
 
 
-def _is_tracked_local_server_url(url: str, *, base_dir: Path | None = None) -> bool:
-    """Whether *url* is a loopback spelling of this data dir's tracked server.
+def _is_tracked_local_server(
+    scheme: str,
+    hostname: str,
+    port: int | None,
+    *,
+    base_dir: Path | None = None,
+) -> bool:
+    """Whether the URL parts name a loopback spelling of the tracked server.
 
     The pidfile is the data dir's declaration of which port its local server
     owns. Liveness and health are deliberately not probed here so a target's
     registry key stays stable instead of flapping with server health.
 
-    :param url: Normalized (trailing-slash-stripped) server URL.
+    :param scheme: Lowercased URL scheme, e.g. ``"http"``.
+    :param hostname: Lowercased URL hostname, e.g. ``"localhost"``.
+    :param port: Explicit URL port, or ``None`` for the scheme default.
     :param base_dir: Data-directory override; defaults to :func:`data_dir`.
-    :returns: ``True`` when the URL's host is loopback and its port matches
-        the tracked local server port.
+    :returns: ``True`` when the host is loopback and the effective port
+        matches the tracked local server port.
     """
-    try:
-        parsed = urlparse(url)
-        port = parsed.port
-    except ValueError:
+    if hostname not in _LOOPBACK_HOSTNAMES:
         return False
-    if port is None or parsed.hostname not in _LOOPBACK_HOSTNAMES:
+    effective_port = port if port is not None else _DEFAULT_SCHEME_PORTS.get(scheme)
+    if effective_port is None:
         return False
-    return port == _tracked_local_server_port(base_dir=base_dir)
+    return effective_port == _tracked_local_server_port(base_dir=base_dir)
 
 
 def _tracked_local_server_port(*, base_dir: Path | None = None) -> int | None:

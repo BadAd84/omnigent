@@ -88,13 +88,23 @@ def test_collapsed_spawn_runs_the_daemon_in_local_mode(
     monkeypatch.setattr(cli, "_build_host_daemon_env", _fake_env)
 
     captured_args: list[str] = []
+    spawned = cli._SpawnedDaemonProcess(pid=4321, log_path=str(tmp_path / "daemon.log"))
 
     def _capture_spawn(*, args: list[str], env: dict[str, str]) -> cli._SpawnedDaemonProcess:
         captured_args.extend(args)
-        return cli._SpawnedDaemonProcess(pid=4321, log_path=str(tmp_path / "daemon.log"))
+        return spawned
 
     monkeypatch.setattr(cli, "_spawn_host_daemon_process", _capture_spawn)
-    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda target, spawned: None)
+    claimed = cli._HostDaemonRecord(
+        pid=spawned.pid,
+        target=cli._LOCAL_DAEMON_MARKER,
+        mode="local",
+        server_url=None,
+        log_path=spawned.log_path,
+        started_at=1_000_000,
+        host_id="host_abc",
+    )
+    monkeypatch.setattr(cli, "_wait_for_daemon_claim", lambda target, spawned: claimed)
 
     assert cli._ensure_host_daemon("http://localhost:6767") is False
 
