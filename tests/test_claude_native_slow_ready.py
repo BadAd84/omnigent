@@ -126,7 +126,6 @@ def test_first_message_survives_slow_terminal_startup(
                 assert json.loads(delivered.read_text()) == ["FIRST_PROMPT_DELIVERED"]
                 assert bridge._claude_pane_state(str(socket_path), "main").alive
             elif startup == "dead":
-                # pane_dead can precede pane_dead_status by one tmux tick.
                 with pytest.raises(
                     bridge.ClaudeTerminalExited,
                     match=r"has exited \(status (?:1|unknown)\)",
@@ -136,12 +135,11 @@ def test_first_message_survives_slow_terminal_startup(
                     )
                 assert not delivered.exists()
                 assert excinfo.value.exit_status in {None, "1"}
-                deadline = time.monotonic() + 1.0
                 pane_state = bridge._claude_pane_state(str(socket_path), "main")
-                while pane_state.exit_status is None and time.monotonic() < deadline:
-                    time.sleep(0.01)
-                    pane_state = bridge._claude_pane_state(str(socket_path), "main")
-                assert pane_state == (False, True, "1")
+                assert pane_state.alive is False
+                assert pane_state.exited is True
+                # Older tmux builds leave pane_dead_status empty.
+                assert pane_state.exit_status in {None, "1"}
             else:
                 with pytest.raises(bridge.ClaudePromptTimeout, match="did not become ready"):
                     bridge.inject_user_message(
