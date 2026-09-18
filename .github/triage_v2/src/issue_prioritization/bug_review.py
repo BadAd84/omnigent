@@ -4,8 +4,6 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
-BUG_REVIEW_VERSION = 4
-
 
 class BugActionability(StrEnum):
     ACTIONABLE = "actionable"
@@ -30,7 +28,6 @@ class BugReview:
     actionability: BugActionability
     reason: str
     clarification: BugClarification | None = None
-    rubric_version: int = BUG_REVIEW_VERSION
     source_only_quote: str | None = None
 
     @classmethod
@@ -65,7 +62,6 @@ class BugReview:
             actionability,
             reason,
             clarification,
-            int(value.get("rubric_version", 1)),
             _text(quote, "source_only_quote", 2000) if quote is not None else None,
         )
         if review.source_only_quote and actionability != BugActionability.NON_ACTIONABLE:

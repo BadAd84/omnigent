@@ -8,12 +8,7 @@ import pytest
 
 from issue_prioritization.areas import Area, AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.bug_review import BUG_REVIEW_VERSION, BugActionability, BugReview
-from issue_prioritization.classification import (
-    MAX_BUG_REVIEW_CHARACTERS,
-    Classification,
-    PromptClassifier,
-)
+from issue_prioritization.classification import Classification
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.domain import Impact, IssueType
 from issue_prioritization.labels import LabelDefinition, LabelManifest
@@ -130,48 +125,6 @@ def test_pipeline_reuses_persisted_classification_and_includes_maintainers() -> 
     assert artifacts.runs == [run]
 
 
-@pytest.mark.parametrize("enabled", [False, True])
-@pytest.mark.parametrize("cached_review", [False, True])
-@pytest.mark.parametrize("cached_version", [1, 2, 3, BUG_REVIEW_VERSION])
-def test_bug_review_switch_refreshes_incompatible_cached_classifications(
-    enabled, cached_review, cached_version
-):
-    issue = _bronze(1)
-    review = BugReview(BugActionability.ACTIONABLE, "Concrete session failure.")
-    cached = Classification(
-        issue_number=1,
-        issue_type=IssueType.BUG,
-        impact=Impact.MEDIUM,
-        area_keys=(),
-        component_labels=(),
-        reasoning="Has mitigation",
-        content_hash=issue.content().content_hash,
-        reported_type=IssueType.BUG,
-        bug_review=replace(review, rubric_version=cached_version) if cached_review else None,
-    )
-    classifier = FakeClassifier(replace(cached, bug_review=review if enabled else None))
-    sink = CaptureSink()
-    pipeline = IssuePrioritizationPipeline(
-        source=FakeSource([issue]),
-        classifier=classifier,
-        classifications=FakeClassifications({1: cached}),
-        scores=sink,
-        artifacts=sink,
-        engine=ScoreEngine(ScoringConfig.default(), AreaCatalog({}, {})),
-        review_bugs=enabled,
-    )
-
-    run = pipeline.run("switch-preview")
-
-    assert classifier.calls == int(
-        enabled != cached_review
-        or (enabled and cached_review and cached_version != BUG_REVIEW_VERSION)
-    )
-    assert (run.ranked[0].issue.bug_review is not None) == enabled
-    if enabled:
-        assert run.ranked[0].issue.bug_review.rubric_version == BUG_REVIEW_VERSION
-
-
 def test_pipeline_reclassifies_changed_content() -> None:
     issue = _bronze(1)
     classification = Classification(
@@ -284,34 +237,6 @@ def test_pipeline_propagates_classifier_runtime_error() -> None:
         pipeline.run("run-model-unavailable")
 
     assert sink.runs == []
-
-
-def test_oversized_report_has_no_classification_or_mutation_plan():
-    issue = replace(_bronze(1), body="x" * MAX_BUG_REVIEW_CHARACTERS)
-    sink = CaptureSink()
-    classifications = FakeClassifications({})
-    catalog = AreaCatalog({}, {})
-    pipeline = IssuePrioritizationPipeline(
-        source=FakeSource([issue]),
-        classifier=PromptClassifier(
-            lambda prompt: pytest.fail("Do not classify partial evidence"),
-            catalog,
-            review_bugs=True,
-        ),
-        classifications=classifications,
-        scores=sink,
-        artifacts=sink,
-        engine=ScoreEngine(ScoringConfig.default(), catalog),
-        mutation_planner=MutationPlanner(LabelManifest(()), FakeStates()),
-        review_bugs=True,
-    )
-
-    run = pipeline.run("oversized")
-
-    assert run.ranked == run.mutations == ()
-    assert classifications.updated == []
-    assert len(run.classification_failures) == 1
-    assert "manual review required" in run.classification_failures[0].reason
 
 
 def test_pipeline_refreshes_reported_type_after_label_only_change() -> None:

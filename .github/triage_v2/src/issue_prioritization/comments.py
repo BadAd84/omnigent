@@ -29,10 +29,6 @@ _MISSING_INFORMATION_TEXT = {
     MissingInformation.DIAGNOSTIC_EVIDENCE: (
         "logs, screenshots, or session IDs that show the failure"
     ),
-    MissingInformation.USER_IMPACT: (
-        "the concrete consequence for users, such as a failed action, incorrect result, "
-        "or reliability, performance, or security problem"
-    ),
 }
 _EVIDENCE_TEXT = {
     EvidenceKind.DIRECT_STEPS: "direct reproduction steps",

@@ -24,7 +24,7 @@ from issue_prioritization.mutations import (
     MutationTarget,
     target_from_ranked,
 )
-from issue_prioritization.pipeline import IssueSource, PipelineMode, PipelineRun
+from issue_prioritization.pipeline import PipelineMode, PipelineRun
 
 DUPLICATE_COMMENT_MARKER = "<!-- omnigent-duplicate-check -->"
 
@@ -52,7 +52,7 @@ class GitHubLabels(Protocol):
 
     def upsert_issue_comment(self, issue_number: int, body: str) -> int: ...
 
-    def issue_for_triage(self, issue_number: int) -> BronzeIssue | None: ...
+    def open_issue(self, issue_number: int) -> BronzeIssue | None: ...
 
     def close_issue(self, issue_number: int) -> None: ...
 
@@ -228,13 +228,9 @@ class GitHubClient:
             page += 1
         return tuple(issues[:limit])
 
-    def issue_for_triage(
-        self, issue_number: int, *, include_closed: bool = False
-    ) -> BronzeIssue | None:
+    def open_issue(self, issue_number: int) -> BronzeIssue | None:
         value = self.issue_data(issue_number)
-        if "pull_request" in value or (
-            value.get("state") != "open" and not (include_closed and value.get("state") == "closed")
-        ):
+        if "pull_request" in value or value.get("state") != "open":
             return None
         author = value.get("user")
         author_login = str(author.get("login", "")) if isinstance(author, dict) else ""
@@ -398,25 +394,6 @@ class GitHubClient:
         return json.loads(content) if content else None
 
 
-class GitHubIssueSource:
-    """Refresh snapshot issues with the same evidence used by the closure check."""
-
-    def __init__(self, source: IssueSource, client: GitHubLabels) -> None:
-        self.source = source
-        self.client = client
-
-    def load_open_issues(self) -> list[BronzeIssue]:
-        issues = []
-        for snapshot in self.source.load_open_issues():
-            try:
-                live = self.client.issue_for_triage(snapshot.number)
-            except GitHubNotFound:
-                continue
-            if live is not None:
-                issues.append(replace(live, duplicate_count=snapshot.duplicate_count))
-        return issues
-
-
 class GitHubLegacyPriorityOwnership:
     def __init__(self, client: PriorityLabelHistory, bot_logins: set[str]) -> None:
         self.client = client
@@ -524,7 +501,7 @@ class GitHubMutationSink:
     def _check_non_actionable_closure(self, item: RankedIssue | None) -> None:
         if item is None or not target_from_ranked(item).close_as_non_actionable:
             raise ValueError("closure requires a current non-actionable bug assessment")
-        live = self.client.issue_for_triage(item.issue.number)
+        live = self.client.open_issue(item.issue.number)
         if live is None or live.content().content_hash != item.issue.classification_content_hash:
             raise StaleBugAssessment(
                 f"Issue #{item.issue.number} changed or closed since classification; rerun triage"

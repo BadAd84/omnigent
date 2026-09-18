@@ -116,121 +116,24 @@ later author comment reopens the issue and, while V2 is enabled, runs it again.
 Reopening remains available during a V2 rollback so closed reports are not
 trapped behind the classifier switch.
 
-## Bug review prototype
+## Optional bug review
 
-The optional bug review checks actionability separately from readability. It
-applies only to issues classified as Bug; Feature and Docs retain their existing
-behavior. Enable it locally with `issue-priority-event --review-bugs` alongside
-the arguments in the no-write example above. Keep `--mode dry_run` to preview
-the proposed labels and comment in `event.json` and `comment.md`.
+The issue-event workflow can apply three decisions to Bugs: keep observed failures
+open (adding a concise summary and grounded reproduction steps when hard to read),
+request clarification through the existing `needs-info` process when observation
+is unclear, or explain and close clearly speculative/unexecuted findings.
 
-To preview a branch through GitHub Actions, dispatch Issue Triage with writes
-disabled. Add `include_closed=true` to evaluate a closed issue without reopening
-it; the local CLI equivalent is `--include-closed`, which rejects apply mode.
+Enable it locally with `issue-priority-event --review-bugs --mode dry_run` and the
+arguments above. Inspect the decision and proposed comment in `event.json`.
+Automatic event runs use
+`ISSUE_TRIAGE_BUG_REVIEW_ENABLED` (default `false`). Feature/Docs and the periodic
+job keep their existing assessment.
 
-```bash
-gh workflow run issue-triage.yml --repo omnigent-ai/omnigent \
-  --ref <branch> -f issue_number=<number> \
-  -f apply_labels=false -f post_comment=false \
-  -f review_bugs=true -f include_closed=true
-```
-
-Manual V2 dry runs check out the selected branch revision. Download the
-`issue-priority-v2-<number>-<run-id>` artifact to inspect `comment.md` and
-`event.json`; the latter records the checked-out commit and the dry-run mode.
-
-- **Actionable, already clear:** normal triage, without an additional summary.
-- **Actionable, hard to read:** the existing bot-owned comment gains a concise
-  problem summary and, when supplied by the author, clearer reproduction steps.
-  The original issue is untouched. Reassessment updates the same comment.
-- **Clearly source-only or hypothetical finding:** post an explanation
-  and close immediately as not planned in apply mode. A reachable code path,
-  predicted consequence, or reproduction recipe nobody ran is not enough.
-- **Unclear whether the described failure occurred, or missing investigation
-  details:** `needs-info` with a targeted question and the existing seven-day
-  expiry/reopen process. Missing logs or an explicit reproduction statement alone
-  do not justify immediate closure.
-
-Immediate closure removes `needs-info`; reporters who later observe a failure
-are asked to open a new issue. These reports have no reply deadline and do not
-enter the author-reply reopening workflow. Security, duplicate, and
-pinned issues remain exempt from closure. The shared mutation sink posts the
-recommendation before closing and checks live report content and author replies
-before acting. The comment does not claim that closure succeeded. A stale
-assessment skips closure for that issue and lets the remaining batch continue;
-GitHub outages and invalid assessments still fail the run. Exempt reports explain
-why closure was skipped and have no response deadline. Dry-run artifacts expose
-`close_as_non_actionable` without writing comments or changing issue state.
-
-Bug review reads the complete title, body, and all author follow-ups, including
-older and long comments. Both model calls see the full evidence. Reports exceeding
-100,000 characters (title plus assembled body) are skipped for manual review,
-without a comment, labels, or a request to repeat information already provided.
-
-The report must describe an actual incorrect result experienced through a user
-workflow. CLI/API failures, data loss, reliability, and performance count as
-user-facing impact. Intermittent observations, diagnostics, or executed tests
-can qualify without a deterministic reproduction. Code analysis may explain an
-observed problem, but cannot establish it alone. Suspected AI authorship and
-writing style are not rejection criteria. For valid reports, poor readability
-is repaired in the comment rather than used to request more information.
-
-The model assesses the supplied report and author follow-ups; it does not inspect
-source code or reproduce the bug. A plain account of a failure does not need
-first-person wording or the phrase "I reproduced it". When a concrete symptom is
-described but its observation is unclear, ask whether it occurred instead of
-assuming it was hypothetical. A validation section proposing synthetic tests
-does not establish that the original symptom was unobserved. Immediate closure
-requires the report to clearly rest only on source analysis or speculation.
-
-An immediate-closure assessment must also supply a `source_only_quote` establishing
-that basis. The parser rejects invented quotes and turns a closure without a
-supporting quote into `needs-info`. Quotes make the assessment reviewable; their
-presence does not independently prove the model interpreted them correctly.
-A separate focused model call must confirm that the quote establishes a speculative
-origin and that the report contains no contradicting observation. Disagreement
-or uncertainty becomes `needs-info`; a failed model call stops the run without
-issue writes. This is still model-based assessment, not independent verification.
-
-Each refined reproduction step carries an exact supporting `source_quote` in
-the artifact; the parser rejects quotes absent from the supplied report. This
-checks provenance, not semantic correctness or reproducibility. The prompt
-forbids invented steps and preserves uncertainty; the comment identifies the
-steps as restated and unverified. Unexecuted investigation sequences do not
-qualify a code-only report for a summary or refined reproduction steps.
-
-Run the evaluation cases, including the code-only report from #3951 and the
-ambiguous terminal-recreation report from #7609,
-against a configured serving endpoint:
-
-```bash
-uv run --frozen --project .github/triage_v2 python .github/triage_v2/evaluate_bug_review.py \
-  --model-endpoint <endpoint> \
-  --profile <profile> \
-  --output-dir /tmp/bug-review-preview
-```
-
-Use a new or empty output directory for each run; existing previews are never
-reused. This command makes model calls but has no GitHub client or write path. Compare
-each case's `input.json` with `comment.md`; `results.json` records the expected
-decision checks. Review summaries for ordinary language, retained uncertainty,
-and reproduction steps faithful to the inputs. The fixtures cover clear and
-verbose observed bugs, unsupported claims, code-only reports, unexecuted recipes,
-observed bugs with code analysis, intermittent failures, Feature/Docs exclusions,
-and prompt injection. Passing these examples is not a
-measurement of precision across real issues.
-
-Production defaults remain off. The event workflow reads
-`ISSUE_TRIAGE_BUG_REVIEW_ENABLED` (default `false`). The periodic bundle uses the
-`review_bugs` variable/job parameter (default `false`); configure both together
-so periodic assessments do not overwrite event assessments with the old rubric.
-The periodic pipeline refreshes cached bugs when this option or the review
-rubric version changes. With bug review enabled, it refreshes snapshot issues
-from GitHub using the same evidence assembly as event triage and the final closure
-check. This requires `--github-secret-scope` for read access even in dry-run mode;
-the write gate remains independent. It persists the optional review in
-`bug_review_json`; existing rows without it remain readable. No deployment or
-repository-variable change is needed to run a local preview.
+Closure requires an exact supporting quote, a second model confirmation against
+all report evidence, and live content checks. Security/duplicate/pinned issues
+remain exempt. Reports over 100,000 characters are skipped for manual review.
+Immediate closures remove `needs-info` and ask reporters to open a new issue if
+they observe the failure. Model assessment does not reproduce or verify the bug.
 
 ## Databricks dry-run
 

@@ -9,7 +9,7 @@ from string import Template
 from typing import Protocol
 
 from issue_prioritization.areas import AreaCatalog
-from issue_prioritization.bug_review import BUG_REVIEW_VERSION, BugActionability, BugReview
+from issue_prioritization.bug_review import BugActionability, BugReview
 from issue_prioritization.domain import (
     EvidenceKind,
     Impact,
@@ -113,9 +113,7 @@ class PromptClassifier:
         bug_review = None
         reasoning = str(value.get("reasoning", ""))
         if self.review_bugs and issue_type == IssueType.BUG:
-            bug_review = replace(
-                BugReview.from_mapping(value.get("bug_review")), rubric_version=BUG_REVIEW_VERSION
-            )
+            bug_review = BugReview.from_mapping(value.get("bug_review"))
             actionable = bug_review.actionability == BugActionability.ACTIONABLE
             if actionable != (information_status == InformationStatus.SUFFICIENT):
                 raise ValueError("bug actionability disagrees with information status")

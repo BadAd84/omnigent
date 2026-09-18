@@ -7,7 +7,6 @@ from pathlib import Path
 
 from issue_prioritization.artifacts import RankedIssue, write_artifacts
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.bug_review import BugReview
 from issue_prioritization.classification import Classification
 from issue_prioritization.comments import build_triage_comment
 from issue_prioritization.config import ScoringConfig
@@ -25,7 +24,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9_]+(?:\.[A-Za-z0-9_]+){2}$")
 _CLASSIFICATION_SCHEMA = """issue_number BIGINT, issue_type STRING, impact STRING,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, reasoning STRING,
 content_hash STRING, reported_type STRING, evidence_kind STRING,
-information_status STRING, missing_information ARRAY<STRING>, bug_review_json STRING"""
+information_status STRING, missing_information ARRAY<STRING>"""
 _SCORE_SCHEMA = """run_id STRING, mode STRING, regrade BOOLEAN,
 adopt_legacy_bot_priorities BOOLEAN, legacy_priorities_adopted BIGINT,
 scored_at TIMESTAMP, rank BIGINT, previous_rank BIGINT, rank_delta BIGINT,
@@ -33,7 +32,7 @@ issue_number BIGINT, title STRING, url STRING, issue_type STRING, impact STRING,
 classification_reasoning STRING, score DOUBLE, upvote_count BIGINT, duplicate_count BIGINT,
 current_priority STRING, proposed_priority STRING,
 reported_type STRING, type_label_mismatch BOOLEAN, evidence_kind STRING,
-information_status STRING, missing_information ARRAY<STRING>, bug_review_json STRING,
+information_status STRING, missing_information ARRAY<STRING>,
 area_keys ARRAY<STRING>, component_labels ARRAY<STRING>, breakdown_json STRING,
 labels_add ARRAY<STRING>, labels_remove ARRAY<STRING>, mutation_blocked ARRAY<STRING>"""
 _BOT_STATE_SCHEMA = """issue_number BIGINT, priority STRING, components ARRAY<STRING>"""
@@ -84,9 +83,6 @@ class SparkClassificationRepository:
                 "evidence_kind": item.evidence_kind.value,
                 "information_status": item.information_status.value,
                 "missing_information": [value.value for value in item.missing_information],
-                "bug_review_json": json.dumps(item.bug_review.as_dict())
-                if item.bug_review
-                else None,
             }
             for item in classifications
         ]
@@ -100,7 +96,6 @@ class SparkClassificationRepository:
             "evidence_kind": "STRING",
             "information_status": "STRING",
             "missing_information": "ARRAY<STRING>",
-            "bug_review_json": "STRING",
         }
         missing_columns = [name for name in definitions if name not in _field_names(schema)]
         if missing_columns:
@@ -164,9 +159,6 @@ class SparkScoreSink:
                     "evidence_kind": issue.evidence_kind.value,
                     "information_status": issue.information_status.value,
                     "missing_information": [value.value for value in issue.missing_information],
-                    "bug_review_json": (
-                        json.dumps(issue.bug_review.as_dict()) if issue.bug_review else None
-                    ),
                     "score": float(result.score),
                     "upvote_count": issue.upvote_count,
                     "duplicate_count": issue.duplicate_count,
@@ -225,9 +217,7 @@ class VolumeArtifactSink:
                     "components": list(plan.target.components),
                     "issue_type": plan.target.issue_type,
                     "needs_info": plan.target.needs_info,
-                    "close_as_non_actionable": plan.target.close_as_non_actionable,
                 },
-                "close_as_non_actionable": plan.close_as_non_actionable,
                 "labels_add": list(plan.labels_add),
                 "labels_remove": list(plan.labels_remove),
                 "blocked": list(plan.blocked),
@@ -339,12 +329,6 @@ def _classification_from_row(row: object) -> Classification:
         missing_information=tuple(
             MissingInformation.parse(item)
             for item in (getattr(row, "missing_information", None) or ())
-        ),
-        bug_review=(
-            BugReview.from_mapping(json.loads(row.bug_review_json))
-            if getattr(row, "bug_review_json", None)
-            and IssueType.parse(row.issue_type) == IssueType.BUG
-            else None
         ),
     )
 

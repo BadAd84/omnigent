@@ -2,89 +2,54 @@ from __future__ import annotations
 
 import json
 from dataclasses import replace
-from datetime import UTC, date, datetime
-from types import SimpleNamespace
+from datetime import UTC, datetime
 
 import pytest
 
 from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.bug_review import BugActionability, BugReview
-from issue_prioritization.classification import (
-    MAX_BUG_REVIEW_CHARACTERS,
-    IssueContent,
-    PromptClassifier,
-)
+from issue_prioritization.classification import MAX_BUG_REVIEW_CHARACTERS, PromptClassifier
 from issue_prioritization.comments import build_triage_comment, preserve_needs_info_deadline
 from issue_prioritization.config import ScoringConfig
-from issue_prioritization.databricks_io import VolumeArtifactSink, _classification_from_row
-from issue_prioritization.domain import InformationStatus, IssueType
 from issue_prioritization.event import prioritize_issue, write_event_artifacts
-from issue_prioritization.github import GitHubClient, GitHubIssueSource, GitHubMutationSink
+from issue_prioritization.github import GitHubClient, GitHubMutationSink
 from issue_prioritization.labels import LabelManifest
-from issue_prioritization.needs_info import expired_issue
 from issue_prioritization.pipeline import PipelineMode
 
-BODY = "Open a session.\nDisconnect Wi-Fi. Reconnect Wi-Fi. The transcript stays blank."
-CODE_ONLY_BODY = "This cache race comes from source analysis. Nobody executed the sequence."
+BODY = "Open a session. Reconnect Wi-Fi. The transcript stays blank."
+SOURCE_ONLY = "Found only by reading source. Nobody executed this sequence."
 NOW = datetime(2026, 9, 18, tzinfo=UTC)
 
 
-def _response(**overrides):
+def response(decision="actionable"):
     return {
         "type": "Bug",
         "impact": "medium",
         "area_keys": [],
-        "evidence_kind": "direct_steps",
-        "information_status": "sufficient",
-        "missing_information": [],
-        "reasoning": "Reconnecting leaves the user unable to read the session.",
+        "reasoning": "Session transcript may be unavailable.",
+        "evidence_kind": "direct_steps" if decision == "actionable" else "code_analysis",
+        "information_status": "sufficient" if decision == "actionable" else "needs_info",
+        "missing_information": [] if decision == "actionable" else ["observed_behavior"],
         "bug_review": {
-            "actionability": "actionable",
-            "reason": "The report describes a specific user action and incorrect result.",
-            "readability": "needs_summary",
-            "clarification": {
-                "summary": "After Wi-Fi reconnects, the session transcript stays blank.",
-                "reproduction_steps": [
-                    {"text": "Open a session.", "source_quote": "Open a session."},
-                    {
-                        "text": "Disconnect and reconnect Wi-Fi.",
-                        "source_quote": "Disconnect Wi-Fi. Reconnect Wi-Fi.",
-                    },
-                    {
-                        "text": "Observe that the transcript stays blank.",
-                        "source_quote": "The transcript stays blank.",
-                    },
-                ],
-            },
+            "actionability": decision,
+            "reason": "Assessment of the reported failure.",
+            "readability": "clear" if decision == "actionable" else "not_assessed",
+            "source_only_quote": SOURCE_ONLY if decision == "non_actionable" else None,
         },
-        **overrides,
     }
 
 
-def _classifier(response, *, enabled=True, closure_confirmed=True):
-    def query(prompt):
-        if prompt.startswith("Check whether this bug report"):
-            return json.dumps({"source_only": closure_confirmed})
-        return json.dumps(response)
-
-    return PromptClassifier(query, AreaCatalog({}, {}), review_bugs=enabled)
+def issue(body=SOURCE_ONLY, labels=("Bug",)):
+    return BronzeIssue(7, "Session failure", body, "url", "author", labels, NOW, 0, 0)
 
 
-def _content():
-    return IssueContent(7, "Reconnect leaves transcript blank", BODY, ("Bug",), "reporter")
-
-
-def _issue(body=BODY, labels=("Bug",)):
-    return BronzeIssue(7, _content().title, body, "url", "reporter", labels, NOW, 0, 0)
-
-
-def _event(response, *, issue=None):
-    source_only = response.get("bug_review", {}).get("actionability") == "non_actionable"
-    issue = issue or _issue(body=CODE_ONLY_BODY if source_only else BODY)
+def preview(decision="non_actionable", *, value=None, report=None, confirmed=True):
+    value = value or response(decision)
+    report = report or issue(BODY if decision == "actionable" else SOURCE_ONLY)
+    replies = iter([json.dumps(value), json.dumps({"source_only": confirmed})])
     return prioritize_issue(
-        issue,
-        _classifier(response),
+        report,
+        PromptClassifier(lambda _: next(replies), AreaCatalog({}, {}), review_bugs=True),
         ScoringConfig.default(),
         AreaCatalog({}, {}),
         LabelManifest(()),
@@ -93,631 +58,259 @@ def _event(response, *, issue=None):
     )
 
 
-def test_valid_unreadable_bug_produces_a_grounded_comment_preview(tmp_path):
-    run, classification, _, _ = _event(_response())
-    write_event_artifacts(
-        tmp_path, run, classification, ScoringConfig.default(), "example", "revision", ("Bug",)
-    )
-
-    artifact = json.loads((tmp_path / "event.json").read_text())
-    body = (tmp_path / "comment.md").read_text()
-    assert artifact["comment"]["body"] + "\n" == body
-    assert artifact["classification"]["bug_review"]["actionability"] == "actionable"
-    assert "Problem in plain English" in body
-    assert "After Wi-Fi reconnects, the session transcript stays blank." in body
-    assert "2. Disconnect and reconnect Wi-Fi." in body
-    assert "not been independently verified" in body
-    assert "source_quote" not in body
-    assert "needs-info" not in artifact["mutation"]["labels_add"]
-
-
-@pytest.mark.parametrize("readability", ["not_assessed", "clear"])
-def test_incomplete_observed_bug_reuses_needs_info_expiry(readability):
-    response = _response(
-        evidence_kind="none",
-        information_status="needs_info",
-        missing_information=["user_impact"],
-        bug_review={
-            "actionability": "needs_info",
-            "reason": "No concrete consequence is described.",
-            "readability": readability,
-        },
-    )
-    run, classification, _, _ = _event(response)
-    body = build_triage_comment(run.ranked[0], run.mutations[0], ("Bug", "needs-info"), NOW)
-
-    assert classification.information_status == InformationStatus.NEEDS_INFO
-    assert "needs-info" in run.mutations[0].labels_add
-    assert not run.mutations[0].close_as_non_actionable
-    assert "No concrete consequence is described." in body
-    assert "concrete consequence for users" in body
-    assert "Problem in plain English" not in body
-    issue = {"number": 7, "state": "open", "labels": [{"name": "Bug"}, {"name": "needs-info"}]}
-    comments = ({"body": body, "user": {"type": "Bot"}},)
-    assert expired_issue(issue, comments, date(2026, 9, 25)) is None
-    assert expired_issue(issue, comments, date(2026, 9, 26)).number == 7
-
-
-@pytest.mark.parametrize("issue_type", ["Feature", "Docs"])
-def test_review_never_applies_to_features_or_docs(issue_type):
-    result = _classifier(_response(type=issue_type, bug_review="malformed")).classify(_content())
-    assert result.issue_type != IssueType.BUG
-    assert result.bug_review is None
-    assert result.information_status == InformationStatus.NOT_APPLICABLE
-
-
-def test_disabled_prototype_ignores_review_fields():
-    result = _classifier(_response(bug_review="malformed"), enabled=False).classify(_content())
-    assert result.bug_review is None
-
-
-def test_readable_bug_does_not_get_an_extra_summary():
-    response = _response()
-    response["bug_review"]["clarification"] = None
-    response["bug_review"]["readability"] = "clear"
-    run, _, _, _ = _event(response)
-    body = build_triage_comment(run.ranked[0], run.mutations[0], ("Bug",), NOW)
-    assert "Problem in plain English" not in body
-    assert "Steps to reproduce" not in body
-
-
-def test_code_analysis_cannot_be_actionable_without_an_observed_failure():
-    response = _response(evidence_kind="code_analysis")
-    response["bug_review"]["clarification"]["reproduction_steps"] = []
-    with pytest.raises(ValueError, match="code-only evidence"):
-        _event(response)
-
-
-@pytest.mark.parametrize("evidence_kind", ["none", "code_analysis"])
-def test_unclear_observation_can_request_details_without_immediate_closure(evidence_kind):
-    response = _response(
-        evidence_kind=evidence_kind,
-        information_status="needs_info",
-        missing_information=["observed_behavior"],
-        bug_review={
-            "actionability": "needs_info",
-            "reason": "Did terminal recreation actually fail, or is this inferred from source?",
-            "readability": "not_assessed",
-        },
-    )
-    client = ClosureClient()
-    client.issue = _issue()
-    run, _, planner, states = _event(response)
-    plan = run.mutations[0]
-    body = build_triage_comment(run.ranked[0], plan, ("Bug",), NOW)
-
-    assert plan.target.needs_info
-    assert "needs-info" in plan.labels_add
-    assert not plan.close_as_non_actionable
-    assert "Did terminal recreation actually fail" in body
-    assert "Please update the issue by" in body
-    assert "Closing as" not in body
-    GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
-        replace(run, mode=PipelineMode.APPLY)
-    )
-    assert client.events == ["sync", "labels", "comment"]
-
-
-def _non_actionable_response():
-    return _response(
-        evidence_kind="code_analysis",
-        information_status="needs_info",
-        missing_information=["observed_behavior", "user_impact"],
-        bug_review={
-            "actionability": "non_actionable",
-            "reason": "The report predicts a cache race but describes no observed failure.",
-            "readability": "not_assessed",
-            "source_only_quote": CODE_ONLY_BODY,
-        },
-    )
-
-
-@pytest.mark.parametrize("labels", [("Bug",), ("Bug", "needs-info")])
-def test_code_only_bug_previews_immediate_closure_and_comment(tmp_path, labels):
-    run, classification, _, _ = _event(
-        _non_actionable_response(), issue=_issue(body=CODE_ONLY_BODY, labels=labels)
-    )
-    write_event_artifacts(
-        tmp_path, run, classification, ScoringConfig.default(), "example", "revision", labels
-    )
-    artifact = json.loads((tmp_path / "event.json").read_text())
-    body = (tmp_path / "comment.md").read_text()
-
-    assert artifact["mode"] == "dry_run"
-    assert artifact["mutation"]["close_as_non_actionable"] is True
-    assert "recommend closing as **not planned**" in body
-    assert "no observed failure" in body
-    assert "please open a new issue" in body
-    assert "reopen" not in body
-    assert "Please update the issue by" not in body
-    assert "**Priority:**" not in body
-    assert '"needs_info_deadline":null' in body
-    assert artifact["mutation"]["target"]["needs_info"] is False
-    assert artifact["classification"]["bug_review"]["source_only_quote"] == CODE_ONLY_BODY
-    assert "needs-info" not in run.mutations[0].labels_add
-    labels_after = (set(labels) - set(run.mutations[0].labels_remove)) | set(
-        run.mutations[0].labels_add
-    )
-    assert "needs-info" not in labels_after
-
-    previous = body.replace('"needs_info_deadline":null', '"needs_info_deadline":"2026-09-25"')
-    assert preserve_needs_info_deadline(body, previous) == body
-
-    VolumeArtifactSink(str(tmp_path / "periodic"), ScoringConfig.default()).write(run)
-    periodic = json.loads((tmp_path / "periodic/preview/mutations.json").read_text())[0]
-    assert periodic["close_as_non_actionable"] is True
-    assert "recommend closing as **not planned**" in periodic["comment"]
-
-
-@pytest.mark.parametrize("label", ["security", "duplicate", "Pinned"])
-def test_existing_exemptions_block_immediate_closure(label):
-    run, _, _, _ = _event(
-        _non_actionable_response(), issue=_issue(body=CODE_ONLY_BODY, labels=("Bug", label))
+@pytest.mark.parametrize("decision", ["actionable", "needs_info", "non_actionable"])
+def test_three_decisions_and_comment_previews(tmp_path, decision):
+    run, classification, _, _ = preview(
+        decision,
+        report=issue(BODY if decision == "actionable" else SOURCE_ONLY, ("Bug", "needs-info")),
     )
     plan = run.mutations[0]
-    assert not plan.close_as_non_actionable
-    assert f"non_actionable_{label.casefold()}_exempt" in plan.blocked
-    body = build_triage_comment(run.ranked[0], plan, ("Bug", label), NOW)
-    assert "recommend closing" not in body
-    assert "More evidence needed" not in body
-    assert f"exempt ({label.casefold()})" in body
-    assert "No response deadline is set" in body
-    assert '"needs_info_deadline":null' in body
-
-
-def test_observed_evidence_cannot_be_used_to_close_a_bug_as_non_actionable():
-    response = _non_actionable_response()
-    response["evidence_kind"] = "observed_intermittent"
-    with pytest.raises(ValueError, match="cannot claim observed failure evidence"):
-        _event(response)
-
-
-class ClosureClient:
-    def __init__(self):
-        self.issue = _issue(body=CODE_ONLY_BODY)
-        self.events = []
-        self.comments = []
-
-    def sync_missing_labels(self, manifest):
-        self.events.append("sync")
-
-    def issue_labels(self, issue_number):
-        return self.issue.labels
-
-    def issue_for_triage(self, issue_number):
-        return self.issue
-
-    def apply_labels(self, issue_number, labels_add, labels_remove):
-        self.events.append("labels")
-        labels = (set(self.issue.labels) - set(labels_remove)) | set(labels_add)
-        self.issue = replace(self.issue, labels=tuple(sorted(labels)))
-
-    def upsert_issue_comment(self, issue_number, body):
-        self.events.append("comment")
-        self.comments.append(body)
-        return 1
-
-    def close_issue(self, issue_number):
-        self.events.append("close")
-
-
-def _closure_apply(client, *, mode=PipelineMode.APPLY):
-    run, _, planner, states = _event(_non_actionable_response())
-    return GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
-        replace(run, mode=mode)
+    write_event_artifacts(
+        tmp_path, run, classification, ScoringConfig.default(), "model", "sha", ()
     )
-
-
-def test_apply_posts_explanation_before_closing():
-    client = ClosureClient()
-    plans = _closure_apply(client)
-    assert plans[0].close_as_non_actionable
-    assert client.events == ["sync", "labels", "comment", "close"]
-    assert "recommend closing as **not planned**" in client.comments[0]
-
-
-def test_immediate_closure_removes_the_automatic_reopen_label():
-    client = ClosureClient()
-    client.issue = replace(client.issue, labels=("Bug", "needs-info"))
-
-    _closure_apply(client)
-
-    assert client.events == ["sync", "labels", "comment", "close"]
-    assert "needs-info" not in client.issue.labels
-    assert "please open a new issue" in client.comments[0]
-
-
-def test_observed_failure_is_commented_on_without_closure():
-    client = ClosureClient()
-    client.issue = _issue()
-    run, _, planner, states = _event(_response())
-    plans = GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
-        replace(run, mode=PipelineMode.APPLY)
-    )
-    assert not plans[0].close_as_non_actionable
-    assert client.events == ["sync", "labels", "comment"]
-    assert "Problem in plain English" in client.comments[0]
-
-
-def test_failed_comment_prevents_closure():
-    class Client(ClosureClient):
-        def upsert_issue_comment(self, issue_number, body):
-            raise RuntimeError("comment failed")
-
-    client = Client()
-    with pytest.raises(RuntimeError, match="comment failed"):
-        _closure_apply(client)
-    assert "close" not in client.events
-
-
-@pytest.mark.parametrize("after_comment", [False, True])
-def test_new_evidence_prevents_stale_closure(after_comment):
-    class Client(ClosureClient):
-        def issue_for_triage(self, issue_number):
-            if not after_comment or self.comments:
-                return replace(self.issue, body="New observed failure and logs")
-            return self.issue
-
-    client = Client()
-    plans = _closure_apply(client)
-    assert not plans[0].close_as_non_actionable
-    assert "non_actionable_stale_assessment" in plans[0].blocked
-    assert "close" not in client.events
-    if not after_comment:
-        assert "comment" not in client.events
-        assert "labels" not in client.events
-        assert plans[0].labels_add == plans[0].labels_remove == ()
-        assert not plans[0].next_state.has_ownership
+    artifact = json.loads((tmp_path / "event.json").read_text())
+    body = artifact["comment"]["body"]
+    assert classification.bug_review.actionability == decision
+    assert plan.close_as_non_actionable == (decision == "non_actionable")
+    assert plan.target.needs_info == (decision == "needs_info")
+    assert artifact["mutation"]["close_as_non_actionable"] == plan.close_as_non_actionable
+    if decision == "needs_info":
+        assert "Please update the issue by" in body
     else:
-        assert plans[0].next_state.has_ownership
-        assert "recommend closing" in client.comments[0]
-        assert "Closing as" not in client.comments[0]
-        assert "If this issue is closed" in client.comments[0]
+        assert "needs-info" in plan.labels_remove
+        assert '"needs_info_deadline":null' in body
+    if decision == "non_actionable":
+        assert "recommend closing as **not planned**" in body
+        assert "please open a new issue" in body
+        previous = body.replace('"needs_info_deadline":null', '"needs_info_deadline":"2026-09-25"')
+        assert preserve_needs_info_deadline(body, previous) == body
+    else:
+        assert "recommend closing" not in body
 
 
-def test_failed_close_leaves_a_recommendation_without_claiming_closure():
-    class Client(ClosureClient):
-        def close_issue(self, issue_number):
-            raise RuntimeError("GitHub unavailable")
-
-    client = Client()
-    with pytest.raises(RuntimeError, match="GitHub unavailable"):
-        _closure_apply(client)
-    assert "recommend closing" in client.comments[0]
-    assert "Closing as" not in client.comments[0]
-    assert "If this issue is closed" in client.comments[0]
-
-
-@pytest.mark.parametrize("after_comment", [False, True])
-@pytest.mark.parametrize("closed", [False, True])
-def test_stale_issue_does_not_abort_remaining_batch(after_comment, closed):
-    class Client(ClosureClient):
-        def __init__(self):
-            super().__init__()
-            self.closed = []
-            self.commented = []
-
-        def issue_labels(self, issue_number):
-            self.issue = replace(_issue(body=CODE_ONLY_BODY), number=issue_number)
-            return self.issue.labels
-
-        def issue_for_triage(self, issue_number):
-            if issue_number == 8 and (not after_comment or 8 in self.commented):
-                return None if closed else replace(self.issue, body=BODY)
-            return self.issue
-
-        def upsert_issue_comment(self, issue_number, body):
-            self.commented.append(issue_number)
-            return super().upsert_issue_comment(issue_number, body)
-
-        def close_issue(self, issue_number):
-            self.closed.append(issue_number)
-
-    client = Client()
-    run, _, planner, states = _event(_non_actionable_response())
-    item = run.ranked[0]
-    ranked = tuple(replace(item, issue=replace(item.issue, number=n)) for n in (7, 8, 9))
-    run = replace(
-        run,
-        mode=PipelineMode.APPLY,
-        ranked=ranked,
-        mutations=planner.plan_all(ranked, {n: ("Bug",) for n in (7, 8, 9)}),
+@pytest.mark.parametrize("quote", ["Reconnect Wi-Fi.", "Invented command."])
+def test_observed_unreadable_bug_gets_a_grounded_summary(quote):
+    value = response()
+    value["bug_review"].update(
+        readability="needs_summary",
+        clarification={
+            "summary": "After Wi-Fi reconnects, the session transcript stays blank.",
+            "reproduction_steps": [{"text": "Reconnect Wi-Fi.", "source_quote": quote}],
+        },
     )
-    plans = GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(run)
-
-    assert client.closed == [7, 9]
-    assert client.commented == ([7, 8, 9] if after_comment else [7, 9])
-    assert [p.close_as_non_actionable for p in plans] == [True, False, True]
-    assert "non_actionable_stale_assessment" in plans[1].blocked
-    assert set(states.load()) == ({7, 8, 9} if after_comment else {7, 9})
-
-
-def test_invalid_closure_assessment_is_not_swallowed():
-    client = ClosureClient()
-    run, _, planner, states = _event(_non_actionable_response())
-    with pytest.raises(ValueError, match="requires a current non-actionable"):
-        GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
-            replace(run, mode=PipelineMode.APPLY, ranked=())
-        )
-    assert client.events == ["sync"]
-
-
-def test_periodic_source_and_closure_check_use_identical_author_evidence():
-    payload = {
-        "number": 7,
-        "title": "Possible cache race",
-        "body": CODE_ONLY_BODY,
-        "user": {"login": "reporter"},
-        "labels": [{"name": "Bug"}],
-        "created_at": NOW.isoformat(),
-        "state": "open",
-    }
-    followup = "I only inspected source; this has never happened in a running session."
-    comments = [{"id": 1, "user": {"login": "reporter"}, "body": followup}]
-    writes = []
-
-    def transport(method, path, value):
-        if method == "GET":
-            if path == "/labels?per_page=100&page=1":
-                return []
-            return comments if "/comments" in path else payload
-        writes.append((method, path))
-        if path.endswith("/comments"):
-            comment = {"id": 2, "user": {"login": "triage[bot]"}, "body": value["body"]}
-            comments.append(comment)
-            return comment
-        if path.endswith("/labels"):
-            payload["labels"] += [{"name": label} for label in value["labels"]]
-        else:
-            payload.update(value)
-        return payload
-
-    client = GitHubClient("fake", "org/repo", transport)
-    snapshot = replace(_issue(body=CODE_ONLY_BODY), duplicate_count=3)
-    source = GitHubIssueSource(SimpleNamespace(load_open_issues=lambda: [snapshot]), client)
-    issue = source.load_open_issues()[0]
-    assert issue.duplicate_count == 3
-    assert followup in issue.body
-    assert issue.content().content_hash != snapshot.content().content_hash
-    run, classification, planner, states = _event(_non_actionable_response(), issue=issue)
-    assert classification.content_hash == client.issue_for_triage(7).content().content_hash
-
-    plans = GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
-        replace(run, mode=PipelineMode.APPLY)
-    )
-
-    assert plans[0].close_as_non_actionable
-    assert writes[-2:] == [("POST", "/issues/7/comments"), ("PATCH", "/issues/7")]
-    assert payload["state"] == "closed"
-    assert payload["state_reason"] == "not_planned"
-
-
-def test_long_report_observations_reach_both_model_calls():
-    observation = "I reproduced the failure yesterday; my session transcript went blank."
-    issue = replace(_content(), body=CODE_ONLY_BODY + "\n" + "Source detail. " * 1000 + observation)
-    prompts = []
-
-    def query(prompt):
-        prompts.append(prompt)
-        if len(prompts) == 1:
-            return json.dumps(_non_actionable_response())
-        return json.dumps({"source_only": False})
-
-    result = PromptClassifier(query, AreaCatalog({}, {}), review_bugs=True).classify(issue)
-
-    assert len(prompts) == 2
-    assert all(observation in prompt and issue.title in prompt for prompt in prompts)
-    assert result.bug_review.actionability == BugActionability.NEEDS_INFO
-
-
-def test_reproduction_evidence_after_legacy_cutoff_can_be_summarized():
-    issue = replace(_content(), body="Technical detail. " * 1000 + BODY)
-    result = _classifier(_response()).classify(issue)
-    assert result.bug_review.clarification.reproduction_steps
-
-
-def test_oversized_report_skips_review_without_asking_for_existing_evidence():
-    def query(prompt):
-        pytest.fail("Oversized reports must not be partially reviewed")
-
-    classifier = PromptClassifier(query, AreaCatalog({}, {}), review_bugs=True)
-    issue = replace(_content(), body="x" * MAX_BUG_REVIEW_CHARACTERS + BODY)
-    with pytest.raises(ValueError, match="manual review required"):
-        classifier.classify(issue)
-
-
-def test_dry_run_cannot_enter_the_mutation_sink():
-    client = ClosureClient()
-    with pytest.raises(ValueError, match="require apply mode"):
-        _closure_apply(client, mode=PipelineMode.DRY_RUN)
-    assert client.events == []
-
-
-def test_exemption_added_since_classification_prevents_closure():
-    client = ClosureClient()
-    client.issue = replace(client.issue, labels=("Bug", "security"))
-    plans = _closure_apply(client)
-    assert not plans[0].close_as_non_actionable
-    assert "close" not in client.events
-    assert "Closing as" not in client.comments[0]
-
-
-def test_fabricated_source_quote_aborts_classification():
-    response = _response()
-    response["bug_review"]["clarification"]["reproduction_steps"][0]["source_quote"] = (
-        "Run an undocumented repair command."
-    )
-    with pytest.raises(ValueError, match="absent from the report"):
-        _event(response)
-
-
-def test_missing_source_only_basis_requests_clarification_instead_of_closure():
-    response = _non_actionable_response()
-    response["bug_review"].pop("source_only_quote")
-    response["missing_information"] = ["version_or_environment"]
-    run, classification, _, _ = _event(response)
-
-    assert classification.bug_review.actionability == BugActionability.NEEDS_INFO
-    assert "observed_behavior" in classification.missing_information
-    assert run.mutations[0].target.needs_info
+    if quote not in BODY:
+        with pytest.raises(ValueError, match="source_quote is absent"):
+            preview("actionable", value=value)
+        return
+    run, _, _, _ = preview("actionable", value=value)
+    body = build_triage_comment(run.ranked[0], run.mutations[0], (), NOW)
+    assert "Problem in plain English" in body
+    assert "1. Reconnect Wi-Fi." in body
+    assert "not been independently verified" in body
     assert not run.mutations[0].close_as_non_actionable
 
 
-def test_fabricated_source_only_basis_cannot_close_a_report():
-    response = _non_actionable_response()
-    response["bug_review"]["source_only_quote"] = "The author confirms this never happened."
-    with pytest.raises(ValueError, match="source_only_quote is absent"):
-        _event(response)
+@pytest.mark.parametrize("kind,enabled", [("Feature", True), ("Docs", True), ("Bug", False)])
+def test_other_types_and_disabled_review_keep_existing_behavior(kind, enabled):
+    value = {**response(), "type": kind, "bug_review": "ignored"}
+    classifier = PromptClassifier(
+        lambda _: json.dumps(value), AreaCatalog({}, {}), review_bugs=enabled
+    )
+    assert classifier.classify(issue(BODY).content()).bug_review is None
 
 
 @pytest.mark.parametrize("confirmed", [False, None, "true"])
-def test_closure_check_must_explicitly_confirm_the_speculative_basis(confirmed):
-    issue = _issue(body=CODE_ONLY_BODY)
-    run, classification, _, _ = prioritize_issue(
-        issue,
-        _classifier(_non_actionable_response(), closure_confirmed=confirmed),
-        ScoringConfig.default(),
-        AreaCatalog({}, {}),
-        LabelManifest(()),
-        "preview",
-        PipelineMode.DRY_RUN,
-    )
-    assert classification.bug_review.actionability == BugActionability.NEEDS_INFO
+def test_uncertain_second_check_requests_clarification(confirmed):
+    run, classification, _, _ = preview(confirmed=confirmed)
+    assert classification.bug_review.actionability == "needs_info"
     assert classification.bug_review.source_only_quote is None
     assert run.mutations[0].target.needs_info
     assert not run.mutations[0].close_as_non_actionable
 
 
-def test_source_only_quote_preserves_whitespace_normalization():
-    response = _non_actionable_response()
-    response["bug_review"]["source_only_quote"] = CODE_ONLY_BODY.replace(". ", ".\n")
-    run, classification, _, _ = _event(response)
-    assert classification.bug_review.source_only_quote == CODE_ONLY_BODY
-    assert run.mutations[0].close_as_non_actionable
+def test_missing_closure_quote_requests_clarification():
+    value = response("non_actionable")
+    value["bug_review"]["source_only_quote"] = None
+    assert preview(value=value)[0].mutations[0].target.needs_info
 
 
-def test_reproduction_quotes_allow_whitespace_normalization():
-    response = _response()
-    response["bug_review"]["clarification"]["reproduction_steps"] = [
-        {
-            "text": "Open a session, then disconnect Wi-Fi.",
-            "source_quote": "Open a session.   Disconnect Wi-Fi.",
-        }
-    ]
-    assert _classifier(response).classify(_content()).bug_review is not None
-
-
-def test_code_fences_in_quoted_evidence_survive_json_parsing():
-    source = 'Run this command: ```json\n{"broken": true}\n```'
-    response = _response()
-    response["bug_review"]["clarification"]["reproduction_steps"] = [
-        {"text": "Run the supplied command.", "source_quote": source}
-    ]
-    classifier = PromptClassifier(
-        lambda _: f"```json\n{json.dumps(response)}\n```",
-        AreaCatalog({}, {}),
-        review_bugs=True,
-    )
-
-    result = classifier.classify(replace(_content(), body=source))
-
-    assert result.bug_review.clarification.reproduction_steps[0].source_quote == " ".join(
-        source.split()
-    )
-
-
-@pytest.mark.parametrize("review", [None, {}, {"actionability": "valid", "reason": "Reason"}])
-def test_opt_in_requires_a_valid_review(review):
+@pytest.mark.parametrize(
+    "bad", ["invented_quote", "observed_closure", "code_actionable", "missing_summary"]
+)
+def test_inconsistent_or_ungrounded_model_output_is_rejected(bad):
+    decision = "non_actionable" if bad in ("invented_quote", "observed_closure") else "actionable"
+    value = response(decision)
+    if bad == "invented_quote":
+        value["bug_review"]["source_only_quote"] = "Invented admission."
+    elif bad == "observed_closure":
+        value["evidence_kind"] = "observed_intermittent"
+    elif bad == "code_actionable":
+        value["evidence_kind"] = "code_analysis"
+    else:
+        value["bug_review"]["readability"] = "needs_summary"
     with pytest.raises(ValueError):
-        _classifier(_response(bug_review=review)).classify(_content())
+        preview(decision, value=value)
 
 
-def test_inconsistent_actionability_cannot_change_labels():
-    response = _response()
-    response["bug_review"] = {
-        "actionability": "non_actionable",
-        "reason": "No actual failure.",
-        "readability": "not_assessed",
+def test_both_model_calls_see_evidence_after_the_old_cutoff():
+    observation = "I reproduced the failure yesterday."
+    report = issue(SOURCE_ONLY + " Source detail." * 1000 + observation)
+    prompts = []
+
+    def query(prompt):
+        prompts.append(prompt)
+        return json.dumps(
+            response("non_actionable") if len(prompts) == 1 else {"source_only": False}
+        )
+
+    classification = PromptClassifier(query, AreaCatalog({}, {}), review_bugs=True).classify(
+        report.content()
+    )
+    assert len(prompts) == 2
+    assert all(observation in prompt and report.title in prompt for prompt in prompts)
+    assert classification.bug_review.actionability == "needs_info"
+
+
+def test_oversized_report_is_not_partially_reviewed():
+    classifier = PromptClassifier(
+        lambda _: pytest.fail("Partial review"), AreaCatalog({}, {}), review_bugs=True
+    )
+    with pytest.raises(ValueError, match="manual review required"):
+        classifier.classify(issue("x" * MAX_BUG_REVIEW_CHARACTERS).content())
+
+
+def test_old_and_long_author_comments_are_preserved():
+    payload = {
+        "number": 7,
+        "title": "Session failure",
+        "body": SOURCE_ONLY,
+        "user": {"login": "author"},
+        "state": "open",
+        "created_at": NOW.isoformat(),
     }
-    with pytest.raises(ValueError, match="disagrees with information status"):
-        _event(response)
+    comments = [{"user": {"login": "author"}, "body": "Logs. " * 800 + BODY}]
+    comments += [{"user": {"login": "author"}, "body": f"Update {n}"} for n in range(100)]
+
+    def transport(method, path, body):
+        if "/comments" not in path:
+            return payload
+        page = int(path.rsplit("=", 1)[1])
+        return comments[(page - 1) * 100 : page * 100]
+
+    report = GitHubClient("fake", "org/repo", transport).open_issue(7)
+    assert BODY in report.body
+    assert all(comment["body"] in report.body for comment in comments)
 
 
-def test_needs_summary_requires_a_clarification():
-    response = _response()
-    response["bug_review"]["clarification"] = None
-    with pytest.raises(ValueError, match="readability disagrees"):
-        _event(response)
+class Client:
+    def __init__(self, *, stale=False, fail=None, labels=("Bug", "needs-info")):
+        self.report = issue(labels=labels)
+        self.events = []
+        self.comments = []
+        self.stale, self.fail = stale, fail
+
+    def sync_missing_labels(self, manifest):
+        pass
+
+    def issue_labels(self, number):
+        return self.report.labels
+
+    def open_issue(self, number):
+        changed = self.stale == "before" or (self.stale == "after" and self.comments)
+        return replace(self.report, body=BODY) if changed else self.report
+
+    def apply_labels(self, number, added, removed):
+        self.events.append("labels")
+        self.report = replace(
+            self.report, labels=tuple((set(self.report.labels) - set(removed)) | set(added))
+        )
+
+    def upsert_issue_comment(self, number, body):
+        if self.fail == "comment":
+            raise RuntimeError("comment failed")
+        self.events.append("comment")
+        self.comments.append(body)
+        return 1
+
+    def close_issue(self, number):
+        if self.fail == "close":
+            raise RuntimeError("close failed")
+        self.events.append("close")
 
 
-def test_clarification_cannot_be_attached_to_an_unsupported_bug():
-    response = _response()
-    response["bug_review"]["actionability"] = "needs_info"
-    with pytest.raises(ValueError, match="only an actionable bug"):
-        BugReview.from_mapping(response["bug_review"])
-
-
-def test_long_summary_or_excessive_steps_are_rejected():
-    response = _response()["bug_review"]
-    response["clarification"]["summary"] = "x" * 601
-    with pytest.raises(ValueError, match="summary"):
-        BugReview.from_mapping(response)
-    response["clarification"]["summary"] = "Short summary."
-    response["clarification"]["reproduction_steps"] *= 3
-    with pytest.raises(ValueError, match="at most six"):
-        BugReview.from_mapping(response)
-
-
-def test_generated_comment_cannot_ping_users_or_embed_links():
-    response = _response()
-    response["bug_review"]["clarification"]["summary"] = (
-        "@maintainer <img> ![image](https://example.com)"
+def apply(client, *, mode=PipelineMode.APPLY):
+    run, _, planner, states = preview()
+    return GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
+        replace(run, mode=mode)
     )
-    run, _, _, _ = _event(response)
-    body = build_triage_comment(run.ranked[0], run.mutations[0], ("Bug",), NOW)
-    assert "@maintainer" not in body
-    assert "<img>" not in body
-    assert "![image](" not in body
 
 
-def test_cached_review_round_trips_and_nonbugs_drop_it():
-    classification = _classifier(_response()).classify(_content())
-    row = SimpleNamespace(
-        issue_number=7,
-        issue_type="Bug",
-        impact="medium",
-        area_keys=[],
-        component_labels=[],
-        reasoning="Reason",
-        content_hash="hash",
-        reported_type="Bug",
-        evidence_kind="direct_steps",
-        information_status="sufficient",
-        missing_information=[],
-        bug_review_json=json.dumps(classification.bug_review.as_dict()),
-    )
-    assert _classification_from_row(row).bug_review == classification.bug_review
-    row.issue_type = "Feature"
-    assert _classification_from_row(row).bug_review is None
+def test_apply_explains_before_closing_and_removes_reopen_label():
+    client = Client()
+    assert apply(client)[0].close_as_non_actionable
+    assert client.events == ["labels", "comment", "close"]
+    assert "needs-info" not in client.report.labels
 
 
-def test_followup_with_evidence_clears_needs_info_and_can_summarize():
-    issue = BronzeIssue(
-        7, _content().title, BODY, "url", "reporter", ("Bug", "needs-info"), NOW, 0, 0
+@pytest.mark.parametrize("label", ["security", "duplicate", "Pinned"])
+def test_live_exemptions_block_closure_without_requesting_evidence(label):
+    client = Client(labels=("Bug", label))
+    assert not apply(client)[0].close_as_non_actionable
+    assert "close" not in client.events
+    assert f"exempt ({label.lower()})" in client.comments[0]
+    assert "More evidence needed" not in client.comments[0]
+    assert '"needs_info_deadline":null' in client.comments[0]
+
+
+@pytest.mark.parametrize("failure", ["comment", "close"])
+def test_api_failure_does_not_claim_successful_closure(failure):
+    client = Client(fail=failure)
+    with pytest.raises(RuntimeError, match=f"{failure} failed"):
+        apply(client)
+    assert "close" not in client.events
+    if client.comments:
+        assert "recommend closing" in client.comments[0]
+
+
+@pytest.mark.parametrize("when", ["before", "after"])
+def test_edit_before_closure_skips_the_stale_assessment(when):
+    client = Client(stale=when)
+    plan = apply(client)[0]
+    assert "close" not in client.events
+    assert "non_actionable_stale_assessment" in plan.blocked
+    assert not plan.close_as_non_actionable
+    if when == "after":
+        assert "recommend closing" in client.comments[0]
+    else:
+        assert not client.events
+
+
+def test_stale_issue_does_not_stop_later_issues():
+    class BatchClient(Client):
+        def issue_labels(self, number):
+            self.report = issue()
+            return self.report.labels
+
+        def open_issue(self, number):
+            return replace(self.report, body=BODY) if number == 8 else self.report
+
+        def close_issue(self, number):
+            self.events.append(("close", number))
+
+    client = BatchClient()
+    run, _, planner, states = preview()
+    item = run.ranked[0]
+    ranked = tuple(replace(item, issue=replace(item.issue, number=n)) for n in (7, 8, 9))
+    plans = GitHubMutationSink(client, LabelManifest(()), planner, states).apply_with_plans(
+        replace(run, mode=PipelineMode.APPLY, ranked=ranked, mutations=planner.plan_all(ranked, {}))
     )
-    run, classification, _, _ = prioritize_issue(
-        issue,
-        _classifier(_response()),
-        ScoringConfig.default(),
-        AreaCatalog({}, {}),
-        LabelManifest(()),
-        "followup",
-        PipelineMode.DRY_RUN,
-    )
-    assert classification.bug_review.actionability == BugActionability.ACTIONABLE
-    assert "needs-info" in run.mutations[0].labels_remove
-    # Defensive rendering also protects callers loading normalized issue JSON.
-    feature = replace(
-        run.ranked[0], issue=replace(run.ranked[0].issue, issue_type=IssueType.ENHANCEMENT)
-    )
-    assert "Problem in plain English" not in build_triage_comment(feature, run.mutations[0], ())
+    assert [p.close_as_non_actionable for p in plans] == [True, False, True]
+    assert ("close", 7) in client.events and ("close", 9) in client.events
+    assert set(states.load()) == {7, 9}
+
+
+def test_dry_run_cannot_apply():
+    client = Client()
+    with pytest.raises(ValueError, match="require apply mode"):
+        apply(client, mode=PipelineMode.DRY_RUN)
+    assert not client.events

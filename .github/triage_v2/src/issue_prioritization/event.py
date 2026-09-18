@@ -193,7 +193,6 @@ def write_event_status(
         "intake": _intake_payload(intake_plan) if intake_plan is not None else None,
     }
     (output_dir / "event.json").write_text(json.dumps(payload, indent=2) + "\n")
-    (output_dir / "comment.md").write_text(payload["comment"]["body"] + "\n")
     (output_dir / "mutations.json").write_text(
         json.dumps([_mutation_payload(plan)], indent=2) + "\n"
     )
@@ -280,7 +279,7 @@ def _write_skip_artifact(output_dir: Path, run_id: str, issue_number: int, reaso
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Prioritize one GitHub issue")
+    parser = argparse.ArgumentParser(description="Prioritize one newly opened issue")
     parser.add_argument("--issue-number", required=True, type=int)
     parser.add_argument("--github-repo", required=True)
     parser.add_argument("--model-endpoint", required=True)
@@ -297,29 +296,23 @@ def main() -> None:
     parser.add_argument(
         "--review-bugs", action="store_true", help="Enable the bug review prototype"
     )
-    parser.add_argument(
-        "--include-closed", action="store_true", help="Preview closed issues in dry-run mode"
-    )
     args = parser.parse_args()
     if args.issue_number <= 0:
         raise ValueError("issue_number must be positive")
-    mode = PipelineMode(args.mode)
-    if args.include_closed and mode != PipelineMode.DRY_RUN:
-        parser.error("--include-closed requires --mode dry_run")
 
     token = os.environ.get("GITHUB_TOKEN", "")
     if not token:
         raise RuntimeError("GITHUB_TOKEN is required")
     client = GitHubClient(token, args.github_repo)
-    issue = client.issue_for_triage(args.issue_number, include_closed=args.include_closed)
+    issue = client.open_issue(args.issue_number)
     if issue is None:
-        reason = "not_an_issue" if args.include_closed else "issue_not_open"
-        _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, reason)
-        print(f"Skipping #{args.issue_number}: {reason}")
+        _write_skip_artifact(args.output_dir, args.run_id, args.issue_number, "issue_not_open")
+        print(f"Skipping #{args.issue_number}: issue is not open")
         return
     config = ScoringConfig.default()
     areas = AreaCatalog.from_json(args.areas)
     manifest = LabelManifest.from_json(args.label_manifest)
+    mode = PipelineMode(args.mode)
     duplicate_candidates: tuple[dict[str, object], ...] = ()
     if args.intake:
         if args.maintainers is None:

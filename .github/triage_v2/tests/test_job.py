@@ -10,12 +10,6 @@ def test_dry_run_does_not_require_github_credentials() -> None:
     validate_github_write_gate(PipelineMode.DRY_RUN, "false", "")
 
 
-def test_bug_review_requires_read_credentials_even_in_dry_run() -> None:
-    with pytest.raises(RuntimeError, match="github_secret_scope is required"):
-        validate_github_write_gate(PipelineMode.DRY_RUN, "false", "", review_bugs=True)
-    validate_github_write_gate(PipelineMode.DRY_RUN, "false", "scope", review_bugs=True)
-
-
 def test_apply_requires_both_write_gate_and_secret_scope() -> None:
     with pytest.raises(RuntimeError, match="allow_github_writes is false"):
         validate_github_write_gate(PipelineMode.APPLY, "false", "scope")

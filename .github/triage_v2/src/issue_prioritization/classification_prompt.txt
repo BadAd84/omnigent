@@ -10,7 +10,7 @@ Output only JSON with these fields:
 - information_status: for bugs, sufficient or needs_info; use not_applicable
   for Features and Docs
 - missing_information: array containing any of trigger, expected_behavior,
-  observed_behavior, version_or_environment, diagnostic_evidence, or user_impact
+  observed_behavior, version_or_environment, or diagnostic_evidence
 - help_wanted: true when a community contribution would be useful, otherwise false
 - duplicate_decision: duplicate, similar, or none
 - duplicate_of: one candidate issue number for duplicate, otherwise null

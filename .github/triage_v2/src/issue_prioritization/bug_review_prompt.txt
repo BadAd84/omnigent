@@ -65,7 +65,7 @@ observed.
   consequence does not rescue a report whose stated basis is only source analysis.
   In reason, identify what establishes that speculative basis instead of merely
   listing missing logs, versions, or proof. Set information_status=needs_info, identify the
-  missing observed_behavior and/or user_impact, and set evidence_kind to
+  missing observed_behavior, and set evidence_kind to
   code_analysis or none. Use low impact because user impact is unconfirmed.
   The automation will post an explanation and close as not planned immediately,
   without a seven-day wait. Explain the missing observation in ordinary language.

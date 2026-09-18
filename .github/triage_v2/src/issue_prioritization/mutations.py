@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from issue_prioritization.artifacts import RankedIssue
-from issue_prioritization.bug_review import BUG_REVIEW_VERSION, BugActionability
+from issue_prioritization.bug_review import BugActionability
 from issue_prioritization.domain import InformationStatus, IssueType, Priority
 from issue_prioritization.labels import LEGACY_SEVERITY_LABELS, LabelManifest
 
@@ -190,7 +190,6 @@ def target_from_ranked(item: RankedIssue) -> MutationTarget:
     close_as_non_actionable = (
         item.issue.issue_type == IssueType.BUG
         and review is not None
-        and review.rubric_version == BUG_REVIEW_VERSION
         and review.actionability == BugActionability.NON_ACTIONABLE
     )
     return MutationTarget(

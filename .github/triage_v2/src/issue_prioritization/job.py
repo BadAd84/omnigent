@@ -14,7 +14,6 @@ from issue_prioritization.databricks_io import (
 )
 from issue_prioritization.github import (
     GitHubClient,
-    GitHubIssueSource,
     GitHubLegacyPriorityOwnership,
     GitHubMutationSink,
 )
@@ -42,13 +41,10 @@ def validate_github_write_gate(
     allow_github_writes: str,
     github_secret_scope: str,
     adopt_legacy_bot_priorities: bool = False,
-    review_bugs: bool = False,
 ) -> None:
     if mode == PipelineMode.APPLY and not _enabled(allow_github_writes):
         raise RuntimeError("apply mode is disabled: allow_github_writes is false")
-    if (
-        mode == PipelineMode.APPLY or adopt_legacy_bot_priorities or review_bugs
-    ) and not github_secret_scope:
+    if (mode == PipelineMode.APPLY or adopt_legacy_bot_priorities) and not github_secret_scope:
         raise RuntimeError("github_secret_scope is required for GitHub access")
 
 
@@ -56,7 +52,6 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--mode", choices=list(PipelineMode), default=PipelineMode.DRY_RUN)
     parser.add_argument("--regrade", default="false")
-    parser.add_argument("--review-bugs", default="false")
     parser.add_argument(
         "--adopt-legacy-bot-priorities",
         "--adopt_legacy_bot_priorities",
@@ -97,16 +92,14 @@ def main() -> None:
     states = SparkBotStateRepository(spark, args.bot_state_table)
     mode = PipelineMode(args.mode)
     adopt_legacy = _enabled(args.adopt_legacy_bot_priorities)
-    review_bugs = _enabled(args.review_bugs)
     validate_github_write_gate(
         mode,
         args.allow_github_writes,
         args.github_secret_scope,
         adopt_legacy,
-        review_bugs,
     )
     github_client = None
-    if mode == PipelineMode.APPLY or adopt_legacy or review_bugs:
+    if mode == PipelineMode.APPLY or adopt_legacy:
         from pyspark.dbutils import DBUtils
 
         secrets = DBUtils(spark).secrets
@@ -143,10 +136,9 @@ def main() -> None:
             planner,
             states,
         )
-    source = SparkIssueSource(spark, args.source_table, args.github_repo)
     pipeline = IssuePrioritizationPipeline(
-        source=GitHubIssueSource(source, github_client) if review_bugs else source,
-        classifier=serving_endpoint_classifier(args.model_endpoint, areas, review_bugs=review_bugs),
+        source=SparkIssueSource(spark, args.source_table, args.github_repo),
+        classifier=serving_endpoint_classifier(args.model_endpoint, areas),
         classifications=SparkClassificationRepository(spark, args.classifications_table),
         scores=SparkScoreSink(spark, args.scores_table, args.latest_scores_view),
         artifacts=VolumeArtifactSink(args.artifact_dir, config),
@@ -154,7 +146,6 @@ def main() -> None:
         mutation_planner=planner,
         mutation_sink=mutation_sink,
         classification_progress=_print_classification_progress,
-        review_bugs=review_bugs,
     )
     run = pipeline.run(
         args.run_id,

@@ -52,10 +52,8 @@ issues change, while unchanged LLM classifications are reused.
 For bugs, include the observed impact, reproduction evidence, Omnigent version,
 platform, and affected harness or authentication mode. Direct steps are best,
 but a clear intermittent observation, controlled test, diagnostics, or concrete
-analysis explaining an observed failure can also help maintainers investigate.
-Source analysis alone, including a reachable code path or a reproduction recipe
-nobody has run, does not establish a user-facing bug. For feature requests,
-describe the user problem and expected
+analysis of the failing code path can also give maintainers enough to
+investigate. For feature requests, describe the user problem and expected
 reach. Use a `+1` reaction when an existing issue matters to you; ordinary
 comments are not counted as votes.
 
@@ -85,14 +83,6 @@ issue is automatically closed as not planned. A later author reply reopens the
 issue and sends it through triage again. This lifecycle is separate from the
 normal stale policy and applies to bug reports that would otherwise be exempt
 from stale closure.
-
-The optional bug-review workflow closes code-only reports with no observed
-user-facing failure immediately as not planned, with an explanatory comment.
-If you later observe a failure, open a new issue describing what you did, what
-happened, and relevant logs or session details.
-Reports of an actual failure that need more details retain the seven-day reply
-window above. Security, duplicate, and pinned issues are exempt from automatic
-closure by this review.
 
 Pull requests waiting for an author response follow the separate 7-day policy
 described under [Review state labels](#review-state-labels).

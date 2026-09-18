@@ -32,16 +32,6 @@ on:
         required: false
         default: false
         type: boolean
-      review_bugs:
-        description: Enable the optional bug review for this run
-        required: false
-        default: false
-        type: boolean
-      include_closed:
-        description: Preview closed issues (requires apply=false)
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: read
@@ -60,7 +50,7 @@ jobs:
       PIP_INDEX_URL: https://pypi.org/simple
     steps:
       - name: Reopen for author follow-up
-        if: inputs.reopen_closed && inputs.apply && !inputs.include_closed
+        if: inputs.reopen_closed
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -74,12 +64,11 @@ jobs:
             echo "Issue #$ISSUE_NUMBER is already open."
           fi
 
-      - name: Check out triage code
+      - name: Check out default branch
         if: vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
         with:
-          # Manual dry runs preview the selected revision; writes use the default branch.
-          ref: ${{ github.event_name == 'workflow_dispatch' && !inputs.apply && github.sha || github.event.repository.default_branch }}
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
       - name: Install uv
@@ -101,8 +90,7 @@ jobs:
           POST_DUPLICATE_COMMENTS: ${{ inputs.post_duplicate_comments }}
           REPO_POST_DUPLICATE_COMMENTS: ${{ vars.ISSUE_TRIAGE_POST_DUPLICATE_COMMENTS || 'false' }}
           CLOSE_DUPLICATES: ${{ vars.ISSUE_TRIAGE_CLOSE_DUPLICATES || 'false' }}
-          REVIEW_BUGS: ${{ inputs.review_bugs || vars.ISSUE_TRIAGE_BUG_REVIEW_ENABLED == 'true' }}
-          INCLUDE_CLOSED: ${{ inputs.include_closed }}
+          REVIEW_BUGS: ${{ vars.ISSUE_TRIAGE_BUG_REVIEW_ENABLED || 'false' }}
         run: |
           set -euo pipefail
           : "${DATABRICKS_HOST:?Set the DATABRICKS_HOST repository secret}"
@@ -121,14 +109,11 @@ jobs:
             --label-manifest .github/issue-prioritization-labels.json
             --output-dir /tmp/issue-priority-v2
             --run-id "github-${{ github.run_id }}-${{ github.run_attempt }}"
-            --source-revision "$(git rev-parse HEAD)"
+            --source-revision "${{ github.sha }}"
             --mode "$mode"
           )
           if [ "$REVIEW_BUGS" = "true" ]; then
             args+=(--review-bugs)
-          fi
-          if [ "$INCLUDE_CLOSED" = "true" ]; then
-            args+=(--include-closed)
           fi
           if [ "$INTAKE" = "true" ]; then
             args+=(--intake --maintainers .github/MAINTAINER)

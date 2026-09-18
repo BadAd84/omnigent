@@ -72,7 +72,6 @@ class MissingInformation(StrEnum):
     OBSERVED_BEHAVIOR = "observed_behavior"
     VERSION_OR_ENVIRONMENT = "version_or_environment"
     DIAGNOSTIC_EVIDENCE = "diagnostic_evidence"
-    USER_IMPACT = "user_impact"
 
     @classmethod
     def parse(cls, value: object) -> MissingInformation:
@@ -175,11 +174,6 @@ class Issue:
             ),
             missing_information=tuple(
                 MissingInformation.parse(item) for item in value.get("missing_information", ())
-            ),
-            bug_review=(
-                BugReview.from_mapping(value["bug_review"])
-                if value.get("bug_review") and IssueType.parse(value["type"]) == IssueType.BUG
-                else None
             ),
             duplicate_count=max(0, int(value.get("duplicate_count", 0))),
             upvote_count=max(0, int(value.get("upvote_count", 0))),
