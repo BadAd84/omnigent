@@ -50,16 +50,16 @@ from dataclasses import dataclass, field, replace
 from typing import Literal
 
 from omnigent.cli_invocation import cli_invocation
-from omnigent.env_credentials import (
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.harness_aliases import canonicalize_harness
+from omnigent.spec.parser import check_unresolved_env_vars
+from omnigent.util.env_credentials import (
     _ENV_REF_RE,
     env_names_with_omnigent_prefix,
     expand_envvars_with_omnigent_prefix,
     getenv_with_omnigent_prefix,
     omnigent_prefixed_env_name,
 )
-from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.harness_aliases import canonicalize_harness
-from omnigent.spec.parser import check_unresolved_env_vars
 
 _logger = logging.getLogger(__name__)
 
@@ -351,6 +351,28 @@ class FamilyConfig:
             ``None`` when the family declares no default.
         """
         return self.models.get("default")
+
+    def resolve_model_tier(self, model_id: str) -> str:
+        """Resolve a ``models:`` value that names another tier to its id.
+
+        Deployments alias tier names to ids (``deepseek-pro:
+        deepseek-v4-pro``) and reference those aliases from other keys
+        (``default: deepseek-pro``). Whatever reaches an endpoint — the
+        launch model, the picker's shortlist, the spawn env — must be the
+        concrete id, never the alias.
+
+        :param model_id: A ``models`` key or value, e.g. ``"deepseek-pro"``.
+        :returns: The concrete id the alias chain ends at, e.g.
+            ``"deepseek-v4-pro"``; *model_id* unchanged when it names no
+            other tier.
+        """
+        current = model_id
+        for _ in range(8):  # bounded: a cyclic alias map must terminate
+            alias = self.models.get(current)
+            if not isinstance(alias, str) or not alias or alias == current:
+                return current
+            current = alias
+        return model_id
 
 
 @dataclass(frozen=True)
@@ -1184,12 +1206,12 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
     Most ``cli-config`` providers (a custom codex ``[model_providers.X]``) are
     unusable outside their own CLI, so they never serve pi. The exception is a
     Databricks AI Gateway: it exposes an Anthropic Messages surface Pi speaks
-    natively, and :func:`omnigent.pi_native_credentials._cli_config_pi_provider`
+    natively, and :func:`omnigent.harnesses.pi_native.credentials._cli_config_pi_provider`
     translates it into a Pi gateway config (and the gateway-harness pi path
     routes it too — see ``configure_agent_harness_with_provider``). So a
     cli-config provider serves pi *iff* it is a pi-consumable Databricks gateway.
 
-    The capability check lives in :mod:`omnigent.pi_native_credentials` (the
+    The capability check lives in :mod:`omnigent.harnesses.pi_native.credentials` (the
     single source of truth, alongside the gateway-URL allowlist and the codex
     transport reader). It is imported **lazily** here: ``pi_native_credentials``
     imports this module at top level, so a top-level import back would cycle;
@@ -1201,7 +1223,7 @@ def _cli_config_serves_pi(entry: ProviderEntry) -> bool:
     """
     if entry.kind != CLI_CONFIG_KIND:
         return False
-    from omnigent.pi_native_credentials import cli_config_pi_provider_capable
+    from omnigent.harnesses.pi_native.credentials import cli_config_pi_provider_capable
 
     return cli_config_pi_provider_capable(entry)
 
