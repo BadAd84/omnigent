@@ -28,6 +28,11 @@ on:
         description: PR number to review.
         required: true
         type: string
+      resolve_scope:
+        description: Assess PR scope for Resolve's existing-PR review path.
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -131,8 +136,14 @@ jobs:
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number || github.event.issue.number || inputs.pr }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          RESOLVE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.resolve_scope }}
         run: |
           set -euo pipefail
+
+          # Resolve needs a fresh assessment, including changed issue context.
+          if [ "$RESOLVE_SCOPE" = true ]; then
+            exit 0
+          fi
 
           head_sha="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.head.sha')"
           echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
@@ -334,6 +345,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+          RESOLVE_SCOPE: ${{ github.event_name == 'workflow_dispatch' && inputs.resolve_scope }}
         run: |
           set -euo pipefail
 
@@ -349,6 +361,13 @@ jobs:
           chmod 444 /tmp/pr_diff.txt
           echo "head_sha=${head_sha}" >> "$GITHUB_OUTPUT"
 
+          if [ "$RESOLVE_SCOPE" = true ]; then
+            python3 dev/resolve-agent/scope_review.py prepare \
+              --repo "$REPO" --pr "$PR_NUMBER" \
+              --head-sha "$head_sha" --base-sha "$base_sha" \
+              > /tmp/resolve_scope_prompt.txt
+          fi
+
           # Extract lockfile pin changes from the diff.
           grep -E '^[+-]name = |^[+-]version = ' /tmp/pr_diff.txt \
             | head -500 > /tmp/lockfile_pins.txt || true
@@ -362,7 +381,7 @@ jobs:
 
           # Reviewers read the shared snapshot; Polly passes only its path and identity.
           python3 -u <<'PYEOF'
-          import hashlib, json, pathlib, re
+          import hashlib, json, os, pathlib, re
 
           meta = json.loads(pathlib.Path("/tmp/pr_meta.json").read_text())
           diff_sha256 = hashlib.sha256(pathlib.Path("/tmp/pr_diff.txt").read_bytes()).hexdigest()
@@ -505,6 +524,8 @@ jobs:
           on its own line, then the review content. Nothing before the marker
           will be shown.
           """
+          if os.environ.get("RESOLVE_SCOPE") == "true":
+              prompt += pathlib.Path("/tmp/resolve_scope_prompt.txt").read_text()
           pathlib.Path("/tmp/review_prompt.txt").write_text(prompt)
           PYEOF
 
@@ -652,6 +673,15 @@ jobs:
           # and notifies watchers — no in-place upsert of a prior comment.
           gh pr comment "$PR_NUMBER" --repo "$REPO" --body-file /tmp/comment.md
           echo "Created new comment"
+
+      - name: Validate Resolve scope assessment
+        if: github.event_name == 'workflow_dispatch' && inputs.resolve_scope
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ steps.pr.outputs.pr_number }}
+        run: |
+          python3 dev/resolve-agent/scope_review.py check --repo "$REPO" --pr "$PR_NUMBER"
 
       # Successful slow runs need the same evidence as failed reviews.
       - name: Prepare Polly diagnostics
