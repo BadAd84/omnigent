@@ -149,8 +149,9 @@ Manual V2 dry runs check out the selected branch revision. Download the
 - **An observed failure with missing details:** `needs-info` with the specific
   missing details and the existing seven-day expiry/reopen process.
 
-Immediate closure retains `needs-info` so an author follow-up can reopen and
-re-evaluate the report. It adds no seven-day deadline. Security, duplicate, and
+Immediate closure removes `needs-info`; reporters who later observe a failure
+are asked to open a new issue. These reports have no reply deadline and do not
+enter the author-reply reopening workflow. Security, duplicate, and
 pinned issues remain exempt from closure. The shared mutation sink posts the
 explanation before closing and checks live report content and author replies
 before acting. Dry-run artifacts expose `close_as_non_actionable` without

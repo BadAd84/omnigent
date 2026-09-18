@@ -171,10 +171,11 @@ def _non_actionable_response():
     )
 
 
-def test_code_only_bug_previews_immediate_closure_and_comment(tmp_path):
-    run, classification, _, _ = _event(_non_actionable_response())
+@pytest.mark.parametrize("labels", [("Bug",), ("Bug", "needs-info")])
+def test_code_only_bug_previews_immediate_closure_and_comment(tmp_path, labels):
+    run, classification, _, _ = _event(_non_actionable_response(), issue=_issue(labels=labels))
     write_event_artifacts(
-        tmp_path, run, classification, ScoringConfig.default(), "example", "revision", ("Bug",)
+        tmp_path, run, classification, ScoringConfig.default(), "example", "revision", labels
     )
     artifact = json.loads((tmp_path / "event.json").read_text())
     body = (tmp_path / "comment.md").read_text()
@@ -183,11 +184,17 @@ def test_code_only_bug_previews_immediate_closure_and_comment(tmp_path):
     assert artifact["mutation"]["close_as_non_actionable"] is True
     assert "Closing as **not planned**" in body
     assert "no observed failure" in body
-    assert "An author follow-up will reopen" in body
+    assert "please open a new issue" in body
+    assert "reopen" not in body
     assert "Please update the issue by" not in body
     assert "**Priority:**" not in body
     assert '"needs_info_deadline":null' in body
-    assert "needs-info" in run.mutations[0].labels_add
+    assert artifact["mutation"]["target"]["needs_info"] is False
+    assert "needs-info" not in run.mutations[0].labels_add
+    labels_after = (set(labels) - set(run.mutations[0].labels_remove)) | set(
+        run.mutations[0].labels_add
+    )
+    assert "needs-info" not in labels_after
 
     previous = body.replace('"needs_info_deadline":null', '"needs_info_deadline":"2026-09-25"')
     assert preserve_needs_info_deadline(body, previous) == body
@@ -256,6 +263,17 @@ def test_apply_posts_explanation_before_closing():
     assert plans[0].close_as_non_actionable
     assert client.events == ["sync", "labels", "comment", "close"]
     assert "Closing as **not planned**" in client.comments[0]
+
+
+def test_immediate_closure_removes_the_automatic_reopen_label():
+    client = ClosureClient()
+    client.issue = replace(client.issue, labels=("Bug", "needs-info"))
+
+    _closure_apply(client)
+
+    assert client.events == ["sync", "labels", "comment", "close"]
+    assert "needs-info" not in client.issue.labels
+    assert "please open a new issue" in client.comments[0]
 
 
 def test_observed_failure_is_commented_on_without_closure():

@@ -88,7 +88,8 @@ from stale closure.
 
 The optional bug-review workflow closes code-only reports with no observed
 user-facing failure immediately as not planned, with an explanatory comment.
-An author follow-up with an observed problem can reopen the issue for review.
+If you later observe a failure, open a new issue describing what you did, what
+happened, and relevant logs or session details.
 Reports of an actual failure that need more details retain the seven-day reply
 window above. Security, duplicate, and pinned issues are exempt from automatic
 closure by this review.

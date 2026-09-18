@@ -187,18 +187,22 @@ class MutationPlanner:
 
 def target_from_ranked(item: RankedIssue) -> MutationTarget:
     review = item.issue.bug_review
+    close_as_non_actionable = (
+        item.issue.issue_type == IssueType.BUG
+        and review is not None
+        and review.rubric_version == BUG_REVIEW_VERSION
+        and review.actionability == BugActionability.NON_ACTIONABLE
+    )
     return MutationTarget(
         issue_number=item.issue.number,
         priority=item.result.priority.value,
         components=item.issue.component_labels,
         issue_type=item.issue.issue_type.label,
-        needs_info=item.issue.information_status == InformationStatus.NEEDS_INFO,
-        close_as_non_actionable=(
-            item.issue.issue_type == IssueType.BUG
-            and review is not None
-            and review.rubric_version == BUG_REVIEW_VERSION
-            and review.actionability == BugActionability.NON_ACTIONABLE
+        needs_info=(
+            item.issue.information_status == InformationStatus.NEEDS_INFO
+            and not close_as_non_actionable
         ),
+        close_as_non_actionable=close_as_non_actionable,
     )
 
 

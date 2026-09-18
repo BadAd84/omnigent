@@ -51,7 +51,7 @@ def build_triage_comment(
 ) -> str:
     needs_info = (
         item.issue.information_status == InformationStatus.NEEDS_INFO
-        and not plan.close_as_non_actionable
+        and not plan.target.close_as_non_actionable
         and not any(value.startswith("needs_info_") for value in plan.blocked)
     )
     deadline = (
@@ -81,9 +81,8 @@ def build_triage_comment(
                 _plain_text(review.reason),
                 "",
                 "We prioritize bugs that affect users; code-path analysis alone is not enough. "
-                "If you encounter this problem, reply with what you did, what happened, and "
-                "relevant logs or session details. An author follow-up will reopen the issue "
-                "for review.",
+                "If you encounter this problem, please open a new issue with what you did, "
+                "what happened, and relevant logs or session details.",
             )
         )
     priority_lines = _priority_lines(item, plan, labels_after)
