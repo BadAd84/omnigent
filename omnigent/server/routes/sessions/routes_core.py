@@ -2638,10 +2638,37 @@ def register_core_routes(
                             ),
                         )
                     if body.workspace and _is_absolute_workspace(body.workspace):
-                        # No runner to resolve against, but an absolute wire-form
-                        # path is already the canonical target on the owner's
-                        # machine, so persist it as-is (owner-gated above).
-                        _resolved_workspace = body.workspace
+                        # No runner to resolve against. The same agent boundary
+                        # the create/relaunch paths enforce applies here: the
+                        # session's host validates existence, canonicalizes,
+                        # and checks the agent's os_env.cwd boundary. Runner
+                        # availability must not decide whether that boundary
+                        # holds — an unvalidated persist would become the
+                        # runner root (and sandbox base) on automatic relaunch.
+                        from omnigent.server.routes._sessions.helpers import (
+                            _validate_session_workspace,
+                        )
+
+                        if _prior_conv is None or _prior_conv.host_id is None:
+                            raise OmnigentError(
+                                "session runner is offline and no host is bound; "
+                                "cannot validate the working directory for this "
+                                "session",
+                                code=ErrorCode.RUNNER_UNAVAILABLE,
+                            )
+                        _agent_row = (
+                            await asyncio.to_thread(agent_store.get, _prior_conv.agent_id)
+                            if _prior_conv.agent_id is not None
+                            else None
+                        )
+                        _resolved_workspace = await _validate_session_workspace(
+                            user_id=user_id,
+                            host_id=_prior_conv.host_id,
+                            workspace=body.workspace,
+                            agent=_agent_row,
+                            agent_cache=agent_cache,
+                            request=request,
+                        )
                     else:
                         # A relative path only means something against the runner's
                         # live env root; with no runner the server can't resolve it.

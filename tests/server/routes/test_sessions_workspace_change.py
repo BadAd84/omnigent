@@ -82,6 +82,7 @@ def _seed_session(
     *,
     grants: dict[str, int],
     workspace: str | None = None,
+    host_id: str | None = None,
 ) -> tuple[FastAPI, str, SqlAlchemyConversationStore]:
     """Seed a session with the given per-user grant levels.
 
@@ -95,7 +96,9 @@ def _seed_session(
     agent_store = SqlAlchemyAgentStore(db_uri)
     agent_id = generate_agent_id()
     agent_store.create(agent_id, name="workdir-agent", bundle_location="test:///bundle")
-    conv = conversation_store.create_conversation(agent_id=agent_id, workspace=workspace)
+    conv = conversation_store.create_conversation(
+        agent_id=agent_id, workspace=workspace, host_id=host_id
+    )
     for email, level in grants.items():
         permission_store.ensure_user(email)
         permission_store.grant(email, conv.id, level)
@@ -108,14 +111,97 @@ def _seed_session(
     return app, conv.id, conversation_store
 
 
-async def test_owner_repoints_workspace_to_absolute_path(db_uri: str, tmp_path: Path) -> None:
-    """An owner PATCHing an absolute ``workspace`` persists it.
+async def test_offline_absolute_change_validates_against_the_host_boundary(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An offline absolute change runs the shared workspace validator.
 
-    With no runner bound the forward is offline, but an absolute wire-form
-    path is already the canonical target on the owner's machine, so the
-    server persists it directly. If this regresses, the double-click that
-    re-roots the Files rail leaves ``Conversation.workspace`` untouched and
-    the runner keeps cd'ing to the old directory.
+    With no runner to resolve against, the session's host must validate the
+    path exactly like session create does (existence, canonicalization, the
+    agent's ``os_env.cwd`` boundary) — and the canonical path it returns is
+    what persists. Persisting the raw client string unvalidated would make
+    it the runner root (and sandbox base) on automatic relaunch.
+    """
+    import uuid
+
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+
+    host_id = uuid.uuid4().hex
+    app, session_id, store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER},
+        workspace="/home/user/project",
+        host_id=host_id,
+    )
+
+    seen: dict[str, object] = {}
+
+    async def _fake_validate(**kwargs: object) -> str:
+        seen.update(kwargs)
+        return "/home/user/project/subdir-canonical"
+
+    monkeypatch.setattr(sessions_helpers, "_validate_session_workspace", _fake_validate)
+    async with _client(app, _OWNER) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{session_id}",
+            json={"workspace": "/home/user/project/subdir"},
+        )
+        assert resp.status_code == 200, resp.text
+
+    assert seen.get("host_id") == host_id
+    assert seen.get("workspace") == "/home/user/project/subdir"
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    # The HOST's canonical answer persists, not the raw client string.
+    assert conv.workspace == "/home/user/project/subdir-canonical"
+
+
+async def test_offline_absolute_change_rejected_by_the_validator_persists_nothing(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A boundary-refused offline change is surfaced and leaves no trace."""
+    import uuid
+
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+
+    app, session_id, store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER},
+        workspace="/home/user/project",
+        host_id=uuid.uuid4().hex,
+    )
+
+    async def _refuse(**kwargs: object) -> str:
+        del kwargs
+        raise OmnigentError(
+            "workspace is outside the boundary required by this agent",
+            code=ErrorCode.INVALID_INPUT,
+        )
+
+    monkeypatch.setattr(sessions_helpers, "_validate_session_workspace", _refuse)
+    async with _client(app, _OWNER) as c:
+        resp = await c.patch(
+            f"/v1/sessions/{session_id}",
+            json={"workspace": "/outside/boundary"},
+        )
+        assert resp.status_code == 400, resp.text
+
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == "/home/user/project"
+
+
+async def test_offline_absolute_change_without_a_host_is_refused(
+    db_uri: str, tmp_path: Path
+) -> None:
+    """With no runner and no host there is nothing to validate against.
+
+    Runner availability must not decide whether the agent's workspace
+    boundary is enforced, so an absolute change with no validatable host is
+    refused (503) rather than persisted blind.
     """
     app, session_id, store = _seed_session(
         db_uri,
@@ -128,11 +214,11 @@ async def test_owner_repoints_workspace_to_absolute_path(db_uri: str, tmp_path: 
             f"/v1/sessions/{session_id}",
             json={"workspace": "/home/user/project/subdir"},
         )
-        assert resp.status_code == 200, resp.text
+        assert resp.status_code == 503, resp.text
 
     conv = store.get_conversation(session_id)
     assert conv is not None
-    assert conv.workspace == "/home/user/project/subdir"
+    assert conv.workspace == "/home/user/project"
 
 
 async def test_relative_workspace_change_requires_online_runner(
