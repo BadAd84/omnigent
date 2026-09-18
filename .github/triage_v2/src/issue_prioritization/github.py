@@ -52,9 +52,11 @@ class GitHubLabels(Protocol):
 
     def upsert_issue_comment(self, issue_number: int, body: str) -> int: ...
 
-    def open_issue(self, issue_number: int) -> BronzeIssue | None: ...
+    def open_issue(self, issue_number: int) -> BronzeIssue | None:
+        """Return an open issue with its author's follow-ups, or None."""
 
-    def close_issue(self, issue_number: int) -> None: ...
+    def close_issue(self, issue_number: int) -> None:
+        """Close the issue as not planned."""
 
 
 class PriorityLabelHistory(Protocol):
