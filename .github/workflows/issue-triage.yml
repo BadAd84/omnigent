@@ -50,6 +50,10 @@ on:
         description: Post the duplicate-check comment (otherwise log only)
         type: boolean
         default: false
+      review_bugs:
+        description: Enable the optional bug review for this V2 run
+        type: boolean
+        default: false
 
 permissions:
   issues: write
@@ -795,4 +799,5 @@ jobs:
       apply: ${{ github.event_name != 'workflow_dispatch' || inputs.apply_labels }}
       manual_dispatch: ${{ github.event_name == 'workflow_dispatch' }}
       post_duplicate_comments: ${{ github.event_name == 'workflow_dispatch' && inputs.post_comment }}
+      review_bugs: ${{ github.event_name == 'workflow_dispatch' && inputs.review_bugs }}
     secrets: inherit
