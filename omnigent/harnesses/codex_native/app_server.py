@@ -3253,7 +3253,7 @@ def _resolve_subscription_launch(
 
 
 def resolve_native_codex_launch(
-    *, model: str | None, spec: AgentSpec | None = None
+    *, model: str | None, spec: AgentSpec | None = None, resolve_model: bool = True
 ) -> NativeCodexLaunch:
     """Resolve the native Codex launch config across all offerings.
 
@@ -3295,6 +3295,11 @@ def resolve_native_codex_launch(
     :param spec: The custom agent spec launching this session, when there is
         one, so its ``executor.auth`` / legacy profile win over machine-level
         config (issue #2744 — parity with the in-process codex harness).
+    :param resolve_model: When ``True`` (default), a Databricks-broker launch
+        resolves its model against the workspace's served catalog — a live
+        listing. Pass ``False`` to resolve the provider *shape* (base_url, auth)
+        only, skipping that network call; the host-side gateway-backed check
+        reads the base_url alone and does not need a pinned model.
     :returns: The resolved :class:`NativeCodexLaunch`.
     """
     from omnigent.onboarding.ambient import codex_config_detection
@@ -3436,8 +3441,14 @@ def resolve_native_codex_launch(
         connect_host = _read_databrickscfg_host(HOST_DATABRICKS_PROFILE)
         if connect_host and broker_token_command(connect_host.rstrip("/")):
             connect_host = connect_host.rstrip("/")
-            resolved_model = _resolve_databricks_codex_model(
-                connect_host, HOST_DATABRICKS_PROFILE, model
+            # A gateway-backed check (resolve_model=False) needs only the
+            # provider base_url, derived from connect_host below and independent
+            # of the model. Skip the live Databricks model discovery that
+            # resolving model=None would otherwise perform on the startup path.
+            resolved_model = (
+                _resolve_databricks_codex_model(connect_host, HOST_DATABRICKS_PROFILE, model)
+                if resolve_model
+                else model
             )
             log_info_once(
                 _logger,

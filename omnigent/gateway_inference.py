@@ -81,7 +81,12 @@ def codex_gateway_inference_backed() -> bool:
         resolve_native_codex_launch,
     )
 
-    base_url = native_codex_launch_base_url(resolve_native_codex_launch(model=None))
+    # resolve_model=False keeps the module's "no network round-trip" contract:
+    # this check reads the base_url alone, so skip the live Databricks model
+    # discovery a model=None resolution would otherwise trigger on this host.
+    base_url = native_codex_launch_base_url(
+        resolve_native_codex_launch(model=None, resolve_model=False)
+    )
     if not base_url:
         return False
     if not is_databricks_ai_gateway_url(base_url):

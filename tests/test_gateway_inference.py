@@ -449,6 +449,68 @@ def test_codex_not_gateway_backed_for_non_codex_gateway_path(
     assert codex_gateway_inference_backed() is False
 
 
+def test_databricks_overrides_omit_model_line_when_model_is_none() -> None:
+    # A model=None resolution keeps the provider base_url but pins no model, so
+    # the gateway-backed check can read the URL without resolving a model.
+    overrides = codex_executor._databricks_codex_config_overrides(
+        model=None,
+        base_url=_GATEWAY_CODEX_URL,
+        auth_command="databricks auth token --profile dev",
+    )
+    assert not any(o.startswith("model=") for o in overrides)
+    launch = NativeCodexLaunch(config_overrides=overrides, model=None, profile=None)
+    assert native_codex_launch_base_url(launch) == _GATEWAY_CODEX_URL
+
+
+def test_codex_gateway_check_does_not_perform_live_model_discovery(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The host-side gateway-backed check runs before hello, so it must read the
+    launch base_url without the live Databricks model discovery that resolving
+    ``model=None`` on a managed-connect host would otherwise trigger.
+    """
+    import omnigent.host.databricks_credential as dcred
+    import omnigent.inner.databricks_executor as dexec
+    import omnigent.onboarding.ambient as ambient
+    import omnigent.onboarding.detected as detected
+    import omnigent.onboarding.provider_config as provider_config
+    import omnigent.runtime.workflow as workflow
+
+    host = "https://example.cloud.databricks.com"
+    # Force the managed-connect (broker) branch: no explicit/global/ambient provider.
+    monkeypatch.setattr(provider_config, "load_config", lambda *a, **k: {})
+    monkeypatch.setattr(provider_config, "default_provider_for_harness", lambda *a, **k: None)
+    monkeypatch.setattr(ambient, "codex_config_detection", lambda *a, **k: None)
+    monkeypatch.setattr(detected, "effective_config_with_detected", lambda *a, **k: {})
+    monkeypatch.setattr(detected, "dismissed_detection_names", lambda *a, **k: set())
+    monkeypatch.setattr(workflow, "_load_global_auth", lambda *a, **k: None)
+    monkeypatch.setattr(dcred, "api_key_auth_precludes_broker", lambda *a, **k: False)
+    monkeypatch.setattr(
+        dcred, "broker_token_command", lambda *a, **k: f"databricks auth token --host {host}"
+    )
+    monkeypatch.setattr(dexec, "_read_databrickscfg_host", lambda *a, **k: host)
+
+    discovery_calls = 0
+
+    def _forbidden_discovery(*_a: Any, **_k: Any) -> str:
+        nonlocal discovery_calls
+        discovery_calls += 1
+        return "system.ai.gpt-5-2"
+
+    monkeypatch.setattr(
+        codex_native_app_server, "_resolve_databricks_codex_model", _forbidden_discovery
+    )
+
+    # The startup check resolves gateway-backed True from the base_url alone.
+    assert codex_gateway_inference_backed() is True
+    assert discovery_calls == 0
+
+    # Sanity: the default (resolve_model=True) path *does* still discover, so the
+    # flag is what gates the network call — not an unrelated short-circuit.
+    codex_native_app_server.resolve_native_codex_launch(model=None)
+    assert discovery_calls == 1
+
+
 def test_gateway_inference_map_fans_out_over_every_spelling(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

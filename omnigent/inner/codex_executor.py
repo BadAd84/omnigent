@@ -1881,14 +1881,16 @@ def _databricks_codex_auth_command(host: str, profile: str | None = None) -> str
 
 def _databricks_codex_config_overrides(
     *,
-    model: str,
+    model: str | None,
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
-    :param model: Model id to pin, e.g. ``"databricks-gpt-5-5"``.
+    :param model: Model id to pin, e.g. ``"databricks-gpt-5-5"``, or ``None`` to
+        resolve the provider shape only — the ``model=`` line is then omitted so
+        callers that need the base_url alone don't force a model to be resolved.
     :param base_url: Provider base URL from ucode state or the legacy profile
         path, e.g. ``"https://example.databricks.com/ai-gateway/codex/v1"``.
     :param auth_command: Shell command from ucode state or the legacy profile
@@ -1900,8 +1902,10 @@ def _databricks_codex_config_overrides(
     """
     provider_name = "omnigent_databricks"
     auth_command_json = json.dumps(auth_command)
-    return [
-        f"model={json.dumps(model)}",
+    overrides: list[str] = []
+    if model is not None:
+        overrides.append(f"model={json.dumps(model)}")
+    overrides += [
         f'model_provider="{provider_name}"',
         "model_supports_reasoning_summaries=true",
         (
@@ -1916,6 +1920,7 @@ def _databricks_codex_config_overrides(
             'wire_api="responses"}'
         ),
     ]
+    return overrides
 
 
 def _provider_codex_config_overrides(
