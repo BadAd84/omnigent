@@ -49,8 +49,7 @@ def test_urls_of_other_servers_keep_their_own_key(tmp_path: Path) -> None:
     _track_local_server(tmp_path, 6767)
     assert cli._normalize_daemon_target("http://127.0.0.1:9999") == "http://127.0.0.1:9999"
     assert (
-        cli._normalize_daemon_target("https://x.example.com:6767")
-        == "https://x.example.com:6767"
+        cli._normalize_daemon_target("https://x.example.com:6767") == "https://x.example.com:6767"
     )
 
 

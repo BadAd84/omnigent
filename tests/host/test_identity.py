@@ -123,8 +123,11 @@ def test_default_config_path_honors_config_home(
     config_home = tmp_path / "isolated"
     monkeypatch.setattr(identity_module, "CONFIG_PATH", fallback_path)
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
-    # The config-home fallback only applies without a data-dir override.
+    # The config-home fallback only applies without a data-dir override, and
+    # an ambient env identity would bypass the file entirely.
     monkeypatch.delenv("OMNIGENT_DATA_DIR", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_HOST_NAME", raising=False)
 
     identity = load_or_create_host_identity()
 
