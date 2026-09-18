@@ -22,6 +22,7 @@ import {
 import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
+import { attachmentFilename } from "@/lib/attachments";
 import { cn } from "@/lib/utils";
 
 /** Keep touch targets large without enlarging the visible glyphs. */
@@ -86,7 +87,7 @@ function QueuedRow({
   });
   const hasText = message.text.trim().length > 0;
   const files = message.files ?? [];
-  const attachmentNames = files.map((file) => file.name || "Attachment");
+  const attachmentNames = files.map(attachmentFilename);
   const AttachmentIcon = files.every((file) => file.type.startsWith("image/"))
     ? ImageIcon
     : PaperclipIcon;

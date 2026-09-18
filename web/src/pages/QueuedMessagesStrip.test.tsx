@@ -83,7 +83,7 @@ describe("QueuedMessagesStrip", () => {
   });
 
   it.each(["", "Look at this"])(
-    "uses a visible fallback for an unnamed attachment (text: %j)",
+    "uses the composer/upload filename for an unnamed attachment (text: %j)",
     (text) => {
       render(
         <QueuedMessagesStrip
@@ -92,7 +92,11 @@ describe("QueuedMessagesStrip", () => {
           onEdit={vi.fn()}
         />,
       );
-      expect(screen.getByText("Attachment")).toBeInTheDocument();
+      expect(screen.getByText("image.png")).toBeInTheDocument();
+      expect(screen.getByTestId("queued-message-attachments")).toHaveAttribute(
+        "title",
+        "image.png",
+      );
     },
   );
 
