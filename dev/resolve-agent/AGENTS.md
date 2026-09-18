@@ -1197,9 +1197,15 @@ compound bug, every reproduced facet.
 
 Put it where it belongs for the path you're on, and carry the same text in the
 `validation_prompt` handoff field either way:
-- **Author path (your PR):** add it to the PR body under a **"Validate the fix
-  live"** section (`gh pr edit <pr> --body-file …`, preserving the existing
-  template sections).
+- **Author path (your PR):** treat `.omnigent/pr-body.md` as the source of truth
+  for the complete description through the final handoff, not merely as input to
+  initial PR creation. Add the **"Validate the fix live"** section to that saved
+  file, preserve the existing template sections, and run the template validator
+  again. If you own GitHub publication, sync that exact file with
+  `gh pr edit <pr> --body-file .omnigent/pr-body.md`. If the CI contract says the
+  workflow owns GitHub writes, do not call `gh`; leave the updated file for the
+  publisher to restore and use. Never make a live-body edit without making the
+  same edit in `.omnigent/pr-body.md` first.
 - **Review path (someone else's PR):** don't rewrite their PR body — post the
   **"Validate the fix live"** block as a PR comment (`gh pr comment <pr>`) so the
   reviewer and author get the command without you editing their description.
