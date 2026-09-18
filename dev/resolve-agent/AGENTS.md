@@ -127,7 +127,10 @@ Plus optional fields:
   locally but does not push the branch or open the PR** (Step 3), leaving the
   commit in the local worktree for a human to inspect, push, and PR. It has no
   effect on the reproduction-driven review path. Review-remediation ignores it
-  and follows its workflow-provided push contract. Off by default.
+  and follows its workflow-provided push contract. This is a local-only mode,
+  not the signal for workflow-owned PR publication; a later explicit publisher
+  contract is authoritative and requires the PR body before final handoff. Off
+  by default.
 - `public` (optional, boolean) — when `true`, share this session public-read as
   the first thing you do in preflight (see Preflight). Off by default: locally
   the session is already yours to browse; sharing is for spectating a live run
@@ -682,9 +685,13 @@ then goes straight to Step 4 to land it.) Once the set is genuinely green:
 When a later CI publication contract says the workflow owns GitHub writes, obey
 that contract: do not push or call `gh pr create`. You must still prepare and
 validate `.omnigent/pr-body.md` exactly as described in Step 3.4 before writing
-the final handoff. The publisher restores that file with the committed checkpoint
-and uses it as the PR description; without it, the publisher can only construct a
-less readable description from machine-oriented handoff fields.
+the final handoff. `.omnigent/` is intentionally gitignored, so this transport
+does not rely on the file being committed: the workflow captures `pr-body.md`
+separately in the resolve artifact bundle alongside the committed checkpoint,
+then restores it into the publication worktree before running the PR finalizer.
+The finalizer validates and uses that restored file as the PR description;
+without it, the publisher can only construct a less readable fallback from
+machine-oriented handoff fields.
 
 ### Get the GitHub write token (needed for every push / `gh` write)
 
@@ -752,10 +759,15 @@ Once the set is genuinely green:
    to confirm the staged set is only the fix + test. If a recording or handoff
    file already landed in an earlier commit on this branch, remove it (e.g.
    `git rm --cached`) so it never reaches the PR.
-2. **If the input has `skip_push: true`, stop here** — the fix is committed
-   locally; do **not** push and do **not** open a PR. Report the branch name in
-   your output (`pushed_branch`) so a human can inspect, push, and PR it. The
-   focused local validation in 2B.5 still runs before the handoff is written.
+2. **If the input has `skip_push: true` and no later workflow-owned publisher
+   contract, stop here** — the fix is committed locally; do **not** push and do
+   **not** open a PR. Report the branch name in your output (`pushed_branch`) so
+   a human can inspect, push, and PR it. The focused local validation in 2B.5
+   still runs before the handoff is written. A workflow-owned publisher contract
+   is a separate, authoritative mode: do not take this early exit when one is
+   present. Continue through Step 3.4, prepare and validate `.omnigent/pr-body.md`,
+   then hand the committed fix and saved body to the publisher without making
+   GitHub writes yourself.
 3. Otherwise **push** the branch. **First make sure `git push` / `gh` have the
    write token — see "Get the GitHub write token" below.** Your shell does **not**
    inherit `GH_TOKEN` (you run in the session's runner, not the CI wrapper's
@@ -769,9 +781,10 @@ Once the set is genuinely green:
    that file. Otherwise create `.omnigent/pr-body.md` with concise **Related
    issue**, **Summary**, and **Test Plan** sections. Pass the finished file to
    `gh pr create --body-file .omnigent/pr-body.md`. The
-   workflow-owned publisher also reads this file if it has to finish publication
-   after your session ends, so write it before the GitHub call. Link the bug in
-   the template's **Related issue** section.
+   workflow-owned publisher also restores this file from the resolve artifact
+   bundle if it has to finish publication after your session ends, so write it
+   before the GitHub call or final handoff. Link the bug in the template's
+   **Related issue** section.
 
    Write the description for a reviewer, not for the handoff parser:
 
