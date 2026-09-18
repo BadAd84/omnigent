@@ -12,6 +12,14 @@ UI or automatic image/pool management. First configure the native controllers,
 RBAC, networking, and generic fallback using the
 [warm-pool runbook](../../deploy/kubernetes/overlays/sandbox-runners/warm-pool/README.md).
 
+Install the Kubernetes extra explicitly in a development checkout:
+
+```bash
+uv sync --frozen --extra all --extra kubernetes --group dev
+```
+
+For a Vault-backed credential store, also pass `--extra vault`.
+
 ## Build a seed image
 
 Supply a GitHub token through `OMNIGENT_WORKSPACE_SEED_GITHUB_TOKEN` in the build
