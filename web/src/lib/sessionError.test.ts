@@ -74,6 +74,29 @@ describe("latestActivityIsError", () => {
     expect(latestActivityErrorState([older, disconnected], true)).toBe("recovered_disconnect");
   });
 
+  it("does not reach across a newer disconnect boundary for native API error text", () => {
+    const nativeError = {
+      ...text("API Error: Request rejected (429)"),
+      ctx: { ...ctx, responseId: "r0", turn: 0 },
+    };
+    const disconnected = {
+      ...error,
+      ctx: { ...ctx, responseId: "r1", turn: 1 },
+      code: "runner_disconnected",
+    };
+
+    expect(latestActivityErrorState([nativeError, disconnected], true)).toBe(
+      "recovered_disconnect",
+    );
+    expect(latestActivityErrorState([nativeError, disconnected], false)).toBe("disconnected");
+  });
+
+  it("preserves same-response native API error text before a disconnect", () => {
+    const nativeError = text("API Error: Request rejected (429)");
+    const disconnected = { ...error, code: "runner_disconnected" };
+    expect(latestActivityErrorState([nativeError, disconnected], true)).toBe("error");
+  });
+
   it("lets a recovered disconnect override its generic failed lifecycle marker", () => {
     const disconnected = { ...error, code: "runner_disconnected" };
     expect(

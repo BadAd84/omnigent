@@ -58,6 +58,8 @@ async function fetchLatestError(
       // The item this badge read anchored on was deleted between requests. A
       // disconnect boundary is unknowable now, so retain a conservative fault.
       if (isStaleCursorError(err)) return needsOlderBoundary ? "error" : null;
+      const aborted = signal.aborted || (err instanceof Error && err.name === "AbortError");
+      if (needsOlderBoundary && !aborted) return "error";
       throw err;
     }
     const combined = latestActivityErrorWindow(

@@ -9,7 +9,10 @@ import { fetchSessionItemsPage, type SessionItemsPage } from "@/lib/sessionsApi"
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { useSessionErrors, useSessionErrorStates } from "./useSessionErrors";
 
-vi.mock("@/lib/sessionsApi", () => ({ fetchSessionItemsPage: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  ApiError: class ApiError extends Error {},
+  fetchSessionItemsPage: vi.fn(),
+}));
 const fetchPage = vi.mocked(fetchSessionItemsPage);
 const session = { id: "session1", updated_at: 100, status: "idle" as const };
 const message = (text: string): MessageItem => ({
@@ -153,6 +156,21 @@ describe("useSessionErrors", () => {
     );
 
     await waitFor(() => expect(hook.result.current).toEqual(["error"]));
+  });
+
+  it("keeps partial disconnect evidence when its pagination request returns 503", async () => {
+    const disconnect = disconnectPage.items[0]!;
+    fetchPage
+      .mockResolvedValueOnce({ items: [disconnect], hasMore: true })
+      .mockRejectedValueOnce(new Error("503 Service Unavailable"));
+    const { wrapper } = harness();
+    const hook = renderHook(
+      () => useSessionErrorStates([{ ...session, status: "failed", host_online: true }]),
+      { wrapper },
+    );
+
+    await waitFor(() => expect(hook.result.current).toEqual(["error"]));
+    expect(fetchPage).toHaveBeenCalledTimes(2);
   });
 
   it("flags an unopened idle session from its latest native message and reuses the cache", async () => {

@@ -41,6 +41,9 @@ export function latestActivityErrorWindow(
         return { state: "error", boundaryResolved: true };
       }
       case "text_done":
+        if (boundary && !sameCausalBoundary(boundary, block.ctx)) {
+          return { state: resolvedFailure(), boundaryResolved: true };
+        }
         // Claude's native transcript can persist an API rejection as ordinary
         // assistant text, without an error item or a failed session status.
         return {
