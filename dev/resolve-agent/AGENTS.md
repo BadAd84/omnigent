@@ -128,9 +128,9 @@ Plus optional fields:
   commit in the local worktree for a human to inspect, push, and PR. It has no
   effect on the reproduction-driven review path. Review-remediation ignores it
   and follows its workflow-provided push contract. This is a local-only mode,
-  not the signal for workflow-owned PR publication; a later explicit publisher
-  contract is authoritative and requires the PR body before final handoff. Off
-  by default.
+  not the signal for workflow-owned PR publication. It takes precedence over a
+  generic publisher overlay because the workflow suppresses its finalizer when
+  `skip_push` is true. Off by default.
 - `public` (optional, boolean) — when `true`, share this session public-read as
   the first thing you do in preflight (see Preflight). Off by default: locally
   the session is already yours to browse; sharing is for spectating a live run
@@ -682,16 +682,26 @@ This step applies **only when you authored a fix in Step 2B** — it's about
 *opening* a PR. (The review path 2A adopts the existing PR instead of opening one,
 then goes straight to Step 4 to land it.) Once the set is genuinely green:
 
-When a later CI publication contract says the workflow owns GitHub writes, obey
-that contract: do not push or call `gh pr create`. You must still prepare and
-validate `.omnigent/pr-body.md` exactly as described in Step 3.4 before writing
-the final handoff. `.omnigent/` is intentionally gitignored, so this transport
-does not rely on the file being committed: the workflow captures `pr-body.md`
-separately in the resolve artifact bundle alongside the committed checkpoint,
-then restores it into the publication worktree before running the PR finalizer.
-The finalizer validates and uses that restored file as the PR description;
-without it, the publisher can only construct a less readable fallback from
-machine-oriented handoff fields.
+### Choose the publication mode before proceeding
+
+- **Local-only (`skip_push: true`)** — commit the fix and stop at Step 3.2. No PR
+  will be published automatically, so do not prepare a PR body or run Step 4.
+  This takes precedence even when CI appended a generic publisher contract.
+- **Workflow-owned publication (`skip_push: false` plus an explicit CI publisher
+  contract)** — do not push or make any `gh` write. Complete Step 3.4, including
+  the deferred live-validation preparation described in Step 4.4, then write the
+  final handoff and stop. The publisher performs the GitHub writes; do not run
+  the PR-facing CI/preview/review loop in the rest of Step 4.
+- **Direct publication (no publisher contract)** — perform all of Step 3, then
+  drive the published PR through Step 4.
+
+In workflow-owned mode, `.omnigent/` is intentionally gitignored, so body
+transport does not rely on the file being committed. The workflow captures
+`pr-body.md` separately in the resolve artifact bundle alongside the committed
+checkpoint, then restores it into the publication worktree before running the PR
+finalizer. The finalizer validates and uses that restored file as the PR
+description; without it, the publisher can only construct a less readable
+fallback from machine-oriented handoff fields.
 
 ### Get the GitHub write token (needed for every push / `gh` write)
 
@@ -759,15 +769,12 @@ Once the set is genuinely green:
    to confirm the staged set is only the fix + test. If a recording or handoff
    file already landed in an earlier commit on this branch, remove it (e.g.
    `git rm --cached`) so it never reaches the PR.
-2. **If the input has `skip_push: true` and no later workflow-owned publisher
-   contract, stop here** — the fix is committed locally; do **not** push and do
-   **not** open a PR. Report the branch name in your output (`pushed_branch`) so
-   a human can inspect, push, and PR it. The focused local validation in 2B.5
-   still runs before the handoff is written. A workflow-owned publisher contract
-   is a separate, authoritative mode: do not take this early exit when one is
-   present. Continue through Step 3.4, prepare and validate `.omnigent/pr-body.md`,
-   then hand the committed fix and saved body to the publisher without making
-   GitHub writes yourself.
+2. **If the input has `skip_push: true`, stop here** — the fix is committed
+   locally; do **not** push and do **not** open a PR. Report the branch name in
+   your output (`pushed_branch`) so a human can inspect, push, and PR it. The
+   focused local validation in 2B.5 still runs before the handoff is written.
+   This local-only input also suppresses workflow-owned publication; never treat
+   the presence of the generic CI publisher overlay as permission to continue.
 3. Otherwise **push** the branch. **First make sure `git push` / `gh` have the
    write token — see "Get the GitHub write token" below.** Your shell does **not**
    inherit `GH_TOKEN` (you run in the session's runner, not the CI wrapper's
@@ -865,11 +872,14 @@ opened (author path, Step 2B/3) **and** the existing PR you reviewed and kept as
 the fix (review path, Step 2A, when its approach was sound). The goal is identical
 either way: a live preview, green CI, a clean automated review, a copy-paste
 live-validation command, and a maintainer tagged. `skip_push` runs (author path
-that only committed locally) are the sole exception — there is no PR to land, so
-skip Step 4. Once the PR is up you **stay on it** until CI is green and the review
-is clean, then hand it to a human. The sub-steps overlap in time (kick off the
-preview and the first review, then poll), so don't serialize what can run
-concurrently.
+that only committed locally) have no PR to land, so skip Step 4 entirely.
+Workflow-owned author runs also have no PR during the agent session: perform only
+the deferred body/prompt preparation called out in Step 4.4 before the final
+handoff, and leave preview, CI, Polly, GitHub comments, and maintainer tagging to
+the post-publication workflow. Once a directly published or reviewed PR is up you
+**stay on it** until CI is green and the review is clean, then hand it to a
+human. The sub-steps overlap in time (kick off the preview and the first review,
+then poll), so don't serialize what can run concurrently.
 
 **Whose branch — push or take over.** On the **author path** the PR is yours: push
 fix commits freely. On the **review path** the PR is someone else's; whether you
@@ -1210,15 +1220,21 @@ compound bug, every reproduced facet.
 
 Put it where it belongs for the path you're on, and carry the same text in the
 `validation_prompt` handoff field either way:
-- **Author path (your PR):** treat `.omnigent/pr-body.md` as the source of truth
-  for the complete description through the final handoff, not merely as input to
-  initial PR creation. Add the **"Validate the fix live"** section to that saved
-  file, preserve the existing template sections, and run the template validator
-  again. If you own GitHub publication, sync that exact file with
-  `gh pr edit <pr> --body-file .omnigent/pr-body.md`. If the CI contract says the
-  workflow owns GitHub writes, do not call `gh`; leave the updated file for the
-  publisher to restore and use. Never make a live-body edit without making the
-  same edit in `.omnigent/pr-body.md` first.
+- **Direct author path (your PR already exists):** treat
+  `.omnigent/pr-body.md` as the source of truth for the complete description
+  through the final handoff, not merely as input to initial PR creation. Add the
+  **"Validate the fix live"** section to that saved file, preserve the existing
+  template sections, run the template validator again, then sync that exact file
+  with `gh pr edit <pr> --body-file .omnigent/pr-body.md`. Never make a live-body
+  edit without making the same edit in the saved file first.
+- **Workflow-owned author path (no PR exists yet):** before the final handoff,
+  generate the bare `validation_prompt` from the recovered journey and add a
+  **"Validate the fix live"** section to `.omnigent/pr-body.md`. Since there is
+  no preview URL or PR number yet, use the server-surface command without
+  `--server`, or plain instructions to check out the eventual PR for a
+  runner/`both` surface. Validate the saved body, make no `gh` call, and leave it
+  in the worktree for the resolve artifact bundle. This prompt/body preparation
+  is the only part of Step 4 performed in deferred mode.
 - **Review path (someone else's PR):** don't rewrite their PR body — post the
   **"Validate the fix live"** block as a PR comment (`gh pr comment <pr>`) so the
   reviewer and author get the command without you editing their description.
