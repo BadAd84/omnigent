@@ -23,17 +23,39 @@ import asyncio
 import logging
 import threading
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from cachetools import TTLCache
 
 from omnigent._platform import normalize_interactive_shells
+from omnigent.db.account_authority import (
+    AccountAuthority,
+    account_generation,
+    current_account_user,
+)
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.host.frames import HostHelloFrame, HostSkillsResultFrame
 
 _logger = logging.getLogger(__name__)
+
+_expected_host_owner: ContextVar[AccountAuthority | None] = ContextVar(
+    "expected_host_owner", default=None
+)
+
+
+@contextmanager
+def host_owner_scope(user_id: str | None, generation: str | None) -> Iterator[None]:
+    """Restrict scheduled host RPCs to their saved owner's registration."""
+    owner = AccountAuthority(user_id, generation, current_workspace_id()) if user_id else None
+    token = _expected_host_owner.set(owner)
+    try:
+        yield
+    finally:
+        _expected_host_owner.reset(token)
 
 
 def _canonical_host_id(host_id: str) -> str:
@@ -270,6 +292,7 @@ class HostConnection:
     outbound_queue: asyncio.Queue[str | None]
     connected_at: float
     last_frame_at: float
+    account_generation: str | None = None
     pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
         default_factory=dict,
     )
@@ -349,6 +372,9 @@ class HostRegistry:
         # server re-learns it from the reconnect handshake.
         self._gateway_inference: dict[str, dict[str, bool]] = {}
         self._interactive_shells: dict[str, list[str]] = {}
+        self.launch_authorizer: (
+            Callable[[str, str, str | None, str | None, bool, str | None], None] | None
+        ) = None
 
     def register(
         self,
@@ -392,6 +418,7 @@ class HostRegistry:
             ws=ws,
             hello=hello,
             owner=owner,
+            account_generation=account_generation(owner) if owner else None,
             outbound_queue=asyncio.Queue(),
             connected_at=now,
             last_frame_at=now,
@@ -560,6 +587,26 @@ class HostRegistry:
             reported = self._interactive_shells.get(_canonical_host_id(host_id))
         return list(reported) if reported is not None else None
 
+    async def admit_launch(
+        self,
+        conn: HostConnection,
+        session_id: str,
+        *,
+        allow_unbound: bool = False,
+        transfer_from_host_id: str | None = None,
+    ) -> None:
+        """Reauthorize immediately before a new runner binding is created."""
+        if self.launch_authorizer is not None:
+            await asyncio.to_thread(
+                self.launch_authorizer,
+                conn.host_id,
+                session_id,
+                conn.owner,
+                conn.account_generation,
+                allow_unbound,
+                transfer_from_host_id,
+            )
+
     def send_text(self, conn: HostConnection, data: str) -> None:
         """Enqueue a text frame for sending to the host.
 
@@ -574,8 +621,23 @@ class HostRegistry:
         :param conn: The target host connection.
         :param data: JSON-encoded frame text.
         :raises ConnectionError: If the connection has been
-            replaced (the outbound queue was poisoned).
+            replaced or its owner does not match captured authority.
         """
+        expected = _expected_host_owner.get()
+        if (
+            expected is not None
+            and expected.workspace_id == current_workspace_id()
+            and (conn.workspace_id, conn.owner, conn.account_generation)
+            != (expected.workspace_id, expected.user_id, expected.generation)
+        ):
+            raise ConnectionError(f"host {conn.host_id!r} account ownership changed")
+        actor = current_account_user()
+        if (
+            actor is not None
+            and actor == conn.owner
+            and account_generation(actor) != conn.account_generation
+        ):
+            raise ConnectionError(f"host {conn.host_id!r} account registration changed")
         with self._lock:
             current = self._hosts.get((conn.workspace_id, conn.host_id))
             if current is not conn:

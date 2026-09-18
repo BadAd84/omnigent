@@ -13087,10 +13087,25 @@ def _build_spawn_env_from_spec(
     # dispatch, model-key lookup, and logging below all key off the base harness;
     # the concrete agent's slug is read from the spec by ``_build_acp_spawn_env``.
     harness = canonicalize_harness(harness) or harness
+    acp_default_model: str | None = None
+    if harness == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        acp_default_model = _acp_launch_model(spec)
+        validate_acp_model(spec, acp_default_model)
+        validate_acp_model(spec, model_override)
     effective_spec = spec
     if model_override is not None:
         executor = getattr(spec, "executor", None)
-        if hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
+        if (
+            harness == "acp"
+            and dataclasses.is_dataclass(spec)
+            and dataclasses.is_dataclass(executor)
+        ):
+            effective_spec = dataclasses.replace(
+                spec, executor=dataclasses.replace(spec.executor, model=model_override)
+            )
+        elif hasattr(spec, "model_copy") and hasattr(executor, "model_copy"):
             copied_executor = cast(_ModelCopyValue, executor).model_copy(
                 update={"model": model_override}
             )
@@ -13137,6 +13152,9 @@ def _build_spawn_env_from_spec(
             env = _build_goose_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness == "acp":
             env = _build_acp_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            # Reset uses the original default even when the process launched
+            # with a session override. Empty defers to the vendor's first model.
+            env["HARNESS_ACP_DEFAULT_MODEL"] = acp_default_model or ""
         elif harness == "copilot":
             env = _build_copilot_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
         elif harness in ACP_CLI_HARNESSES:

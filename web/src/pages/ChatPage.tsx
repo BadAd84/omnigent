@@ -872,7 +872,6 @@ export function ChatPage() {
   }, [activeConv?.title, subAgentTabTitle, showsWorking, urlConvId, appName]);
 
   const sessionModelOptions = useChatStore((s) => s.codexModelOptions);
-  const selectedModel = useChatStore((s) => s.selectedModel);
   const llmModel = useChatStore((s) => s.llmModel);
   const sessionModelOverrideForEffort = useChatStore((s) => s.sessionModelOverride);
   // Pre-catalog fallback: a fresh native session's own catalog only arrives
@@ -1074,10 +1073,9 @@ export function ChatPage() {
     composerSessionModelSeeded,
     activeConversationId,
   ]);
-  const modelPickerKind = modelPickerKindForConv(capabilitySource);
+  const modelPickerKind = modelPickerKindForConv(capabilitySource, codexModelOptions);
   // Effort ladders key on the model the session is actually on — the reported
-  // `llmModel` — then the session's pinned `model_override`, and only then the
-  // sticky preference. The override matters for a harness that never reports a
+  // `llmModel` — then the session's pinned `model_override`. The override matters for a harness that never reports a
   // concrete model (devin pins the family there): without it the lookup finds no
   // catalog row and a per-model ladder comes back empty, hiding the picker.
   // Memoized because codex-native resolves via codexEffortLevelsForModel, which
@@ -1089,9 +1087,9 @@ export function ChatPage() {
       effortLevelsForConv(
         capabilitySource,
         codexModelOptions,
-        llmModel ?? sessionModelOverrideForEffort ?? selectedModel,
+        llmModel ?? sessionModelOverrideForEffort,
       ),
-    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort, selectedModel],
+    [capabilitySource, codexModelOptions, llmModel, sessionModelOverrideForEffort],
   );
   const showEffort = shouldShowEffortPicker(capabilitySource) && effortLevels.length > 0;
 
@@ -4277,7 +4275,8 @@ const PI_NATIVE_EFFORT_LEVELS = [
   "max",
 ] as const;
 
-type NativeModelPickerKind = "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin";
+type NativeModelPickerKind =
+  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4408,6 +4407,7 @@ export function modelPickerKindForConv(
       }
     | null
     | undefined,
+  modelOptions: readonly NativeModelOption[] = [],
 ): NativeModelPickerKind | null {
   switch (effectiveWrapperLabel(conv)) {
     case "claude-code-native-ui":
@@ -4437,6 +4437,9 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
+      // Generic ACP sessions carry no wrapper label; the server canonicalizes
+      // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
+      if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
       return null;
   }
 }
@@ -4444,8 +4447,9 @@ export function modelPickerKindForConv(
 export function shouldShowModelPicker(
   conv:
     { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+  modelOptions: readonly NativeModelOption[] = [],
 ): boolean {
-  return modelPickerKindForConv(conv) !== null;
+  return modelPickerKindForConv(conv, modelOptions) !== null;
 }
 
 /**
@@ -4979,19 +4983,10 @@ function useSessionConfigSummary({
  * The effort this conversation is actually at.
  *
  * `sessionReasoningEffort` is conversation-scoped, so two live conversations at
- * different efforts each read their own; `selectedEffort` is the single
- * app-global sticky pick, used only as the pre-hydration fallback. Reading the
- * sticky pick alone would show a warm-switched conversation the last effort
- * picked anywhere.
+ * different efforts each read their own.
  */
 function useSessionEffort(): string | null {
-  const sessionReasoningEffort = useChatStore((s) => s.sessionReasoningEffort);
-  const seeded = useChatStore((s) => s.sessionEffortSeeded);
-  const stickyEffort = useChatStore((s) => s.selectedEffort);
-  // A seeded conversation's effort is authoritative even when null (an
-  // intentional "no effort" from the create), so it never borrows the
-  // app-global sticky pick; only an unhydrated conversation falls back.
-  return seeded ? sessionReasoningEffort : (sessionReasoningEffort ?? stickyEffort);
+  return useChatStore((s) => s.sessionReasoningEffort);
 }
 
 /**
@@ -5027,7 +5022,8 @@ function useResolvedComposerModel(
     modelPickerKind === "kiro" ||
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
-    modelPickerKind === "devin";
+    modelPickerKind === "devin" ||
+    modelPickerKind === "acp";
   const modelOptions: readonly {
     id: string;
     model?: string;
@@ -5041,9 +5037,8 @@ function useResolvedComposerModel(
   // native sessions: `llmModel` carries the verbatim reported model (the
   // launch's own report, or an in-pane switch), and the chip, the gear
   // highlight, and the hover summary all resolve from it alone. The user's
-  // request (`sessionModelOverride`) and the cross-session sticky
-  // (`selectedModel`) are inputs, never display state — rendering a request
-  // as if it were truth is exactly how a record/pane divergence hides.
+  // request (`sessionModelOverride`) is input, never display state — rendering
+  // a request as if it were truth is exactly how a record/pane divergence hides.
   const isReportedModelPicker = modelPickerKind === "claude" || modelPickerKind === "codex";
   // The row the reported model maps to: its catalog row when one matches
   // exactly (by id or wire model), else the raw reported value itself — the
@@ -5068,7 +5063,7 @@ function useResolvedComposerModel(
   // mirror both ways into ``model_override``. Those wrappers keep their
   // override-derived surface until they adopt reported-model semantics.
   // SDK/bundle agents (no native picker) resolve the session override or the
-  // bound default — never the cross-session sticky.
+  // bound default.
   const pickerSelectedModel = isReportedModelPicker
     ? (reportedRowId ?? requestedRowId)
     : sessionModelOverride;

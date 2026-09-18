@@ -2976,7 +2976,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
     assert exc.value.status_code == 409
     assert "host lifecycle" in exc.value.detail
     assert len(fake.host_starts) == 1
-    assert fake.terminated == [active.name]
+    assert fake.terminated == []
     still_pending = host_store.get_host(active.host_id)
     assert still_pending is not None
     assert still_pending.sandbox_id is None
@@ -2984,7 +2984,7 @@ async def test_relaunch_rejects_pending_reused_id_then_allows_retry(db_uri: str)
 
     reaper = ManagedSandboxReaper(host_store=host_store, sandbox_config=config)
     assert await reaper.sweep_once() == 1
-    assert fake.terminated == [active.name, active.name]
+    assert fake.terminated == [active.name]
     cleared = host_store.get_host(active.host_id)
     assert cleared is not None
     assert cleared.sandbox_id is None
@@ -5582,3 +5582,58 @@ def test_keep_warm_sets_runner_idle_timeout() -> None:
     assert _apply_keep_warm({"x": 1}, None) == {"x": 1}
     with pytest.raises(ValueError):
         _parse_keep_warm_s({"keep_warm_s": -5})
+
+
+@pytest.mark.parametrize("relaunch", [False, True])
+async def test_account_deleted_after_provision_terminates_unregistered_sandbox(db_uri, relaunch):
+    from omnigent.db.account_authority import account_authority_scope
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    account = accounts.create_user_with_password(_OWNER, "test-password-hash")
+    hosts = HostStore(db_uri)
+
+    def connect(invocation):
+        hosts.upsert_on_connect(invocation.host_id, invocation.host_name, _OWNER)
+
+    fake = FakeSandboxLauncher(on_host_start=connect)
+    config = _injected_config(fake)
+    host = None
+    if relaunch:
+        first = await launch_managed_host(config=config, owner=_OWNER, host_store=hosts)
+        host = hosts.get_host(first.host_id)
+    provision = fake.provision
+    unregistered = []
+
+    def delete_after_provision(name):
+        sandbox_id = provision(name)
+        unregistered.append(sandbox_id)
+        assert accounts.delete_user(_OWNER) is True
+        return sandbox_id
+
+    fake.provision = delete_after_provision
+    with account_authority_scope(_OWNER, account.account_generation):
+        with pytest.raises(HTTPException) as error:
+            if relaunch:
+                await relaunch_managed_host(config=config, host=host, host_store=hosts)
+            else:
+                await launch_managed_host(config=config, owner=_OWNER, host_store=hosts)
+    assert "revoked" in str(error.value.detail)
+    assert len(unregistered) == 1
+    assert unregistered[0] in fake.terminated
+    assert len(fake.host_starts) == (1 if relaunch else 0)
+
+
+async def test_registration_database_failure_still_attempts_provider_cleanup(db_uri, monkeypatch):
+    hosts = HostStore(db_uri)
+    fake = FakeSandboxLauncher()
+
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(hosts, "register_managed_host", unavailable)
+    monkeypatch.setattr(hosts, "get_host", unavailable)
+    with pytest.raises(HTTPException, match="database unavailable"):
+        await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
+    assert len(fake.terminated) == 1
+    assert fake.host_starts == []

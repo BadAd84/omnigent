@@ -70,6 +70,7 @@ from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_agent_name,
     native_coding_agent_for_harness,
+    native_coding_agent_for_wrapper_label,
 )
 from omnigent.policies.types import (
     ElicitationRequest,
@@ -289,6 +290,7 @@ from omnigent.server.routes._sessions.helpers import (
     _publish_error_event,
     _publish_external_conversation_item,
     _publish_input_consumed,
+    _publish_model_options,
     _publish_sandbox_status,
     _publish_status,
     _publish_terminal_pending,
@@ -9023,6 +9025,42 @@ async def _create_session_from_existing_agent(
             _validated_harness_override, body.harness_override, agent
         )
 
+    if agent_cache is not None:
+        from omnigent.harness_aliases import canonicalize_harness
+        from omnigent.models.model_catalog import (
+            _acp_launch_model,
+            validate_acp_model,
+        )
+        from omnigent.runtime.workflow import _find_spec_by_name
+
+        try:
+            selection_spec = (
+                await asyncio.to_thread(
+                    agent_cache.load,
+                    agent.id,
+                    agent.bundle_location,
+                    expand_env=agent.session_id is None,
+                )
+            ).spec
+        except (KeyError, AttributeError, ValueError, ImportError, OSError):
+            if model_override is not None:
+                raise
+            # Without a selection, retain creation when the harness is unknown.
+            _logger.debug(
+                "create-time model policy: agent %r failed to load", agent.name, exc_info=True
+            )
+            selection_spec = None
+        if selection_spec is not None and body.sub_agent_name:
+            selection_spec = _find_spec_by_name(selection_spec, body.sub_agent_name)
+        if (
+            selection_spec is not None
+            and canonicalize_harness(harness_override or _spec_harness(selection_spec)) == "acp"
+        ):
+            default_model = await asyncio.to_thread(_acp_launch_model, selection_spec)
+            await asyncio.to_thread(validate_acp_model, selection_spec, default_model)
+            if model_override is not None:
+                await asyncio.to_thread(validate_acp_model, selection_spec, model_override)
+
     # Inherit runner affinity from the parent session so the child
     # is assigned to the same runner (sub-agent co-location).
     inherited_runner_id: str | None = None
@@ -9570,6 +9608,11 @@ def _create_session_from_bundle(
             enforce_handler_allowlist=not local_single_user_enabled(),
         )
     assert spec.name is not None
+
+    if _spec_harness(spec) == "acp":
+        from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+
+        validate_acp_model(spec, _acp_launch_model(spec))
 
     if metadata.reasoning_effort is None and spec.executor.reasoning_effort is not None:
         _, seeded_effort = validate_session_model_metadata(
@@ -10123,6 +10166,7 @@ async def _fetch_model_options(
     runner_client: httpx.AsyncClient | None,
     session_id: str,
     conv: Conversation,
+    agent_store: AgentStore | None = None,
 ) -> list[dict[str, Any]]:
     """
     Resolve the Web UI model-picker options for a native session.
@@ -10141,12 +10185,20 @@ async def _fetch_model_options(
       With no runner bound and a cold cache (server restart while the
       session slept), the session's host resolves a pre-launch preview
       instead — the same source the new-session picker uses.
+    * **acp** — the deployment's curated provider ``models:`` shortlist from
+      the session's explicit provider (provider default first). Local to the
+      server, so a cold cache re-resolves inline with no runner round trip.
+      Served only when the deployment actually curated a set (2+ models); a
+      session configured without one shows no picker, matching pi-native's
+      no-scope-when-uncurated rule.
 
     :param runner_client: HTTP client pointed at the bound runner, or
         ``None`` when no runner is bound.
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row whose labels identify the wrapper.
+    :param agent_store: Optional store for the ACP spec lookup; resolves
+        from the runtime globals when ``None``.
     :returns: Model options, or ``[]`` when the session has no model picker or
         the runner-owned options are not yet available.
     """
@@ -10161,6 +10213,11 @@ async def _fetch_model_options(
         return _pushed_model_options_cache.get(session_id, [])
     endpoint = _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER.get(wrapper or "")
     if endpoint is None:
+        # Generic ACP sessions carry no native wrapper label; their picker
+        # serves the deployment's curated provider ``models:`` shortlist
+        # resolved from the spec instead of a runner-owned catalog.
+        if _resolve_harness_impl_is_acp(conv, agent_store):
+            return await _load_acp_model_options(session_id, conv, agent_store)
         return []
     cached = _model_options_cache.get(session_id)
     if runner_client is None:
@@ -10238,6 +10295,132 @@ async def _codex_side_chat_fork_sealed(conv: Conversation, conv_store: Conversat
         return False
     parent = await asyncio.to_thread(conv_store.get_conversation, conv.parent_conversation_id)
     return parent is not None and bool(parent.runner_id) and parent.runner_id != conv.runner_id
+
+
+def _resolve_harness_impl_is_acp(conv: Conversation, agent_store: AgentStore | None) -> bool:
+    """Return whether *conv* runs a generic ``acp`` harness.
+
+    ``canonicalize_harness`` folds ``acp:<slug>`` ids to ``"acp"``, so any
+    configured or embedded generic ACP agent matches.
+
+    :param conv: Conversation row the session snapshot was built from.
+    :param agent_store: Optional store for the harness lookup; ``None`` lets
+        :func:`_resolve_harness` fall back to the runtime global.
+    :returns: ``True`` when the session's resolved harness is ``"acp"``.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+
+    return canonicalize_harness(_resolve_harness(conv, agent_store=agent_store)) == "acp"
+
+
+def _validate_session_model_selection(
+    conv: Conversation, model: str | None, agent_store: AgentStore
+) -> None:
+    """Validate a model mutation against the resolved harness and current provider config.
+
+    :param conv: The conversation whose model is changing.
+    :param model: Requested model id, or ``None`` to restore the configured default.
+    :param agent_store: Store for loading the conversation's bound agent spec.
+    :raises OmnigentError: If the harness cannot be resolved or its model policy rejects the pick.
+    """
+    from omnigent.harness_aliases import canonicalize_harness
+    from omnigent.models.model_catalog import _acp_launch_model, validate_acp_model
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    harness = canonicalize_harness(conv.harness_override)
+    if harness and harness != "acp":
+        return
+    if not harness and native_coding_agent_for_wrapper_label(
+        conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    ):
+        return
+    try:
+        root_spec = _load_agent_spec_for_session(conv, agent_store)
+        selection_spec = root_spec
+        if root_spec is not None and conv.sub_agent_name:
+            selection_spec = _find_spec_by_name(root_spec, conv.sub_agent_name)
+        if root_spec is None or selection_spec is None:
+            raise OmnigentError(
+                "Cannot resolve the session's agent spec to validate model selection.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        harness = harness or canonicalize_harness(
+            selection_spec.executor.config.get("harness")
+            or root_spec.executor.config.get("harness")
+            or selection_spec.executor.type
+        )
+    except OmnigentError:
+        raise
+    except Exception as exc:
+        raise OmnigentError(
+            "Cannot load the session's agent spec to validate model selection.",
+            code=ErrorCode.INVALID_INPUT,
+        ) from exc
+    if not harness or harness == "omnigent":
+        raise OmnigentError(
+            "Cannot resolve the session's harness to validate model selection.",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    if harness == "acp":
+        validate_acp_model(selection_spec, _acp_launch_model(selection_spec))
+        validate_acp_model(selection_spec, model)
+
+
+async def _load_acp_model_options(
+    session_id: str,
+    conv: Conversation,
+    agent_store: AgentStore | None,
+) -> list[dict[str, Any]]:
+    """Resolve the curated picker options for a generic ACP session.
+
+    Serves the explicitly selected provider's verified shortlist in provider
+    order. The default row restores the agent's configured launch model.
+    The resolved options, including an empty catalog, stay cached while the
+    session sleeps without needing a runner round trip. Spec and provider
+    configuration reads run off the event loop.
+
+    Fewer than two curated models returns ``[]`` so the picker does not render.
+
+    :param session_id: Session/conversation identifier, e.g. ``"conv_abc"``.
+    :param conv: Conversation row the options are resolved for.
+    :param agent_store: Store for the bound-agent spec load; ``None`` falls
+        back to the runtime global store.
+    :returns: Option dicts (``id`` / ``displayName`` / ``isDefault``), or
+        ``[]`` when nothing was curated.
+    """
+    cached = _model_options_cache.get(session_id)
+    if cached is not None:
+        return cached
+    if agent_store is None:
+        from omnigent.runtime._globals import _agent_store
+
+        agent_store = _agent_store
+    if agent_store is None:
+        return []
+    spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
+    if spec is None:
+        return []
+    from omnigent.models.model_catalog import _acp_launch_model, acp_curated_models
+    from omnigent.runtime.workflow import _find_spec_by_name
+
+    def resolve_options() -> list[dict[str, Any]]:
+        resolved_spec = spec
+        if conv.sub_agent_name:
+            resolved_spec = _find_spec_by_name(spec, conv.sub_agent_name) or spec
+        curated = acp_curated_models(resolved_spec)
+        if len(curated) < 2:
+            return []
+        default_model = _acp_launch_model(resolved_spec)
+        return [
+            {"id": model_id, "displayName": model_id, "isDefault": model_id == default_model}
+            for model_id in curated
+        ]
+
+    options = await asyncio.to_thread(resolve_options)
+    _model_options_cache[session_id] = options
+    _model_options_stale.discard(session_id)
+    _publish_model_options(session_id)
+    return options
 
 
 async def _get_session_snapshot(
@@ -10469,7 +10652,7 @@ async def _get_session_snapshot(
     # session's live Codex app-server ``model/list`` response. Best-effort
     # and cache-backed so a snapshot poll cannot wedge the
     # runner while a turn is active.
-    model_options = await _fetch_model_options(runner_client, session_id, conv)
+    model_options = await _fetch_model_options(runner_client, session_id, conv, agent_store)
     # Dynamic override from the forwarder (real Claude Code window).
     # Only present after the first statusLine tick; before that the
     # spec default applies.

@@ -173,6 +173,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status,
     _run_managed_launch,
     _spawn_archive_stop,
+    _validate_session_model_selection,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -457,6 +458,7 @@ def register_core_routes(
             permission_store=permission_store,
         )
         conn = target.conn
+        await host_registry.admit_launch(conn, session_id)
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
         # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
@@ -2247,6 +2249,18 @@ def register_core_routes(
                     f"invalid model_override: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        if model_override is not None:
+            conv_for_model = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if conv_for_model is None:
+                raise _session_not_found()
+            await asyncio.to_thread(
+                _validate_session_model_selection,
+                conv_for_model,
+                None if clear_model else model_override,
+                agent_store,
+            )
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,

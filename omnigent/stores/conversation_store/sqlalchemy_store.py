@@ -30,6 +30,7 @@ from sqlalchemy.orm import QueryableAttribute, Session, load_only
 from sqlalchemy.sql.selectable import Subquery
 
 from omnigent._wrapper_labels import UI_MODE_LABEL_KEY, WRAPPER_LABEL_KEY
+from omnigent.db.account_authority import AccountAuthority, require_active_account
 from omnigent.db.converters import sql_agent_to_entity
 from omnigent.db.db_models import (
     LABEL_VALUE_MAX_LEN,
@@ -42,6 +43,7 @@ from omnigent.db.db_models import (
     SqlPolicy,
     SqlProject,
     SqlSessionPermission,
+    SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
     uuid_to_bytes,
@@ -1644,6 +1646,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 self._upsert_daily_cost_dialect(session, dialect, user_id, day_utc, delta_usd, now)
@@ -1809,6 +1812,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         now = now_epoch()
 
         def write(session: Session) -> None:
+            require_active_account(session, user_id)
             dialect = session.bind.dialect.name if session.bind is not None else ""
             if dialect == "sqlite" or is_postgresql_family(dialect):
                 # Typed as Any to sidestep the mypy variance between the
@@ -1874,20 +1878,38 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param owner_only: Require an explicit owner-level grant.
         :returns: The grantee's user id, or ``None`` if no qualifying grant exists.
         """
+        owner = self.get_session_owner_authority(conversation_id, owner_only=owner_only)
+        return owner.user_id if owner is not None else None
+
+    def get_session_owner_authority(
+        self, conversation_id: str, *, owner_only: bool = False
+    ) -> AccountAuthority | None:
+        """Read the owner grant and registration together, including external identities."""
         from omnigent.server.auth import LEVEL_OWNER, RESERVED_USER_PUBLIC
 
         query = (
-            select(SqlSessionPermission.user_id)
+            select(SqlSessionPermission.user_id, SqlUser.account_generation)
+            .outerjoin(
+                SqlUser,
+                and_(
+                    SqlUser.workspace_id == SqlSessionPermission.workspace_id,
+                    SqlUser.id == SqlSessionPermission.user_id,
+                ),
+            )
             .where(SqlSessionPermission.workspace_id == current_workspace_id())
             .where(SqlSessionPermission.conversation_id == conversation_id)
             .where(SqlSessionPermission.user_id != RESERVED_USER_PUBLIC)
+            .where(SqlUser.deleted_at.is_(None))
             .order_by(SqlSessionPermission.level.desc())
             .limit(1)
         )
         if owner_only:
             query = query.where(SqlSessionPermission.level >= LEVEL_OWNER)
         with self._session("select_session_owner") as session:
-            return session.execute(query).scalar_one_or_none()
+            row = session.execute(query).one_or_none()
+            if row is None:
+                return None
+            return AccountAuthority(row.user_id, row.account_generation, current_workspace_id())
 
     def search(
         self,
