@@ -173,6 +173,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _publish_runner_recovered_status,
     _run_managed_launch,
     _spawn_archive_stop,
+    _validate_session_model_selection,
 )
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
@@ -457,6 +458,7 @@ def register_core_routes(
             permission_store=permission_store,
         )
         conn = target.conn
+        await host_registry.admit_launch(conn, session_id)
         binding_token = secrets.token_urlsafe(32)
         runner_id = token_bound_runner_id(binding_token)
         # Atomic bind (WHERE runner_id IS NULL) closes the TOCTOU.
@@ -2247,6 +2249,18 @@ def register_core_routes(
                     f"invalid model_override: {exc}",
                     code=ErrorCode.INVALID_INPUT,
                 ) from exc
+        if model_override is not None:
+            conv_for_model = await asyncio.to_thread(
+                conversation_store.get_conversation, session_id
+            )
+            if conv_for_model is None:
+                raise _session_not_found()
+            await asyncio.to_thread(
+                _validate_session_model_selection,
+                conv_for_model,
+                None if clear_model else model_override,
+                agent_store,
+            )
 
         # Cost-control switch: ``"off"`` is a real stored value here,
         # so the clear signal is an explicit JSON null (field present,
@@ -2315,6 +2329,7 @@ def register_core_routes(
                 conv = conversation_store.get_conversation(
                     session_id,
                 )
+                parent_initialized = False
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
                     # The versioned payload's snapshot carries harness_override,
                     # so a rebind after a cross-harness create initializes the
@@ -2331,8 +2346,6 @@ def register_core_routes(
                             ),
                             timeout=10.0,
                         )
-                        if runner_init_resp.status_code < 400:
-                            await _publish_runner_recovered_status(session_id, conversation_store)
                     except (httpx.HTTPError, ConnectionError):
                         # ConnectionError covers a tunnel close mid-POST
                         # (same source as the relay's except clause).
@@ -2341,6 +2354,8 @@ def register_core_routes(
                             session_id,
                             exc_info=True,
                         )
+                    else:
+                        parent_initialized = runner_init_resp.status_code < 400
                 if _runner_client is None:
                     # Runner deregistered between validation and
                     # lookup; PATCH still returns 200 but no
@@ -2359,6 +2374,17 @@ def register_core_routes(
                     _runner_client,
                     conversation_store,
                 )
+                if parent_initialized:
+                    assert conv is not None and _runner_client is not None
+                    await _publish_runner_recovered_status(session_id, conversation_store)
+                    from omnigent.server.child_session_recovery import restore_active_children
+
+                    await restore_active_children(
+                        conv,
+                        _runner_client,
+                        conversation_store,
+                        request.app.state.runner_session_initializer,
+                    )
         else:
             conv = conv_for_collaboration_mode
             if conv is None:

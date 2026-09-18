@@ -3484,7 +3484,9 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
-    args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
+    # Match runner/zygote startup: keep workspace code out of runtime imports
+    # without changing the caller's working directory or agent workspace.
+    args = [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *mode_args]
     config_sig = server_config_signature(include_features=not server_url)
     daemon_env = _build_host_daemon_env(server_url=server_url)
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
@@ -4870,6 +4872,13 @@ def server_status(json_output: bool) -> None:
 @cli.command("start")
 @click.option("--server", default=None, help="Omnigent server URL to host on.")
 @click.option(
+    "--no-open",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_NO_OPEN",
+    show_envvar=True,
+    help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
+)
+@click.option(
     "--non-interactive",
     "non_interactive",
     is_flag=True,
@@ -4880,7 +4889,7 @@ def server_status(json_output: bool) -> None:
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
-def start(server: str | None, non_interactive: bool) -> None:
+def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
     """Start Omnigent on this machine, in the background.
 
     The on switch, and the counterpart of ``omnigent stop``: brings up the
@@ -4896,6 +4905,7 @@ def start(server: str | None, non_interactive: bool) -> None:
     :param server: Omnigent server URL to host on, e.g.
         ``"https://example.databricksapps.com"``. ``None`` falls back to
         config; empty string forces local mode.
+    :param no_open: When ``True``, skip automatically opening the host web UI.
     :param non_interactive: When ``True``, never launch the browser login for
         an un-authed remote server — fail with the ``omnigent login`` hint
         instead.
@@ -4905,6 +4915,7 @@ def start(server: str | None, non_interactive: bool) -> None:
         _resolve_host_server(server),
         stop_command=f"{cli_invocation()} stop",
         non_interactive=non_interactive,
+        no_open=no_open,
     )
 
 
@@ -8770,10 +8781,11 @@ def _maybe_open_host_web_ui(
     server_url: str,
     *,
     non_interactive: bool,
+    no_open: bool,
     cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
 ) -> None:
     """Open the host web UI when interactive and enabled."""
-    if non_interactive or not _stdin_is_tty():
+    if no_open or non_interactive or not _stdin_is_tty():
         return
     if cfg is None:
         cfg = _load_effective_config()
@@ -8796,6 +8808,7 @@ def _run_background_host(
     *,
     stop_command: str,
     non_interactive: bool,
+    no_open: bool,
 ) -> None:
     """Spawn (or reuse) the detached host daemon and report it.
 
@@ -8817,6 +8830,7 @@ def _run_background_host(
         matches how it was invoked.
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
+    :param no_open: When ``True``, skip automatically opening the host web UI.
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
@@ -8875,7 +8889,7 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
-    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive)
+    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive, no_open=no_open)
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -8910,6 +8924,13 @@ def _host_stop_command(explicit_server: str | None) -> str:
 @cli.group("host", cls=_HostGroup, invoke_without_command=True)
 @click.option("--server", default=None, help="Remote omnigent server URL.")
 @click.option(
+    "--no-open",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_NO_OPEN",
+    show_envvar=True,
+    help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
+)
+@click.option(
     "--background",
     "background",
     is_flag=True,
@@ -8937,6 +8958,7 @@ def host(
     ctx: click.Context,
     server: str | None,
     background: bool,
+    no_open: bool,
     non_interactive: bool,
 ) -> None:
     """
@@ -8948,6 +8970,7 @@ def host(
       omnigent host --server https://omnigent-app.databricksapps.com
       omnigent host ""   # spawn + connect to a local server
       omnigent host --background   # spawn detached, return immediately
+      omnigent host --no-open   # connect without opening the web UI
       omnigent host enable   # install and start a per-user system service
       omnigent host disable  # stop and remove the per-user system service
 
@@ -8970,6 +8993,7 @@ def host(
         to config; empty string selects local mode.
     :param background: When ``True``, spawn the daemon detached and return
         instead of running the daemon loop in the foreground.
+    :param no_open: When ``True``, skip automatically opening the host web UI.
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
@@ -8997,6 +9021,7 @@ def host(
             server,
             stop_command=_host_stop_command(explicit_server),
             non_interactive=non_interactive,
+            no_open=no_open,
         )
         return
 
@@ -9035,7 +9060,7 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
-        _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
+        _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
@@ -13190,4 +13215,8 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
+    # Omnigent is already loaded from the selected installation. Restore the
+    # workspace path for local tools, matching the console entry point.
+    if (_cwd := os.getcwd()) not in sys.path:
+        sys.path.insert(0, _cwd)
     cli()

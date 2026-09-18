@@ -22,7 +22,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, SupportsIndex, SupportsInt, cast
+from typing import Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
 import httpx
 import psutil
@@ -50,6 +50,7 @@ from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    HOST_CAPABILITIES,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -174,6 +175,7 @@ from omnigent.util.tunnel_limits import (
 from omnigent.version import VERSION
 
 _logger = logging.getLogger(__name__)
+_T = TypeVar("_T")
 
 
 def _coerce_int(value: object) -> int:
@@ -651,9 +653,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         # NAMES, not secrets, so allowlisting it leaks nothing on its own.
         # (Literal, not RUNNER_ENV_PASSTHROUGH_ENV_VAR, which is defined below.)
         "OMNIGENT_RUNNER_ENV_PASSTHROUGH",
-        # Pi's credential-env denylist must survive both daemon and runner hops.
+        # Credential-env denylists must survive both daemon and runner hops.
         # This carries variable names only; their values still follow normal forwarding.
         "OMNIGENT_PI_ENV_UNSET",
+        "OMNIGENT_ACP_ENV_UNSET",
         # Keep host and spawned-runner routing decisions aligned when the
         # host-slice-key kill switch is explicitly disabled.
         "OMNIGENT_HOST_SLICE_KEY_ENABLED",
@@ -1116,9 +1119,12 @@ class HostProcess:
         # The orphan reaper skips its sweep while this is >0 so it never
         # ``wait()``s a child that ``subprocess.run`` is about to reap itself —
         # stealing it would corrupt that command's returncode to 0 (#1782).
-        # Mutated only via :meth:`_host_subprocess_op`; safe as a plain int
-        # because both the mutation and the reaper run on the event loop.
+        # Mutated only on the event loop by the guard helpers below, so a plain
+        # counter is sufficient.
         self._owned_subprocess_ops = 0
+        # Keep cancellation-shielded worker tasks alive until they release the
+        # orphan-reaper guard after their subprocesses have actually finished.
+        self._host_subprocess_tasks: set[asyncio.Task[object]] = set()
         # Copy-on-write runner forkserver, on by default; set
         # OMNIGENT_RUNNER_ZYGOTE=0 (or false/no/off) to opt out onto the direct
         # Popen path. POSIX-only (needs os.fork + AF_UNIX fd-passing); the host
@@ -1258,6 +1264,27 @@ class HostProcess:
             yield
         finally:
             self._owned_subprocess_ops -= 1
+
+    async def _run_host_subprocess_in_thread(self, operation: Callable[[], _T]) -> _T:
+        """Run a subprocess-owning operation off-loop without losing its exit status.
+
+        Cancellation stops waiting for the result but cannot stop a worker
+        thread. Keep the orphan reaper paused until the worker itself finishes.
+        """
+        self._owned_subprocess_ops += 1
+        task = asyncio.create_task(asyncio.to_thread(operation))
+        retained_task = cast("asyncio.Task[object]", task)
+        self._host_subprocess_tasks.add(retained_task)
+
+        def _release(completed: asyncio.Task[_T]) -> None:
+            self._host_subprocess_tasks.discard(cast("asyncio.Task[object]", completed))
+            self._owned_subprocess_ops -= 1
+            if not completed.cancelled():
+                # A canceled caller no longer retrieves a later worker error.
+                completed.exception()
+
+        task.add_done_callback(_release)
+        return await asyncio.shield(task)
 
     def _alive_runner_ids(self) -> list[str]:
         """Return IDs of runners that are still alive.
@@ -3373,7 +3400,7 @@ class HostProcess:
     ) -> dict[str, HarnessAvailability] | None:
         """Collect harness readiness without letting a probe break the channel."""
         try:
-            return await asyncio.to_thread(configured_harness_map)
+            return await self._run_host_subprocess_in_thread(configured_harness_map)
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
@@ -3843,7 +3870,10 @@ class HostProcess:
         self._conn_upgrade_accepted = False
         self._conn_frame_received = False
         url = self._tunnel_url()
-        headers = self._build_connect_headers()
+        # Credential discovery may invoke the Databricks CLI. Keep it off the
+        # event loop so startup capability discovery can make progress at the
+        # same time instead of starting only after authentication completes.
+        headers = await self._run_host_subprocess_in_thread(self._build_connect_headers)
 
         _logger.info("Connecting to %s", url)
         # Build a verifying SSL context from a real CA bundle for wss:// — a bare
@@ -3893,7 +3923,7 @@ class HostProcess:
         record_websocket_connected("host", reconnect=reconnect)
         disconnect_error: BaseException | None = None
         try:
-            await self._ensure_owner_user_id()
+            await self._ensure_owner_user_id(headers=headers)
             await self._serve_frames(ws)
         except BaseException as exc:
             disconnect_error = exc
@@ -3918,7 +3948,7 @@ class HostProcess:
             # upgrade-time exception can be classified above.
             await ws_cm.__aexit__(*sys.exc_info())
 
-    async def _ensure_owner_user_id(self) -> None:
+    async def _ensure_owner_user_id(self, *, headers: dict[str, str] | None = None) -> None:
         """Resolve this host's owning user once and publish it for attribution.
 
         Best-effort ``GET /v1/me`` (the same call the CLI resume picker uses),
@@ -3927,16 +3957,26 @@ class HostProcess:
         this host spawns) and in ``OMNIGENT_USER_ID`` (so the host's own
         debug-log rows carry it). A single-user server / managed host answers no
         owner, and any failure is swallowed -- attribution must never disrupt the
-        host, and those rows simply ship ``user_id = NULL``.
+        host, and those rows simply ship ``user_id = NULL``. The accepted
+        tunnel's request headers may be supplied so this lookup reuses the
+        same credential resolution rather than probing authentication twice.
+
+        :param headers: Auth and routing headers already built for the tunnel.
         """
         if self._owner_user_id is not None:
             return
         try:
             from omnigent.resume_dispatch import _resolve_current_user_id
 
-            headers = self._build_connect_headers()
+            request_headers = headers
+            if request_headers is None:
+                request_headers = await self._run_host_subprocess_in_thread(
+                    self._build_connect_headers
+                )
             owner = await asyncio.to_thread(
-                _resolve_current_user_id, base_url=self._server_url, headers=headers
+                _resolve_current_user_id,
+                base_url=self._server_url,
+                headers=request_headers,
             )
         except Exception:  # noqa: BLE001 — attribution is best-effort
             return
@@ -4053,6 +4093,7 @@ class HostProcess:
             interactive_shells=self._interactive_shells,
             telemetry_opt_out=_tel_opt_out,
             installation_id=_tel_install_id,
+            capabilities=list(HOST_CAPABILITIES),
         )
         try:
             encoded_hello = encode_host_frame(hello)

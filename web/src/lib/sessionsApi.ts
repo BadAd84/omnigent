@@ -1019,11 +1019,9 @@ export async function launchRunner(
  * clear signal. Clearing sub-agent routing lands the session on Default,
  * the same place ``"off"`` does.
  *
- * `silent: true` persists without firing the claude-native tmux
- * forward — use for bind-time auto-apply (e.g. the sticky-pref
- * handoff in `bindStream`) where injecting a visible "/model X"
- * item into a fresh pane would look like an unexpected first
- * message in the chat.
+ * `silent: true` persists without forwarding a live command into a native
+ * harness. Use it only for persistence-only updates, such as detaching a
+ * runner while clearing its model override.
  */
 export async function updateSession(
   sessionId: string,
