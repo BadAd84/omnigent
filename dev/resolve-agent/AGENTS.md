@@ -679,6 +679,13 @@ This step applies **only when you authored a fix in Step 2B** — it's about
 *opening* a PR. (The review path 2A adopts the existing PR instead of opening one,
 then goes straight to Step 4 to land it.) Once the set is genuinely green:
 
+When a later CI publication contract says the workflow owns GitHub writes, obey
+that contract: do not push or call `gh pr create`. You must still prepare and
+validate `.omnigent/pr-body.md` exactly as described in Step 3.4 before writing
+the final handoff. The publisher restores that file with the committed checkpoint
+and uses it as the PR description; without it, the publisher can only construct a
+less readable description from machine-oriented handoff fields.
+
 ### Get the GitHub write token (needed for every push / `gh` write)
 
 Any write to GitHub — `git push`, `gh pr create`, `gh pr edit --add-reviewer`,
@@ -757,9 +764,46 @@ Once the set is genuinely green:
    conclude the token is "expired" or "read-only" from an empty env var — it is
    present on the machine, just not exported to your shell.
 4. **Open a ready-for-review PR** with `gh pr create` (not a draft — the repo's
-   automated review runs on ready PRs). Fill in the PR template at
-   `.github/pull_request_template.md`: link the bug in the **Related issue**
-   section. Use a GitHub closing keyword **only against a GitHub issue number** —
+   automated review runs on ready PRs). If the target repository provides
+   `.github/pull_request_template.md`, copy it to `.omnigent/pr-body.md` and edit
+   that file. Otherwise create `.omnigent/pr-body.md` with concise **Related
+   issue**, **Summary**, and **Test Plan** sections. Pass the finished file to
+   `gh pr create --body-file .omnigent/pr-body.md`. The
+   workflow-owned publisher also reads this file if it has to finish publication
+   after your session ends, so write it before the GitHub call. Link the bug in
+   the template's **Related issue** section.
+
+   Write the description for a reviewer, not for the handoff parser:
+
+   - Keep the template's required headings and every checkbox row. Follow its
+     instructions for optional sections such as Changelog. Do not replace the
+     standard structure with custom `Root Cause`, `Validation`, or `Issues`
+     sections.
+   - In **Summary**, lead with the user-visible problem and result, then explain
+     the cause and implementation in 1–3 short bullets or paragraphs. Use
+     complete sentences. For a non-trivial change, include the template's ELI5
+     explanation and a small diagram.
+   - In **Test Plan**, group the proof into short, scannable bullets. Name the
+     command or test, what failed before the fix, and what passes now. Do not
+     paste `facets`, `test_transition`, other handoff fields, or a long comma-
+     separated inventory of test names into the body.
+   - Keep workflow/session URLs and machine-oriented publication details out of
+     the narrative. The internal workflow links those separately. Never paste
+     the JSON handoff into the PR description.
+   - Read the finished Markdown once as rendered prose. Split run-on sentences,
+     expand unexplained internal shorthand, and remove repeated evidence before
+     opening the PR.
+
+   If the target repository provides the template validator, validate the body
+   locally before publishing it:
+
+   ```bash
+   PR_BODY="$(cat .omnigent/pr-body.md)" \
+     python .github/scripts/pr-template/validate.py
+   ```
+
+   Fix every validation error before `gh pr create`. In **Related issue**, use a
+   GitHub closing keyword **only against a GitHub issue number** —
    `Resolve #<closing_issue_number>` (equivalently `Closes #<n>`), using the
    `closing_issue_number` you determined in Step 1 (the `bug_url` issue, or the
    mirrored GitHub issue for a Linear ticket). **Never** point a closing keyword
