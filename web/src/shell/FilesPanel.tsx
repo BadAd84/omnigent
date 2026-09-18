@@ -322,16 +322,25 @@ export function FilesPanel({
     if (!conversationId || workspaceSeedRef.current === conversationId) return;
     if (!workspaceRoot || sessionLoading) return;
     workspaceSeedRef.current = conversationId;
-    if (browseLocation !== null || browseLocationCache.get(conversationId)) return;
-    const saved = session?.workspace?.replace(/\/$/, "") ?? "";
-    const root = workspaceRoot.replace(/\/$/, "");
+    // The cache is the conversation-local "user browsed here" signal; the
+    // browseLocation STATE may still hold the previous conversation's value
+    // in the same effect pass as an in-place switch, so it must not gate
+    // this conversation's seed.
+    if (browseLocationCache.get(conversationId)) return;
+    const saved = session?.workspace?.replace(/[\\/]+$/, "") ?? "";
+    const root = workspaceRoot.replace(/[\\/]+$/, "");
     if (!saved || saved === root) return;
+    // Windows hosts persist canonical backslash paths; containment must use
+    // the root's own separator or every child fails the check.
+    const sep = root.includes("\\") && !root.includes("/") ? "\\" : "/";
     // An out-of-root workspace browses absolutely, which the server
     // owner-gates — seeding it for a collaborator would 403 their tree.
-    if (!saved.startsWith(`${root}/`) && !isOwnerLevel(session?.permissionLevel ?? null)) return;
+    if (!saved.startsWith(root + sep) && !isOwnerLevel(session?.permissionLevel ?? null)) {
+      return;
+    }
     browseLocationCache.set(conversationId, saved);
     setBrowseLocation(saved);
-  }, [conversationId, workspaceRoot, session, sessionLoading, browseLocation]);
+  }, [conversationId, workspaceRoot, session, sessionLoading]);
   const workingDir = browseLocation ?? workspaceRoot;
   // The wire form: "" means the workspace root (the historical relative
   // contract). A location INSIDE the workspace is sent relative to it, and

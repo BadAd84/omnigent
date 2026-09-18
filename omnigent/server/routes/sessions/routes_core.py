@@ -2625,17 +2625,19 @@ def register_core_routes(
                         _resolved_workspace = _wf_body["workspace"]
                 if _resolved_workspace is None:
                     if _workspace_forward is not None and _workspace_forward.status_code >= 400:
-                        # The runner rejected the location. Preserve its verdict:
-                        # out-of-reach (403) is a permission refusal, anything else
-                        # is bad input.
+                        # Preserve the runner's verdict: out-of-reach (403) is a
+                        # permission refusal, a runner 5xx is infrastructure (so
+                        # the client can retry), anything else is bad input.
+                        if _workspace_forward.status_code == 403:
+                            _forward_code = ErrorCode.FORBIDDEN
+                        elif _workspace_forward.status_code >= 500:
+                            _forward_code = ErrorCode.RUNNER_UNAVAILABLE
+                        else:
+                            _forward_code = ErrorCode.INVALID_INPUT
                         raise OmnigentError(
                             "runner rejected the working-directory change: "
                             f"{_workspace_forward.body}",
-                            code=(
-                                ErrorCode.FORBIDDEN
-                                if _workspace_forward.status_code == 403
-                                else ErrorCode.INVALID_INPUT
-                            ),
+                            code=_forward_code,
                         )
                     if body.workspace and _is_absolute_workspace(body.workspace):
                         # No runner to resolve against. The same agent boundary
