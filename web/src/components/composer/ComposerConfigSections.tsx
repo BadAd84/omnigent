@@ -63,36 +63,31 @@ export function ComposerConfigSections({
   sdk,
   models,
   efforts,
+  extra,
 }: {
   sdk?: ComposerConfigSection;
   models?: ComposerConfigSection;
   efforts?: ComposerConfigSection;
+  // Additional sections rendered after Models/Effort — e.g. Devin Fusion's
+  // Lead / Effort / Sidekick selectors. Each gets its own separator + header.
+  extra?: readonly ComposerConfigSection[];
 }) {
+  const sections = [
+    ...(sdk ? [sdk] : []),
+    ...(models ? [models] : []),
+    ...(efforts ? [efforts] : []),
+    ...(extra ?? []),
+  ];
   return (
     <>
-      {sdk && (
-        <div data-testid={sdk.testId}>
-          <PickerSectionHeader>{sdk.header}</PickerSectionHeader>
-          {sdk.leading}
-          <ConfigChoices choices={sdk.choices} />
+      {sections.map((section, index) => (
+        <div key={section.testId} data-testid={section.testId}>
+          {index > 0 && <DropdownMenuSeparator />}
+          <PickerSectionHeader>{section.header}</PickerSectionHeader>
+          {section.leading}
+          <ConfigChoices choices={section.choices} />
         </div>
-      )}
-      {models && (
-        <div data-testid={models.testId}>
-          {sdk && <DropdownMenuSeparator />}
-          <PickerSectionHeader>{models.header}</PickerSectionHeader>
-          {models.leading}
-          <ConfigChoices choices={models.choices} />
-        </div>
-      )}
-      {efforts && (
-        <div data-testid={efforts.testId}>
-          <DropdownMenuSeparator />
-          <PickerSectionHeader>{efforts.header}</PickerSectionHeader>
-          {efforts.leading}
-          <ConfigChoices choices={efforts.choices} />
-        </div>
-      )}
+      ))}
     </>
   );
 }
