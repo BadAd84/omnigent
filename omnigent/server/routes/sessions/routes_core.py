@@ -30,7 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id, generate_file_id
+from omnigent.db.utils import generate_agent_id, generate_file_id, shared_read_scope
 from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
     CommentsFingerprint,
@@ -122,6 +122,7 @@ from omnigent.server.routes._sessions.helpers import (
     _agent_carries_native_fork_history,
     _announce_session_added,
     _apply_liveness_to_items,
+    _apply_prefetched_liveness,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
     _discovery_key,
@@ -158,6 +159,10 @@ from omnigent.server.routes._sessions.helpers import (
     _validated_cost_control_mode_override,
     _validated_subagent_routing_override,
     reconcile_orphaned_running_status,
+)
+from omnigent.server.routes._sessions.list_batch import (
+    SessionListRowLoader,
+    SessionListSources,
 )
 from omnigent.server.routes._sessions.orchestration import (
     _best_effort_stop,
@@ -1441,6 +1446,59 @@ def register_core_routes(
 
     # ── WS /sessions/updates ────────────────────────────────────
 
+    def _read_session_list_sources(
+        conversation_ids: list[str],
+        user_ids: list[str],
+    ) -> SessionListSources:
+        """
+        Read every by-id source a session-list row needs, in one checkout.
+
+        The reader behind :data:`_session_list_loader`: blocking, called
+        once per coalesced batch on a worker thread. Everything runs inside
+        a single :func:`shared_read_scope`, so a batch costs one pooled
+        connection (and one ``pool_pre_ping``) instead of one per store.
+
+        :param conversation_ids: The batch's union of conversation ids.
+        :param user_ids: The batch's union of requesting users, whose admin
+            flags are resolved in one query.
+        :returns: The loaded :class:`SessionListSources`.
+        """
+        with shared_read_scope():
+            grants = (
+                permission_store.list_for_sessions(conversation_ids)
+                if permission_store is not None
+                else {}
+            )
+            admins = (
+                permission_store.filter_admins(user_ids)
+                if permission_store is not None and user_ids
+                else frozenset[str]()
+            )
+            conversations = conversation_store.get_conversations(conversation_ids)
+            agent_ids = sorted({c.agent_id for c in conversations.values() if c.agent_id})
+            agent_names = agent_store.get_names(agent_ids) if agent_ids else {}
+            child_ids = conversation_store.list_child_conversation_ids_by_parent(conversation_ids)
+            comments = (
+                comment_store.get_comments_fingerprints(conversation_ids)
+                if comment_store is not None
+                else {}
+            )
+            liveness = liveness_lookup(conversation_ids) if liveness_lookup is not None else {}
+        return SessionListSources(
+            grants=grants,
+            admins=frozenset(admins),
+            conversations=conversations,
+            agent_names=agent_names,
+            child_ids=child_ids,
+            comments=comments,
+            liveness=liveness,
+        )
+
+    # Shared across every connected client: the sidebar rescans of all open
+    # browsers are independently timed, so batching them collapses what was
+    # one multi-store read per client per interval into one read per window.
+    _session_list_loader = SessionListRowLoader(_read_session_list_sources)
+
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
@@ -1455,6 +1513,11 @@ def register_core_routes(
         omitted. This is the pull the session-updates stream diffs each
         interval — it is a drop-in for the client's former list poll, not
         a new event source, so it carries no new cross-replica semantics.
+
+        The read itself goes through :data:`_session_list_loader`, which
+        coalesces the concurrent rescans of every connected client into one
+        batched pass, so the deployment's idle read load tracks the number
+        of distinct watched sessions rather than the number of open tabs.
 
         When ``liveness_lookup`` is wired, each payload also carries
         ``runner_online`` and ``host_online`` (the same values
@@ -1471,68 +1534,45 @@ def register_core_routes(
         """
         if not watched:
             return []
+        sources = await _session_list_loader.load(watched, () if user_id is None else (user_id,))
+        user_is_admin = user_id is not None and user_id in sources.admins
         if permission_store is not None:
-            perms_by_conv = await asyncio.to_thread(permission_store.list_for_sessions, watched)
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
             accessible = [
                 cid
                 for cid in watched
                 if _permission_level_from_grants(
-                    user_id, perms_by_conv.get(cid, []), user_is_admin
+                    user_id, sources.grants.get(cid, []), user_is_admin
                 )
                 is not None
             ]
         else:
-            perms_by_conv = {}
-            user_is_admin = False
             accessible = list(watched)
-        if not accessible:
-            return []
-
-        def _load_sessions(ids: list[str]) -> list[Conversation]:
-            """Bulk-load the accessible conversations that are sessions
-            (non-null ``agent_id``) in one batched store call, preserving
-            the caller's id order for deterministic output."""
-            by_id = conversation_store.get_conversations(ids)
-            return [
-                conv
-                for cid in ids
-                if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
-            ]
-
-        convs = await asyncio.to_thread(_load_sessions, accessible)
+        # Preserve the caller's id order for deterministic output, and keep
+        # only real sessions: a legacy conversation with no bound agent is
+        # never a sidebar row.
+        convs = [
+            conv
+            for cid in accessible
+            if (conv := sources.conversations.get(cid)) is not None and conv.agent_id is not None
+        ]
         if not convs:
             return []
-        unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
-        conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
-            asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-            asyncio.to_thread(
-                conversation_store.list_child_conversation_ids_by_parent,
-                conv_ids,
-            ),
-            _comments_fingerprints_for(conv_ids),
-        )
-        pending_counts = pending_elicitations.counts_for(conv_ids)
+        pending_counts = pending_elicitations.counts_for([c.id for c in convs])
         items = [
             _build_session_list_item(
                 conv,
-                agent_names_by_id=agent_names_by_id,
-                grants=perms_by_conv.get(conv.id, []),
+                agent_names_by_id=sources.agent_names,
+                grants=sources.grants.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
                 permissions_enabled=permission_store is not None,
                 pending_count=pending_counts.get(conv.id, 0),
-                child_session_ids=child_ids_by_parent[conv.id],
-                comments_fingerprint=comments_fingerprints.get(conv.id),
+                child_session_ids=sources.child_ids.get(conv.id, []),
+                comments_fingerprint=sources.comments.get(conv.id),
             )
             for conv in convs
         ]
-        await _apply_liveness_to_items(items, liveness_lookup)
+        _apply_prefetched_liveness(items, sources.liveness)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
         # stream is a diff source: the client overlays these onto its cached
         # rows, so a field that cleared to null must arrive as an explicit null

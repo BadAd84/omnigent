@@ -531,6 +531,33 @@ def test_is_admin_false_for_nonexistent_user(store: SqlAlchemyPermissionStore) -
     )
 
 
+# ── filter_admins ────────────────────────────────────────────────────────────
+
+
+def test_filter_admins_selects_only_admins(store: SqlAlchemyPermissionStore) -> None:
+    """``filter_admins`` returns the admin subset of the users asked about."""
+    store.ensure_user("boss@test.com", is_admin=True)
+    store.ensure_user("also-boss@test.com", is_admin=True)
+    store.ensure_user("regular@test.com")
+
+    assert store.filter_admins(["boss@test.com", "regular@test.com", "also-boss@test.com"]) == {
+        "boss@test.com",
+        "also-boss@test.com",
+    }
+
+
+def test_filter_admins_omits_unknown_users(store: SqlAlchemyPermissionStore) -> None:
+    """Users with no row are absent rather than raising, matching ``is_admin``."""
+    store.ensure_user("boss@test.com", is_admin=True)
+
+    assert store.filter_admins(["boss@test.com", "ghost@test.com"]) == {"boss@test.com"}
+
+
+def test_filter_admins_empty_input_touches_nothing(store: SqlAlchemyPermissionStore) -> None:
+    """An empty batch short-circuits instead of querying for no ids."""
+    assert store.filter_admins([]) == set()
+
+
 # ── has_any_grants ───────────────────────────────────────────────────────────
 
 

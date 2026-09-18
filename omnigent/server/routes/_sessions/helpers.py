@@ -1427,8 +1427,33 @@ async def _apply_liveness_to_items(
     if liveness_lookup is None or not items:
         return
     liveness = await asyncio.to_thread(liveness_lookup, [item.id for item in items])
+    _apply_prefetched_liveness(items, liveness)
+
+
+def _apply_prefetched_liveness(
+    items: list[SessionListItem],
+    liveness: dict[str, SessionLiveness],
+) -> None:
+    """
+    Stamp already-loaded liveness onto session-list items.
+
+    Split out of :func:`_apply_liveness_to_items` so a caller that loaded
+    liveness as part of a batched read (see
+    :mod:`omnigent.server.routes._sessions.list_batch`) applies it with the
+    same semantics instead of issuing a second lookup.
+
+    :param items: Session-list rows to annotate, mutated in place.
+    :param liveness: Liveness per session id, e.g.
+        ``{"conv_abc123": SessionLiveness(runner_online=True,
+        host_online=None)}``. Ids absent from the map are left untouched
+        (both fields stay ``None``), matching a server that cannot compute
+        liveness at all.
+    :returns: ``None``. Mutates *items* in place.
+    """
     for item in items:
-        result = liveness[item.id]
+        result = liveness.get(item.id)
+        if result is None:
+            continue
         item.runner_online = result.runner_online
         item.host_online = result.host_online
         # A dead runner's parked prompts died with it, but the persisted
@@ -10914,6 +10939,7 @@ __all__ = [
     "_antigravity_subagent_title",
     "_apply_liveness_to_items",
     "_apply_pending_policy_ask_writes",
+    "_apply_prefetched_liveness",
     "_attachment_disposition",
     "_authorize_bundled_parent_and_inherit_runner",
     "_await_settled_managed_launch",

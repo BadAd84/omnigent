@@ -180,6 +180,23 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def filter_admins(self, user_ids: list[str]) -> set[str]:
+        """Return which of *user_ids* have the admin flag, in one query.
+
+        Batched counterpart to :meth:`is_admin` for callers resolving
+        several users at once — e.g. one coalesced session-list read
+        serving every connected client — so the admin flag costs one
+        ``WHERE id IN (…)`` query instead of one round-trip per user.
+
+        :param user_ids: Users to check, e.g.
+            ``["alice@example.com", "bob@example.com"]``. An empty list
+            returns an empty set without touching the database.
+        :returns: The subset of *user_ids* that exist and have
+            ``is_admin`` set. Unknown users are simply absent.
+        """
+        ...
+
+    @abstractmethod
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user row.
 

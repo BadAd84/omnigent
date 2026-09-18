@@ -464,6 +464,20 @@ class SqlAlchemyPermissionStore(PermissionStore):
             row = session.get(SqlUser, (current_workspace_id(), user_id))
             return row is not None and row.is_admin
 
+    def filter_admins(self, user_ids: list[str]) -> set[str]:
+        """Select the admin users out of a batch. See base class for contract."""
+        if not user_ids:
+            return set()
+        with self._session("select_admin_users") as session:
+            rows = session.execute(
+                select(SqlUser.id).where(
+                    SqlUser.workspace_id == current_workspace_id(),
+                    SqlUser.id.in_(user_ids),
+                    SqlUser.is_admin.is_(True),
+                )
+            )
+            return set(rows.scalars().all())
+
     def set_admin(self, user_id: str, is_admin: bool) -> None:
         """Set the admin flag on an existing user. See base class for contract."""
 

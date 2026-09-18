@@ -21,9 +21,11 @@ from datetime import datetime, timezone
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.db.utils import get_or_create_engine
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -886,3 +888,41 @@ def test_projects_changed_event_forwards_to_client(
         sessions_routes.user_session_stream.publish(ALICE, {"type": "projects_changed"})
         frame = _recv_until(ws, {"projects_changed"})
         assert frame["type"] == "projects_changed"
+
+
+def test_sidebar_read_takes_one_pool_checkout(app: FastAPI, stores, db_uri: str) -> None:
+    """One sidebar read borrows one pooled connection, not one per store.
+
+    A watch-set read touches six stores (grants, admin flag, conversations,
+    agent names, child ids, comment fingerprints). Checking a connection out
+    per store made every connected client's rescan cost six checkouts — plus
+    a ``pool_pre_ping`` round-trip each on a networked database — every
+    interval, which is what saturates the pool as the user count grows.
+    Coalescing the read into one batch keeps it at a single checkout.
+    """
+    watched = [
+        _seed_session(stores, owner=ALICE, title="first"),
+        _seed_session(stores, owner=ALICE, title="second"),
+    ]
+    engine = get_or_create_engine(db_uri)
+    checkouts = 0
+
+    def _on_checkout(*_args: object) -> None:
+        """Count each pooled-connection checkout."""
+        nonlocal checkouts
+        checkouts += 1
+
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        # Count only the snapshot read: the handshake resolves identity from
+        # a header and touches no database.
+        event.listen(engine, "checkout", _on_checkout)
+        try:
+            ws.send_text(json.dumps({"type": "watch", "session_ids": watched}))
+            snapshot = _recv_until(ws, {"snapshot"})
+        finally:
+            event.remove(engine, "checkout", _on_checkout)
+
+    assert {item["id"] for item in snapshot["items"]} == set(watched)  # type: ignore[index]
+    assert checkouts == 1
