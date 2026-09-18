@@ -5786,13 +5786,22 @@ async def _forward_event_to_runner(
         _steer_buffered = False
         if body.type == "message":
             try:
-                _steer_buffered = _forward_resp.json().get("status") == "buffered"
+                _forward_ack = _forward_resp.json()
             except ValueError:
                 # Non-JSON 202 body (older/stub runner) — treat as a fresh
                 # turn, which preserves the pre-delivered behavior.
-                _steer_buffered = False
-        if _steer_buffered:
-            unconsumed_inputs.record(session_id, persisted_items[0].id, persisted_items[0])
+                _forward_ack = None
+            # isinstance guard: a valid-but-non-object JSON body (bare
+            # string/array) must read the same as a non-JSON one, not raise.
+            _steer_buffered = (
+                isinstance(_forward_ack, dict) and _forward_ack.get("status") == "buffered"
+            )
+        # record() returns False when the runner's drain marker beat this
+        # record through the relay — the loop already has the message, so
+        # the canonical consumed goes out instead of a stale delivered.
+        if _steer_buffered and unconsumed_inputs.record(
+            session_id, persisted_items[0].id, persisted_items[0]
+        ):
             _publish_input_delivered(session_id, persisted_items[0])
         else:
             _publish_input_consumed(session_id, persisted_items[0])

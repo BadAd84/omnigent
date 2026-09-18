@@ -4676,11 +4676,14 @@ def _publish_status(
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
     # ``failed``), so this is a safe, harness-agnostic invariant.
-    if status in ("idle", "failed"):
+    if status in ("idle", "failed", "waiting"):
         # No live turn is holding a buffered steered message any more —
         # either it was consumed (its drain marker raced/was lost) or the
         # turn that held it is gone. Clear the intermediate-state index so
         # snapshots stop reporting those items as awaiting the harness.
+        # ``waiting`` is a turn-end edge too (only background work outlives
+        # it), and the web promotes pending bubbles on it — clearing here
+        # keeps cold-load snapshots consistent with that.
         unconsumed_inputs.clear(session_id)
     if status == "idle" and _session_status_cache.get(session_id) == "failed":
         # Session stays ``failed`` (terminal); the turn is over, so drop any

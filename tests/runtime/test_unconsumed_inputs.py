@@ -93,3 +93,42 @@ def test_stale_entries_evicted_after_ttl(monkeypatch: pytest.MonkeyPatch) -> Non
     unconsumed_inputs.record("conv_a", "item_new", {"id": "item_new"})
 
     assert unconsumed_inputs.snapshot_for("conv_a") == ["item_new"]
+
+
+def test_record_after_resolve_reports_already_drained() -> None:
+    """A resolve that beat its record makes the record report consumed.
+
+    This is the drain-marker race: the runner's marker rides the relay
+    connection and can be processed before the forward's buffered ack
+    reaches the route layer. The losing ``record`` must not index the
+    item (it is consumed, not pending) and must tell its caller so.
+    """
+    assert unconsumed_inputs.resolve("conv_a", "item_1") is None
+
+    assert unconsumed_inputs.record("conv_a", "item_1", {"id": "item_1"}) is False
+    assert unconsumed_inputs.snapshot_for("conv_a") == []
+    # The pre-drained mark is consumed by that record; a later record of
+    # the same id indexes normally.
+    assert unconsumed_inputs.record("conv_a", "item_1", {"id": "item_1"}) is True
+    assert unconsumed_inputs.snapshot_for("conv_a") == ["item_1"]
+
+
+def test_pre_drained_mark_expires(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A pre-drained mark with no matching record is dropped after its TTL."""
+    now = 1000.0
+    monkeypatch.setattr(unconsumed_inputs, "_now", lambda: now)
+    assert unconsumed_inputs.resolve("conv_a", "item_1") is None
+
+    now += unconsumed_inputs._PRE_DRAINED_TTL_S + 1.0
+    assert unconsumed_inputs.record("conv_a", "item_1", {"id": "item_1"}) is True
+    assert unconsumed_inputs.snapshot_for("conv_a") == ["item_1"]
+
+
+def test_clear_drops_pre_drained_marks() -> None:
+    """A terminal-status clear forgets pre-drained marks too."""
+    assert unconsumed_inputs.resolve("conv_a", "item_1") is None
+
+    unconsumed_inputs.clear("conv_a")
+
+    assert unconsumed_inputs.record("conv_a", "item_1", {"id": "item_1"}) is True
+    assert unconsumed_inputs.snapshot_for("conv_a") == ["item_1"]

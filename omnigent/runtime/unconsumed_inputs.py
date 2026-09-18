@@ -43,6 +43,14 @@ from typing import Any
 # cleanup; the TTL only bounds a leak when that edge is lost too.
 _TTL_S: float = 6 * 3600.0
 
+# A drain marker can beat ``record``: it rides the relay connection while
+# the forward's 202 (whose "buffered" ack triggers the record) is still in
+# flight back to the route layer. Ids resolved before they were recorded
+# are remembered this long so the racing ``record`` can publish the
+# canonical consumed event instead of stranding a pending bubble. Short:
+# the record it waits for comes from a POST already in flight.
+_PRE_DRAINED_TTL_S: float = 60.0
+
 
 def _now() -> float:
     """
@@ -81,6 +89,10 @@ class _Entry:
 # inner dict is insertion-ordered (FIFO delivery order). Empty inner
 # dicts are popped eagerly so the index doesn't accrete stale keys.
 _unconsumed: dict[str, dict[str, _Entry]] = {}
+# Per-conversation mapping conversation_id → {item_id: resolved_at} for
+# drain markers that arrived before their ``record`` (see
+# :data:`_PRE_DRAINED_TTL_S`).
+_pre_drained: dict[str, dict[str, float]] = {}
 _lock = threading.Lock()
 
 
@@ -95,16 +107,22 @@ def _evict_stale_locked(conversation_id: str, now: float) -> None:
     :param now: Current ``time.monotonic()`` value to compare against.
     """
     entries = _unconsumed.get(conversation_id)
-    if entries is None:
-        return
-    stale = [item_id for item_id, entry in entries.items() if now - entry.recorded_at > _TTL_S]
-    for item_id in stale:
-        entries.pop(item_id, None)
-    if not entries:
-        _unconsumed.pop(conversation_id, None)
+    if entries is not None:
+        stale = [item_id for item_id, entry in entries.items() if now - entry.recorded_at > _TTL_S]
+        for item_id in stale:
+            entries.pop(item_id, None)
+        if not entries:
+            _unconsumed.pop(conversation_id, None)
+    pre = _pre_drained.get(conversation_id)
+    if pre is not None:
+        expired = [item_id for item_id, at in pre.items() if now - at > _PRE_DRAINED_TTL_S]
+        for item_id in expired:
+            pre.pop(item_id, None)
+        if not pre:
+            _pre_drained.pop(conversation_id, None)
 
 
-def record(conversation_id: str, item_id: str, item: Any) -> None:
+def record(conversation_id: str, item_id: str, item: Any) -> bool:
     """
     Record a persisted item delivered into a running turn's buffer.
 
@@ -119,11 +137,22 @@ def record(conversation_id: str, item_id: str, item: Any) -> None:
     :param item: The persisted conversation item itself, held so the
         eventual drain marker can republish it as the canonical
         ``session.input.consumed`` without a store lookup.
+    :returns: ``True`` when the entry was indexed (still awaiting the
+        harness — publish ``session.input.delivered``). ``False`` when
+        the item's drain marker already arrived (the marker beat this
+        record through the relay), so the loop has the message and the
+        caller must publish ``session.input.consumed`` directly.
     """
     entry = _Entry(item=item)
     with _lock:
         _evict_stale_locked(conversation_id, entry.recorded_at)
+        pre = _pre_drained.get(conversation_id)
+        if pre is not None and pre.pop(item_id, None) is not None:
+            if not pre:
+                _pre_drained.pop(conversation_id, None)
+            return False
         _unconsumed.setdefault(conversation_id, {})[item_id] = entry
+        return True
 
 
 def resolve(conversation_id: str, item_id: str) -> Any | None:
@@ -131,7 +160,10 @@ def resolve(conversation_id: str, item_id: str) -> Any | None:
     Drop an entry because the runner drained it into a turn.
 
     Idempotent: resolving an unknown id is a no-op returning ``None``
-    (e.g. the entry was already cleared by a terminal status edge).
+    (e.g. the entry was already cleared by a terminal status edge). An
+    unknown id is additionally remembered as pre-drained for
+    :data:`_PRE_DRAINED_TTL_S`, so a ``record`` racing behind this
+    marker learns the item was already consumed (see :func:`record`).
 
     :param conversation_id: Conversation/session id, e.g.
         ``"conv_abc123"``.
@@ -142,12 +174,13 @@ def resolve(conversation_id: str, item_id: str) -> Any | None:
     """
     with _lock:
         entries = _unconsumed.get(conversation_id)
-        if entries is None:
-            return None
-        entry = entries.pop(item_id, None)
-        if not entries:
+        entry = entries.pop(item_id, None) if entries is not None else None
+        if entries is not None and not entries:
             _unconsumed.pop(conversation_id, None)
-        return entry.item if entry is not None else None
+        if entry is not None:
+            return entry.item
+        _pre_drained.setdefault(conversation_id, {})[item_id] = _now()
+        return None
 
 
 def snapshot_for(conversation_id: str) -> list[str]:
@@ -182,6 +215,7 @@ def clear(conversation_id: str) -> None:
     """
     with _lock:
         _unconsumed.pop(conversation_id, None)
+        _pre_drained.pop(conversation_id, None)
 
 
 def reset_for_tests() -> None:
@@ -194,3 +228,4 @@ def reset_for_tests() -> None:
     """
     with _lock:
         _unconsumed.clear()
+        _pre_drained.clear()

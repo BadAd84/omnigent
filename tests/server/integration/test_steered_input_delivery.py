@@ -313,3 +313,114 @@ async def test_terminal_status_clears_unconsumed_snapshot(
 
     snap = await client.get(f"/v1/sessions/{session['id']}")
     assert snap.json()["unconsumed_input_ids"] == []
+
+
+async def test_waiting_status_clears_unconsumed_snapshot(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A ``waiting`` edge clears pending ids like ``idle``/``failed``.
+
+    ``waiting`` is a turn-end edge (only background work outlives it) and
+    live clients promote their pending bubbles on it, so a snapshot taken
+    afterwards must not re-render the item as awaiting the harness.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    fake_runner = _fake_runner("buffered")
+    _bind_runner(monkeypatch, fake_runner)
+    try:
+        ack = await _post_message(client, session["id"], "steer then waiting edge")
+    finally:
+        await fake_runner.aclose()
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["unconsumed_input_ids"] == [ack["item_id"]]
+
+    from omnigent.server.routes._sessions.helpers import _publish_status
+
+    _publish_status(session["id"], "waiting")
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["unconsumed_input_ids"] == []
+
+
+async def test_drain_marker_racing_ahead_of_record_publishes_consumed(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A drain marker that beats the buffered ack still ends in consumed.
+
+    The marker rides the relay connection while the forward's 202 is in
+    flight back to the route layer, so the relay can resolve the item
+    BEFORE the route records it. If that ordering published delivered
+    with no consumed ever following, the steered bubble would stay in
+    the intermediate state until the next terminal status.
+    """
+    published = _capture_stream(monkeypatch)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    def _drain_before_ack(request: httpx.Request) -> httpx.Response:
+        # Stand-in for the relay's drain handling running mid-forward:
+        # the runner drained the buffered copy and its marker was
+        # processed before the 202 below reaches the route layer.
+        body = json.loads(request.content.decode())
+        unconsumed_inputs.resolve(session["id"], body["persisted_item_id"])
+        return httpx.Response(202, json={"status": "buffered", "detail": "test"})
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_drain_before_ack),
+        base_url="http://runner",
+    )
+    _bind_runner(monkeypatch, fake_runner)
+    try:
+        ack = await _post_message(client, session["id"], "steer with a racing marker")
+    finally:
+        await fake_runner.aclose()
+
+    types = [ev["type"] for _sid, ev in published]
+    assert "session.input.consumed" in types
+    assert "session.input.delivered" not in types
+    consumed = next(ev for _sid, ev in published if ev["type"] == "session.input.consumed")
+    assert consumed["data"]["item_id"] == ack["item_id"]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["unconsumed_input_ids"] == []
+
+
+async def test_non_object_forward_ack_reads_as_fresh_turn(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A valid-but-non-object JSON 202 body reads as an accepted forward.
+
+    An older/stub runner can answer with a bare JSON string; treating it
+    like the non-JSON case (fresh turn, consumed at POST time) keeps the
+    forward from failing after the item was already persisted, which
+    would invite a duplicate client retry.
+    """
+    published = _capture_stream(monkeypatch)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json="ok")),
+        base_url="http://runner",
+    )
+    _bind_runner(monkeypatch, fake_runner)
+    try:
+        ack = await _post_message(client, session["id"], "bare-string ack")
+    finally:
+        await fake_runner.aclose()
+
+    types = [ev["type"] for _sid, ev in published]
+    assert "session.input.consumed" in types
+    assert "session.input.delivered" not in types
+    consumed = next(ev for _sid, ev in published if ev["type"] == "session.input.consumed")
+    assert consumed["data"]["item_id"] == ack["item_id"]
+
+    snap = await client.get(f"/v1/sessions/{session['id']}")
+    assert snap.json()["unconsumed_input_ids"] == []

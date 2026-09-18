@@ -6336,6 +6336,40 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       ]);
     });
 
+    it("does not stamp another author's delivered event onto a local pending entry", () => {
+      // This client (bob) has an in-flight send of its own; alice's steer
+      // lands first. FIFO stamping would attach alice's item id to bob's
+      // unrelated bubble — the author guard makes the event materialize
+      // alice's own pending bubble instead.
+      useChatStore.setState({
+        blocks: [],
+        pendingUserMessages: [
+          {
+            tempId: "pend_bob",
+            content: [{ type: "input_text", text: "bob's draft" }],
+            author: "bob@example.com",
+          },
+        ],
+      });
+
+      handleSessionEvent({
+        type: "session_input_delivered",
+        itemId: "msg_alice_1",
+        itemType: "message",
+        createdBy: "alice@example.com",
+        data: { role: "user", content: [{ type: "input_text", text: "from alice" }] },
+      });
+
+      const state = useChatStore.getState();
+      expect(state.blocks).toEqual([]);
+      expect(state.pendingUserMessages).toHaveLength(2);
+      const bob = state.pendingUserMessages.find((p) => p.tempId === "pend_bob");
+      expect(bob?.deliveredItemId).toBeUndefined();
+      const alice = state.pendingUserMessages.find((p) => p.deliveredItemId === "msg_alice_1");
+      expect(alice?.content).toEqual([{ type: "input_text", text: "from alice" }]);
+      expect(alice?.author).toBe("alice@example.com");
+    });
+
     it("is idempotent across an SSE replay of the same delivered event", () => {
       useChatStore.setState({
         blocks: [],

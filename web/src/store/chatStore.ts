@@ -6848,8 +6848,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         if (s.pendingUserMessages.some((p) => p.deliveredItemId === event.itemId)) return {};
         // Stamp the oldest not-yet-delivered entry: client sends and server
         // acks are both FIFO-ordered within one session (same argument as
-        // the consumed handler's head fallback).
-        const at = s.pendingUserMessages.findIndex((p) => p.deliveredItemId === undefined);
+        // the consumed handler's head fallback). Guard on the author so a
+        // concurrent steer by ANOTHER viewer can't stamp its item id onto
+        // this client's unrelated pending message — an authorless side
+        // (native-terminal sends, older servers) keeps the plain FIFO.
+        const at = s.pendingUserMessages.findIndex(
+          (p) =>
+            p.deliveredItemId === undefined &&
+            (event.createdBy === undefined ||
+              p.author === undefined ||
+              p.author === event.createdBy),
+        );
         if (at >= 0) {
           const entry = s.pendingUserMessages[at]!;
           return {
