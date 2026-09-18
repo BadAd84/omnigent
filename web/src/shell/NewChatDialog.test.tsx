@@ -4889,6 +4889,7 @@ describe("NewChatLandingScreen", () => {
       expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
     );
     fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
     await screen.findByTestId("workspace-picker");
     expect(screen.queryByTestId("workspace-picker-conflict")).not.toBeInTheDocument();
   });
