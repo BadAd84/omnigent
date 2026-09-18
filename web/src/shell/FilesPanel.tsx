@@ -220,6 +220,14 @@ function SearchFilterInput({
 const browseLocationCache = new Map<string, string>();
 
 /**
+ * Workdir-sync failures that must survive a panel remount. A failed PATCH
+ * leaves the browsed folder showing while the session workdir stayed put;
+ * without this the error vanished on remount and the location read as
+ * applied. Cleared by the next successful sync (or a fresh navigation).
+ */
+const workdirSyncErrorCache = new Map<string, string>();
+
+/**
  * Right-side Files card. Always visible on desktop.
  *
  * - Flat view: changed files only (registry-backed, any depth).
@@ -291,7 +299,9 @@ export function FilesPanel({
   const [browseLocation, setBrowseLocation] = useState<string | null>(
     () => (conversationId && browseLocationCache.get(conversationId)) || null,
   );
-  const [browseError, setBrowseError] = useState<string | null>(null);
+  const [browseError, setBrowseError] = useState<string | null>(
+    () => (conversationId && workdirSyncErrorCache.get(conversationId)) || null,
+  );
   // On an in-place conversation switch (no remount), land on the NEW
   // session's own cached location or its root — never the previous
   // session's directory. The ref keeps mount itself from wiping the seed.
@@ -300,7 +310,7 @@ export function FilesPanel({
     if (browseForRef.current === conversationId) return;
     browseForRef.current = conversationId;
     setBrowseLocation((conversationId && browseLocationCache.get(conversationId)) || null);
-    setBrowseError(null);
+    setBrowseError((conversationId && workdirSyncErrorCache.get(conversationId)) || null);
   }, [conversationId]);
   // After a reload the panel would otherwise open at the environment root even
   // when a persisted re-root means turns and new shells run in a subfolder.
@@ -366,16 +376,18 @@ export function FilesPanel({
               // reconciles from the workspace this PATCH just persisted, not
               // a stale pre-navigation value.
               queryClient.setQueryData(["session", cid], updated);
+              workdirSyncErrorCache.delete(cid);
             } catch (err) {
               // The header names the browsed folder the working folder, so a
-              // silent miss would lie. Only the newest intent's failure on
-              // the conversation being shown matters.
-              if (state.queued === null && browseForRef.current === cid) {
-                setBrowseError(
-                  `The session's working directory could not follow this folder: ${
-                    err instanceof Error ? err.message : String(err)
-                  }`,
-                );
+              // silent miss would lie. Only the newest intent's failure
+              // matters; it is cached so a remount keeps showing it (and
+              // keeps the same-location retry path open).
+              if (state.queued === null) {
+                const message = `The session's working directory could not follow this folder: ${
+                  err instanceof Error ? err.message : String(err)
+                }`;
+                workdirSyncErrorCache.set(cid, message);
+                if (browseForRef.current === cid) setBrowseError(message);
               }
             }
           }
@@ -397,6 +409,7 @@ export function FilesPanel({
       if (next === browseLocation && !browseError) return;
       setBrowseError(null);
       if (conversationId) {
+        workdirSyncErrorCache.delete(conversationId);
         if (next === null) browseLocationCache.delete(conversationId);
         else browseLocationCache.set(conversationId, next);
       }
