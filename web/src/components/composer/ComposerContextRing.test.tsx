@@ -1,4 +1,5 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -33,8 +34,10 @@ describe("ComposerContextRing", () => {
   });
 
   it("shows the actual context usage in the tooltip", async () => {
+    const user = userEvent.setup();
     renderRing(1000, 123);
-    fireEvent.focus(screen.getByTestId("composer-context-ring"));
+    await user.tab();
+    expect(screen.getByTestId("composer-context-ring")).toHaveFocus();
     expect(await screen.findByText("123 / 1,000 tokens (12% used)")).toBeInTheDocument();
   });
 

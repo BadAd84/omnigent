@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type { AnyBlock, BlockContext, ErrorBlock, TextDone } from "./blocks";
-import { latestActivityErrorState, latestActivityIsError } from "./sessionError";
+import {
+  latestActivityErrorState,
+  latestActivityErrorWindow,
+  latestActivityIsError,
+} from "./sessionError";
 
 const ctx: BlockContext = {
   agent: null,
@@ -41,6 +45,23 @@ describe("latestActivityIsError", () => {
     const disconnected = { ...error, code: "runner_disconnected", message: "Tunnel dropped" };
     expect(latestActivityErrorState([error, disconnected], false)).toBe("error");
     expect(latestActivityErrorState([error, disconnected], true)).toBe("error");
+  });
+
+  it("reports whether a bounded disconnect window still needs older history", () => {
+    const disconnected = { ...error, code: "runner_disconnected" };
+    expect(latestActivityErrorWindow([disconnected], true)).toEqual({
+      state: "recovered_disconnect",
+      boundaryResolved: false,
+    });
+    expect(
+      latestActivityErrorWindow(
+        [
+          { ...error, ctx: { ...ctx, responseId: "r0" } },
+          { ...disconnected, ctx: { ...ctx, responseId: "r1" } },
+        ],
+        true,
+      ),
+    ).toEqual({ state: "recovered_disconnect", boundaryResolved: true });
   });
 
   it("does not reach across a causal boundary for an older genuine fault", () => {

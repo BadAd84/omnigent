@@ -2,7 +2,11 @@ import { useCallback, useSyncExternalStore } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import type { Conversation } from "./useConversations";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import { latestActivityErrorState, type LatestSessionError } from "@/lib/sessionError";
+import {
+  latestActivityErrorState,
+  latestActivityErrorWindow,
+  type LatestSessionError,
+} from "@/lib/sessionError";
 import { fetchSessionItemsPage, type SessionItemsPage } from "@/lib/sessionsApi";
 import { isStaleCursorError } from "@/lib/staleCursor";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -33,9 +37,15 @@ async function fetchLatestError(
   try {
     signal.throwIfAborted();
     const page = await fetchSessionItemsPage(id, { limit: 1, signal });
-    const error = latestActivityErrorState(itemsToBlocks(page.items), hostOnline);
-    if (error !== undefined || !page.hasMore) return error ?? null;
-    // A hidden metadata item may trail the last visible message. Bound the
+    const latest = latestActivityErrorWindow(itemsToBlocks(page.items), hostOnline);
+    const needsOlderBoundary =
+      (latest.state === "disconnected" || latest.state === "recovered_disconnect") &&
+      !latest.boundaryResolved;
+    if ((latest.state !== undefined && !needsOlderBoundary) || !page.hasMore) {
+      return latest.state ?? null;
+    }
+    // A hidden metadata item may trail the last visible message, and a runner
+    // disconnect may trail a genuine fault in the same response. Bound the
     // fallback instead of hydrating a whole transcript just for its badge.
     let older: SessionItemsPage;
     try {
@@ -45,13 +55,23 @@ async function fetchLatestError(
         signal,
       });
     } catch (err) {
-      // The item this badge read anchored on was deleted between the two
-      // requests. The tail is unknowable now; fall back to the first read
-      // rather than failing the whole badge.
-      if (isStaleCursorError(err)) return null;
+      // The item this badge read anchored on was deleted between requests. A
+      // disconnect boundary is unknowable now, so retain a conservative fault.
+      if (isStaleCursorError(err)) return needsOlderBoundary ? "error" : null;
       throw err;
     }
-    return latestActivityErrorState(itemsToBlocks(older.items), hostOnline) ?? null;
+    const combined = latestActivityErrorWindow(
+      itemsToBlocks([...older.items, ...page.items]),
+      hostOnline,
+    );
+    if (
+      older.hasMore &&
+      !combined.boundaryResolved &&
+      (combined.state === "disconnected" || combined.state === "recovered_disconnect")
+    ) {
+      return "error";
+    }
+    return combined.state ?? null;
   } finally {
     const next = waitingReads.shift();
     if (next) next();

@@ -254,6 +254,62 @@ describe("BlockRenderer dispatch", () => {
     });
   });
 
+  it("dispatches a related disconnect through session recovery", async () => {
+    const onRetryError = vi.fn(async () => {});
+    const item: Extract<RenderItem, { kind: "error" }> = {
+      kind: "error",
+      itemId: "runner-error",
+      source: "execution",
+      code: "runner_error",
+      message: "Runner setup failed.",
+      relatedErrors: [
+        {
+          itemId: "runner-disconnected",
+          source: "execution",
+          code: "runner_disconnected",
+          message: "Runner disconnected.",
+        },
+      ],
+    };
+
+    render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+
+    await waitFor(() =>
+      expect(onRetryError).toHaveBeenCalledWith({
+        kind: "error",
+        itemId: "runner-disconnected",
+        source: "execution",
+        code: "runner_disconnected",
+        message: "Runner disconnected.",
+      }),
+    );
+  });
+
+  it("keeps rate-limit retry distinct from related session recovery", async () => {
+    const onRetryError = vi.fn(async () => {});
+    const item: Extract<RenderItem, { kind: "error" }> = {
+      kind: "error",
+      itemId: "rate-limit",
+      source: "llm",
+      code: "rate_limit_exceeded",
+      message: "Rate limited.",
+      relatedErrors: [
+        {
+          itemId: "runner-disconnected",
+          source: "execution",
+          code: "runner_disconnected",
+          message: "Runner disconnected.",
+        },
+      ],
+    };
+
+    render(<BlockRenderer items={[item]} sessionStatus="idle" onRetryError={onRetryError} />);
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+
+    await waitFor(() => expect(onRetryError).toHaveBeenCalledWith(item));
+  });
+
   it("falls back to a code→sentence description for an unclassified failure", () => {
     const items: RenderItem[] = [
       {

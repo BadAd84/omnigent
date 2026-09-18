@@ -855,6 +855,7 @@ function renderItem(
       return (
         <ErrorBanner
           key={key}
+          itemId={item.itemId}
           message={item.message}
           source={item.source}
           code={item.code}
@@ -863,7 +864,16 @@ function renderItem(
           remediation={item.remediation}
           level={item.level}
           relatedErrors={item.relatedErrors}
-          onRetry={onRetryError ? () => onRetryError(item) : undefined}
+          onRetry={
+            onRetryError
+              ? (actionableError) =>
+                  onRetryError(
+                    actionableError.itemId === item.itemId && actionableError.code === item.code
+                      ? item
+                      : { kind: "error", ...actionableError },
+                  )
+              : undefined
+          }
         />
       );
     case "policy_denied":

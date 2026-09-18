@@ -2,17 +2,22 @@ import type { AnyBlock, BlockContext } from "./blocks";
 
 export type LatestSessionError = "error" | "disconnected" | "recovered_disconnect";
 
+export interface LatestActivityErrorWindow {
+  state: LatestSessionError | null | undefined;
+  boundaryResolved: boolean;
+}
+
 function sameCausalBoundary(first: BlockContext, next: BlockContext): boolean {
   return (
     first.responseId === next.responseId && first.turn === next.turn && first.agent === next.agent
   );
 }
 
-/** Classify the latest visible failure for compact sidebar treatment. */
-export function latestActivityErrorState(
+/** Classify a bounded window and report whether older history can change it. */
+export function latestActivityErrorWindow(
   blocks: readonly AnyBlock[],
   hostOnline?: boolean | null,
-): LatestSessionError | null | undefined {
+): LatestActivityErrorWindow {
   let boundary: BlockContext | null = null;
   let failedLifecycle = false;
   let disconnect: LatestSessionError | null = null;
@@ -22,21 +27,30 @@ export function latestActivityErrorState(
     const block = blocks[i];
     switch (block.type) {
       case "error": {
-        if (boundary && !sameCausalBoundary(boundary, block.ctx)) return resolvedFailure();
+        if (boundary && !sameCausalBoundary(boundary, block.ctx)) {
+          return { state: resolvedFailure(), boundaryResolved: true };
+        }
         boundary ??= block.ctx;
-        if (block.level === "info") return resolvedFailure();
+        if (block.level === "info") {
+          return { state: resolvedFailure(), boundaryResolved: true };
+        }
         if (block.code === "runner_disconnected") {
           disconnect = hostOnline === true ? "recovered_disconnect" : "disconnected";
           break;
         }
-        return "error";
+        return { state: "error", boundaryResolved: true };
       }
       case "text_done":
         // Claude's native transcript can persist an API rejection as ordinary
         // assistant text, without an error item or a failed session status.
-        return /^API Error:\s*\S/.test(block.fullText.trimStart()) ? "error" : resolvedFailure();
+        return {
+          state: /^API Error:\s*\S/.test(block.fullText.trimStart()) ? "error" : resolvedFailure(),
+          boundaryResolved: true,
+        };
       case "response_end":
-        if (boundary && !sameCausalBoundary(boundary, block.ctx)) return resolvedFailure();
+        if (boundary && !sameCausalBoundary(boundary, block.ctx)) {
+          return { state: resolvedFailure(), boundaryResolved: true };
+        }
         boundary ??= block.ctx;
         if (block.status === "failed") failedLifecycle = true;
         break;
@@ -55,7 +69,7 @@ export function latestActivityErrorState(
       case "policy_denied":
       case "routing_decision":
       case "elicitation":
-        return resolvedFailure();
+        return { state: resolvedFailure(), boundaryResolved: true };
       case "retry":
       case "compaction_loading":
       case "compaction":
@@ -66,7 +80,18 @@ export function latestActivityErrorState(
       }
     }
   }
-  return boundary ? resolvedFailure() : undefined;
+  return {
+    state: boundary ? resolvedFailure() : undefined,
+    boundaryResolved: false,
+  };
+}
+
+/** Classify the latest visible failure for compact sidebar treatment. */
+export function latestActivityErrorState(
+  blocks: readonly AnyBlock[],
+  hostOnline?: boolean | null,
+): LatestSessionError | null | undefined {
+  return latestActivityErrorWindow(blocks, hostOnline).state;
 }
 
 /** The latest visible activity, ignoring transcript bookkeeping. */

@@ -445,6 +445,29 @@ describe("ErrorBanner", () => {
     ]);
   });
 
+  it("offers recovery from a retryable related disconnect", async () => {
+    const onRetry = vi.fn(async () => {});
+    const relatedDisconnect = {
+      itemId: "related-disconnect",
+      message: "Runner disconnected.",
+      source: "execution",
+      code: "runner_disconnected",
+    };
+    render(
+      <ErrorBanner
+        itemId="primary-error"
+        message="The runner failed."
+        source="execution"
+        code="runner_error"
+        relatedErrors={[relatedDisconnect]}
+        onRetry={onRetry}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Resume session" }));
+    await waitFor(() => expect(onRetry).toHaveBeenCalledWith(relatedDisconnect));
+  });
+
   it("retries classified rate-limit errors and preserves the provider's details", async () => {
     let resolveRetry: (() => void) | undefined;
     const onRetry = vi.fn(

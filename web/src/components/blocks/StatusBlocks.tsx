@@ -40,6 +40,7 @@ import { cn } from "@/lib/utils";
 import { TOOL_SURFACE_WIDTH_CLASS } from "./toolSurface";
 
 interface ErrorBannerProps {
+  itemId?: string | null;
   message: string;
   source: string;
   code: string;
@@ -52,7 +53,7 @@ interface ErrorBannerProps {
   /** `"info"` renders a neutral notice (no failure tone) instead of a destructive error. */
   level?: "error" | "info";
   /** Recover the existing session or continue after a retryable turn failure. */
-  onRetry?: () => Promise<void>;
+  onRetry?: (error: RelatedRenderError) => Promise<void>;
   /** Later failures emitted by the same response, turn, and agent. */
   relatedErrors?: RelatedRenderError[];
 }
@@ -169,7 +170,9 @@ function parseErrorMessage(rawMessage: string): ParsedErrorMessage {
  * never a blank panel.
  */
 export function ErrorBanner({
+  itemId = null,
   message,
+  source,
   code,
   title,
   cause,
@@ -221,8 +224,12 @@ export function ErrorBanner({
   const dismissButtonRef = useRef<HTMLButtonElement>(null);
   const messageId = useId();
   const diagnosticsId = useId();
-  const retryable = onRetry !== undefined && RETRYABLE_ERROR_CODES.has(code);
-  const retryLabel = code === "rate_limit_exceeded" ? "Retry" : "Resume session";
+  const actionableError = [
+    { itemId, message, source, code, level, title, cause, remediation },
+    ...relatedErrors,
+  ].find((error) => RETRYABLE_ERROR_CODES.has(error.code));
+  const retryable = onRetry !== undefined && actionableError !== undefined;
+  const retryLabel = actionableError?.code === "rate_limit_exceeded" ? "Retry" : "Resume session";
 
   useEffect(() => () => window.clearTimeout(copyResetRef.current), []);
   useEffect(() => {
@@ -257,7 +264,7 @@ export function ErrorBanner({
           className="relative z-10 h-auto rounded-xl border-border bg-background px-4 py-2 text-sm font-normal text-muted-foreground shadow-xs"
         >
           <Loader2Icon aria-hidden="true" className="animate-spin" />
-          {code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
+          {actionableError?.code === "rate_limit_exceeded" ? "Retrying" : "Reconnecting"}
         </Badge>
       </div>
     );
@@ -271,12 +278,12 @@ export function ErrorBanner({
   };
 
   const retry = async () => {
-    if (!onRetry || retryInFlightRef.current) return;
+    if (!onRetry || !actionableError || retryInFlightRef.current) return;
     retryInFlightRef.current = true;
     setRetrying(true);
     setRetryError(null);
     try {
-      await onRetry();
+      await onRetry(actionableError);
       setDismissed(true);
     } catch (error) {
       retryInFlightRef.current = false;
