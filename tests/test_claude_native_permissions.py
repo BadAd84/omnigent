@@ -16,8 +16,8 @@ import asyncio
 
 import pytest
 
-import omnigent.claude_native_permissions as cp
-from omnigent.claude_native_bridge import (
+import omnigent.harnesses.claude_native.permissions as cp
+from omnigent.harnesses.claude_native.bridge import (
     read_recent_permission_traces,
     record_permission_trace,
 )

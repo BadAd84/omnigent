@@ -54,9 +54,11 @@ import type {
   UserMessageBlock,
 } from "@/lib/blocks";
 import { userInputElicitationKey } from "@/lib/askUserQuestion";
-import { LIVE_ITEM_PREFIX, structuredErrorFields } from "@/lib/blocks";
+import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
   ApiError,
@@ -72,6 +74,7 @@ import {
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
+import { isStaleCursorError } from "@/lib/staleCursor";
 import type {
   McpServerStartup,
   SessionInputConsumedEvent,
@@ -79,6 +82,7 @@ import type {
   StreamEvent,
 } from "@/lib/events";
 import { createPresenceIdleTracker } from "@/lib/presenceIdle";
+import { randomUUID } from "@/lib/randomUUID";
 import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
 import { createInitialConversationState, isConversationStateKey } from "./conversationState";
 import { getStreamSlotManager, type StreamSlot } from "./streamSlots";
@@ -93,7 +97,21 @@ import { clearSseLog, pushSseEvent } from "@/lib/sseEventLog";
 import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
 import { sessionItemsQueryKey } from "@/hooks/useSessionItems";
 import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
-import { overlayTitleIntoCaches, type ConversationsInfiniteData } from "@/lib/sessionListCache";
+import {
+  filtersFromConversationQueryKey,
+  insertNewRowsIntoPages,
+  markRecentlyCreated,
+  overlayTitleIntoCaches,
+  PROJECT_LABEL_KEY,
+  removeIdsFromPages,
+  type ConversationsInfiniteData,
+} from "@/lib/sessionListCache";
+import { recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
+// Re-exported below so existing `@/store/chatStore` importers keep working; the
+// pure helpers live in a leaf module so low-level session hooks can gate on temp
+// ids without an import cycle back to the store.
+import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -105,14 +123,14 @@ import type {
   SandboxStatus,
   Session,
   SessionStatus,
-  SkillSummary,
 } from "@/lib/types";
 import { uploadFile } from "@/lib/filesApi";
 import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
-import { codexPlanModeFromSession } from "@/lib/codexPlanMode";
+import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
+import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
 import { getCurrentAuthorId } from "@/lib/identity";
 import { getOmnigentHostConfig } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
@@ -125,10 +143,13 @@ import {
   onResponseStart,
 } from "./interactionTelemetry";
 import { getSessionHost } from "@/lib/sessionHost";
-import { isSystemUserContent } from "@/lib/systemMessage";
+import { isSystemUserContent, taskNotificationMarkerContent } from "@/lib/systemMessage";
 import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nativeCodingAgents";
+import type { StoredReplyDraft } from "@/lib/replyDraft";
 
 export interface SendOptions {
+  /** Client-only quote provenance, retained if the composer needs to retry. */
+  replyDraft?: StoredReplyDraft;
   /**
    * Fires synchronously after `createSession` returns for a brand-new
    * session (before the first message is posted). Callers use this
@@ -137,6 +158,305 @@ export interface SendOptions {
    * `send` already set `conversationId` before the callback.
    */
   onConversationCreated?: (conversationId: string) => void;
+  /**
+   * Stable id to reuse for this send instead of generating a fresh one.
+   * Set by ChatPage when retrying a `failedSendDraft` so the server-side
+   * dedup recognises the retry and does not re-dispatch to the runner.
+   */
+  stableId?: string;
+  /**
+   * Reuse the optimistic bubble already on the target entry (pushed by
+   * `beginLocalConversation`) instead of pushing a fresh one, so the navigate-
+   * first flow's POST doesn't duplicate the message the user already sees. Its
+   * `content` is already set; `session.input.consumed` pops it FIFO as usual.
+   */
+  reusePendingTempId?: string;
+  /**
+   * Target session id, overriding the active `conversationId` — so the navigate-
+   * first background POST lands on the created session even after the user moves
+   * to another chat. Defaults to the active conversation.
+   */
+  pinnedConversationId?: string;
+}
+
+/**
+ * A title-less conversation row for the sidebar cache (renders like a fresh
+ * session). `provisional` marks the client-only `temp:` row so the sidebar
+ * disables per-row mutations until it's rekeyed to the real id.
+ */
+export interface LocalConversationProject {
+  id: string | null;
+  name: string;
+}
+
+function makeConvRow(
+  id: string,
+  provisional = false,
+  project?: LocalConversationProject,
+): Conversation {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    id,
+    object: "conversation",
+    title: null,
+    created_at: now,
+    updated_at: now,
+    labels: project?.id === null ? { [PROJECT_LABEL_KEY]: project.name } : {},
+    permission_level: null,
+    ...(project?.id ? { project_id: project.id } : {}),
+    ...(provisional ? { provisional: true } : {}),
+  };
+}
+
+/** Upsert one row into every `["conversations", ...]` cache variant. */
+function upsertConvRow(row: Conversation, removeId?: string): void {
+  if (queryClient === null) return;
+  const rowMap = new Map([[row.id, row]]);
+  const removeSet = removeId ? new Set([removeId]) : null;
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    if (!data) continue;
+    const base = removeSet ? (removeIdsFromPages(data, removeSet).data ?? data) : data;
+    const { data: next } = insertNewRowsIntoPages(
+      base,
+      rowMap,
+      filtersFromConversationQueryKey(key),
+    );
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
+ * Move the sidebar row from the temp id to the real one. `markRecentlyCreated`
+ * keeps it in the first-page fetch until the search index catches up; the WS
+ * `session_added` frame then finds it present and skips it (no duplicate).
+ */
+function rekeyConvRow(
+  tempId: string,
+  realId: string,
+  text: string,
+  project?: LocalConversationProject,
+): void {
+  if (queryClient === null) return;
+  const realConv = makeConvRow(realId, false, project);
+  recordOptimisticTitle(realId, text);
+  markRecentlyCreated(realConv);
+  upsertConvRow(realConv, tempId);
+}
+
+/** Drop the sidebar row for a temp id (on create failure). */
+function removeConvRow(tempId: string): void {
+  if (queryClient === null) return;
+  const tempIds = new Set([tempId]);
+  for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+    queryKey: ["conversations"],
+  })) {
+    const { data: next } = removeIdsFromPages(data, tempIds);
+    if (next !== data) queryClient.setQueryData(key, next);
+  }
+}
+
+/**
+ * Start a client-only conversation synchronously, before `createSession` runs:
+ * one temp id (`temp:*`) shared by the sidebar row, the registry entry, and the
+ * URL; the optimistic first message pushed into the entry; made active so the
+ * caller can `navigate('/c/<tempConvId>')` at once. `switchTo` paints it and
+ * skips binding for a temp id; ChatPage suppresses server-scoped fetches for it.
+ *
+ * Returns the temp id + the bubble's `pendingMsgTempId` for
+ * `hydrateLocalConversation`, or `null` with no query cache (tests).
+ */
+/**
+ * The model/agent identity the optimistic conversation should show while
+ * `createSession` is in flight. Every field mirrors the SAME normalized create
+ * request the POST sends — NOT raw picker state — so the temp view matches the
+ * session that binds. When cost-control routing is on the composer renders the
+ * routing label over any model, so the model fields stay `null` there.
+ */
+export interface OptimisticSessionModel {
+  /** The `model_override` the create POSTs, or `null` when none (default/routing). */
+  modelOverride: string | null;
+  /** The agent's resolved default model id, shown when there's no override. Omit
+   *  to leave `llmModel` unset (composer reads "agent default"). */
+  llmModel?: string | null;
+  /** The `reasoning_effort` the create POSTs, or `null`. */
+  reasoningEffort?: string | null;
+  /** Normalized brain/session harness (e.g. `"claude-sdk"`), NOT the picker's
+   *  `*-native` id. Omit when unknown; the composer tolerates a null harness. */
+  harness?: string | null;
+  /** Model context window, when known up front. Omit to leave unset. */
+  contextWindow?: number | null;
+  /** The `cost_control_mode_override` the create POSTs. `"on"` makes the
+   *  composer render the routing label instead of a model. */
+  costControlModeOverride?: "on" | "off" | null;
+  /** The `subagent_routing_override` the create POSTs, when set. */
+  subagentRoutingOverride?: "on" | "off" | null;
+  /** Bound agent identity for the composer, when resolved. */
+  boundAgentId?: string | null;
+  boundAgentName?: string | null;
+  /** Selected host id, so the temp composer can evaluate routing's per-family
+   *  gateway guard against the real chosen host during the pre-session window. */
+  hostId?: string | null;
+}
+
+export function beginLocalConversation(
+  text: string,
+  files: File[] | undefined,
+  provisional = newTempConversation(),
+  project?: LocalConversationProject,
+  model?: OptimisticSessionModel,
+): { tempConvId: string; pendingMsgTempId: string; createToken: string } | null {
+  if (queryClient === null) return null;
+  const { id: tempConvId, token: createToken } = provisional;
+  pendingSeq += 1;
+  const pendingMsgTempId = `pend_${pendingSeq}`;
+
+  // Sidebar row under the same id the URL shows.
+  recordOptimisticTitle(tempConvId, text);
+  upsertConvRow(makeConvRow(tempConvId, true, project));
+
+  const fileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
+    const filename = file.name || "image.png";
+    const fileId = `pending:${attachmentKey(file)}`;
+    return file.type.startsWith("image/")
+      ? { type: "input_image" as const, file_id: fileId, filename }
+      : { type: "input_file" as const, file_id: fileId, filename };
+  });
+  const content: MessageContentBlock[] = [
+    ...fileBlocks,
+    ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
+  ];
+  const selfAuthor = getCurrentAuthorId();
+  const bubble: PendingUserMessage = {
+    tempId: pendingMsgTempId,
+    content,
+    createdAtS: Math.floor(Date.now() / 1000),
+    ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+  };
+
+  // Seed the model/agent identity so the optimistic composer shows the selected
+  // model (with the caller's pending spinner) instead of the previous session's
+  // or a blank one. Every field mirrors the normalized create request; when
+  // cost-control routing is on the composer renders the routing label over any
+  // model, so a routing create simply leaves the model fields null.
+  const modelSeed: Partial<ConversationState> =
+    model === undefined
+      ? {}
+      : {
+          sessionModelOverride: model.modelOverride,
+          sessionModelSeeded: true,
+          sessionReasoningEffort: model.reasoningEffort ?? null,
+          // Authoritative only when the caller actually supplied an effort
+          // (a value or an intentional null) — an omitted effort stays a
+          // sticky-fallback, never a claimed "no effort".
+          sessionEffortSeeded: model.reasoningEffort !== undefined,
+          boundAgentId: model.boundAgentId ?? null,
+          boundAgentName: model.boundAgentName ?? null,
+          sessionHostId: model.hostId ?? null,
+          ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
+          ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
+          ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
+          ...(model.costControlModeOverride !== undefined
+            ? { costControlModeOverride: model.costControlModeOverride }
+            : {}),
+          ...(model.subagentRoutingOverride !== undefined
+            ? { subagentRoutingOverride: model.subagentRoutingOverride }
+            : {}),
+        };
+
+  const entry = conversationRegistry.acquire(tempConvId);
+  entry.setState({
+    ...modelSeed,
+    pendingUserMessages: [bubble],
+    loadingConversation: false,
+    status: "streaming",
+  });
+  useChatStore.setState({ conversationId: tempConvId });
+  conversationRegistry.setActive(tempConvId);
+  mirrorActiveEntry();
+  return { tempConvId, pendingMsgTempId, createToken };
+}
+
+/**
+ * Hydrate a client-only conversation onto its real server id once
+ * `createSession` returns: rekey the registry entry (carrying the optimistic
+ * bubble), the send chain, and the sidebar row from `tempConvId` to `realId`;
+ * flip the store + URL when still viewing it; then POST the first message via
+ * `send` (reusing the already-shown bubble), which binds the real stream.
+ *
+ * Navigate-away safe: the registry/chain/sidebar rekey is id-addressed and
+ * always runs. The store flip + `navigate` run ONLY when still on `tempConvId`,
+ * so a background create can't yank a user who has moved to another chat.
+ */
+export function hydrateLocalConversation(
+  tempConvId: string,
+  realId: string,
+  agentId: string,
+  text: string,
+  files: File[] | undefined,
+  pendingMsgTempId: string,
+  skill: { name: string; args: string } | null,
+  navigate: (to: string, opts?: { replace?: boolean }) => void,
+  isStillViewing: () => boolean = () => true,
+  project?: LocalConversationProject,
+): void {
+  // Registry entry (carrying the optimistic bubble) + the sidebar row, both
+  // id-addressed. Rekey the row BEFORE the caller's refetch so a lagging index
+  // can't drop it. No send-chain migration: the composer is read-only for a temp
+  // id, so no send is ever keyed under it — the hydrating `send` below enters
+  // the chain under the real id directly.
+  conversationRegistry.rekey(tempConvId, realId);
+  rekeyConvRow(tempConvId, realId, text, project);
+
+  const stillViewing = useChatStore.getState().conversationId === tempConvId && isStillViewing();
+  if (stillViewing) {
+    useChatStore.setState({ conversationId: realId });
+    conversationRegistry.setActive(realId);
+    mirrorActiveEntry();
+    navigate(`/c/${realId}`, { replace: true });
+  }
+
+  const store = useChatStore.getState();
+  if (skill !== null) {
+    // Slash command: the server resolves the skill and emits its own receipt +
+    // echo, which `sendSlashCommand` renders. Drop the plain-text placeholder
+    // bubble so it isn't duplicated, and clear the create-window "streaming"
+    // status (set by `beginLocalConversation`, no `sendLatchedAt`) so
+    // `sendSlashCommand` arms its own latch and owns the failure-settle — else a
+    // failed command would strand the conversation in "streaming" (see B1).
+    setterFor(realId)((s) => ({
+      pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== pendingMsgTempId),
+      status: "idle",
+      sendLatchedAt: null,
+    }));
+    void store.sendSlashCommand(skill.name, skill.args, agentId, { pinnedConversationId: realId });
+    return;
+  }
+  // Plain message: reuse the bubble already on the entry. `send` →
+  // `ensureBoundSession` (existing-session branch) binds the real stream (the
+  // rekeyed entry has no live pump), so no explicit bind here.
+  void store.send(text, agentId, files, {
+    pinnedConversationId: realId,
+    reusePendingTempId: pendingMsgTempId,
+  });
+}
+
+/**
+ * Discard a client-only conversation (create failed): drop the sidebar row and
+ * the registry entry. Returns whether the discarded conversation was still the
+ * one on screen, so the caller can navigate back to the landing route.
+ */
+export function removeLocalConversation(tempConvId: string): boolean {
+  const wasViewing = useChatStore.getState().conversationId === tempConvId;
+  removeConvRow(tempConvId);
+  if (wasViewing) {
+    // Reset the store to the landing state first (switchTo(null) does the full
+    // mirrored-field reset), THEN release the entry.
+    void useChatStore.getState().switchTo(null);
+  }
+  conversationRegistry.release(tempConvId);
+  return wasViewing;
 }
 
 /**
@@ -193,6 +513,7 @@ export interface QueuedMessage {
   queueId: string;
   /** Fully-assembled message text (mentions/quotes already applied). */
   text: string;
+  replyDraft?: StoredReplyDraft;
   /** Attachments to send with the message. */
   files?: File[];
   /** Owning conversation, so a switch/idle only flushes its own queue. */
@@ -203,6 +524,14 @@ export interface QueuedMessage {
    * Falls back to the current `boundAgentId` when absent.
    */
   agentId?: string;
+  /**
+   * Stable 32-char hex id for this logical message submit. Generated once at
+   * enqueue time and kept across retries so the server-side append is
+   * idempotent — a re-post of the same message after a network failure does
+   * not insert a duplicate conversation item. Optional for backward
+   * compatibility with serialized queue state that predates this field.
+   */
+  stableId?: string;
 }
 
 /**
@@ -357,6 +686,23 @@ export interface ConversationState {
    */
   sessionReasoningEffort: string | null;
   /**
+   * True when ``sessionReasoningEffort`` is AUTHORITATIVE for this conversation
+   * — set by the optimistic create seed (incl. an intentional ``null``) and by a
+   * live ``session_reasoning_effort`` report (also incl. null) — so the composer
+   * must NOT fall back to the app-global sticky pick. Distinguishes a
+   * deliberately-seeded / live-reported null from an unhydrated null. Cold
+   * hydration (bind) deliberately leaves this false: it folds the sticky pref
+   * into the value itself.
+   */
+  sessionEffortSeeded: boolean;
+  sessionModelSeeded: boolean;
+  /**
+   * Selected host id seeded at optimistic create, so the temp composer can run
+   * routing's per-family gateway guard against the real chosen host before the
+   * server session (which then owns ``hostId``) exists. ``null`` when unknown.
+   */
+  sessionHostId: string | null;
+  /**
    * Per-session cost-control switch for the active session: ``"on"``
    * activates the spec's configured cost-control mode, ``"off"``
    * disables cost control, ``null`` defers to the spec default.
@@ -388,6 +734,16 @@ export interface ConversationState {
    */
   claudePermissionMode: string;
   /**
+   * Approval mode of a running codex-native session, one of
+   * ``"ask-for-approval"``, ``"approve-for-me"``, ``"full-access"``,
+   * ``"read-only"`` (Codex's ``/permissions`` presets). Hydrated from the
+   * ``omnigent.codex_native.approval_mode`` read-back label on bind (runtime
+   * approval no longer rides launch args) and updated by the composer's picker
+   * or a live ``session.codex_approval_mode`` event. Empty string when unknown
+   * (non-codex session, or not yet observed).
+   */
+  codexApprovalMode: string;
+  /**
    * True when older items exist before the loaded history window. Binds
    * hydrate only the most recent page (see `fetchSessionItemsPage`);
    * scroll-up `loadMoreHistory` pages older until this goes false.
@@ -417,7 +773,19 @@ export interface ConversationState {
    * into — but the landing path binds a session first, so the reported flow
    * is covered.
    */
-  failedSendDraft: { conversationId: string; text: string; files: File[] } | null;
+  failedSendDraft: {
+    conversationId: string;
+    text: string;
+    files: File[];
+    stableId?: string;
+    replyDraft?: StoredReplyDraft;
+  } | null;
+  /**
+   * Stable id set by the failedSendDraft restore path so the next send()
+   * call can reuse it instead of generating a fresh UUID, preventing a
+   * duplicate dispatch on retry.
+   */
+  pendingRetryStableId: string | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -449,6 +817,13 @@ export interface ConversationState {
    * snapshot on bind; drives the composer pill's harness suffix.
    */
   sessionHarness: string | null;
+  /**
+   * Parent conversation whose `/side` command is waiting for its fork, or null.
+   * Set when the command is sent and consumed by the next `session_created` on
+   * that conversation, so only the user who typed `/side` is moved into it — a
+   * background sub-agent spawn must never yank anyone.
+   */
+  awaitingSideChatFor: string | null;
   /**
    * The active session's sub-agent head name (e.g. `"gpt"`), or null for a
    * top-level session. Set from the snapshot on bind; lets a head sub-agent's
@@ -504,13 +879,6 @@ export interface ConversationState {
     status: "pending" | "in_progress" | "completed";
     activeForm: string;
   }[];
-  /**
-   * Skills the bound agent can invoke (bundled + host-discovered).
-   * Populated from the session snapshot on bind; empty array
-   * before bind. The composer's slash-command menu reads this to
-   * suggest ``/skill-name``.
-   */
-  skills: SkillSummary[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions: NativeModelOption[];
   /**
@@ -553,14 +921,22 @@ export interface ConversationState {
    */
   sandboxStatus: SandboxStatus | null;
   /**
-   * Per-MCP-server startup map for the bound session (codex-native).
-   * Updated by `session.mcp_startup` SSE events while the harness boots
-   * its MCP servers; cleared back to `null` once every server settles
-   * `ready`. Failed/cancelled servers are retained so the page can say
-   * which servers never came up. Always `null` for sessions whose
-   * harness reports no MCP startup.
+   * Native MCP startup progress, cleared when startup settles or live
+   * assistant text arrives. Failures/cancellations stay in host diagnostics,
+   * not the conversation. Null for harnesses that report no MCP startup.
    */
   mcpStartup: Record<string, McpServerStartup> | null;
+  /**
+   * Only native harnesses report MCP startup. Track launch pending separately
+   * from the terminal pill so metadata cannot consume its rearm signal.
+   */
+  mcpStartupLaunch: { pending: boolean; dismissed: boolean };
+  /**
+   * Transient /btw sidechat overlay state (question + answer from `/btw`).
+   * Set by `session_btw_sidechat` SSE events, cleared on Escape or dismiss.
+   * Not persisted across page reloads. `null` when no overlay is open.
+   */
+  btwSidechat: { question: string; answer: string; truncated: boolean } | null;
 
   // Internal mutable bookkeeping. NOT meant to be subscribed to.
   abortController: AbortController | null;
@@ -595,6 +971,30 @@ export interface AppChatState {
    * the old conversation renders the persisted notice instead.
    */
   redirectToConversationId: string | null;
+  /**
+   * Side-chat child to open as a soft tab in the Workspace rail, or null.
+   * `AppShell` observes it, opens/selects that child's side-chat tab on the
+   * (still-active) main chat, and clears it — the user stays in the main
+   * conversation, the side chat lives beside it. App-global (NOT
+   * conversation-scoped) so a value set on the parent isn't lost to the entry
+   * split. Set on the `/side` latch (`awaitingSideChatFor`) matching a
+   * `session_created`; unlike the old flow there is no navigation.
+   *
+   * Carries `parentId` (the conversation the side chat belongs to) so the
+   * matching parent's rail consumes it — a fork that resolves after the user
+   * navigated to another conversation is NOT dropped into the wrong parent's
+   * tabs.
+   */
+  sideChatToOpen: { childId: string; parentId: string } | null;
+  /**
+   * Initial composer text for a freshly-opened side chat, keyed by its child
+   * conversation id. Set when a generic `/side <question>` opens an empty side
+   * chat (its own managed fork) so the typed question isn't lost — the side
+   * chat's composer seeds from and consumes it on mount rather than firing a
+   * turn at a runner that is still launching. App-global (the side chat lives in
+   * the main chat's rail, not its own entry).
+   */
+  sideChatDrafts: Record<string, string>;
   /**
    * Messages submitted while the agent is busy, held client-side (not yet
    * POSTed) and shown in the composer's queue strip. The head is flushed
@@ -645,12 +1045,19 @@ export interface AppChatState {
 /** Actions exposed on the root store. */
 export interface ChatActions {
   send: (text: string, agentId: string, files?: File[], opts?: SendOptions) => Promise<void>;
+  clearSideChatToOpen: () => void;
+  /** Open a generic side chat as a rail tab under `parentId`, seeding its
+   *  composer with `draft` (the typed `/side` question) so it isn't lost while
+   *  the fork launches. */
+  openSideChatWithDraft: (childSessionId: string, draft: string, parentId: string) => void;
+  /** Clear a side chat's seeded composer draft (called after it's consumed). */
+  clearSideChatDraft: (childSessionId: string) => void;
   /**
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
    */
-  enqueueMessage: (text: string, files?: File[]) => void;
+  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
   dequeueMessage: (queueId: string) => void;
   /**
@@ -718,6 +1125,10 @@ export interface ChatActions {
     action: "accept" | "decline" | "cancel",
     content?: Record<string, unknown>,
     meta?: Record<string, unknown>,
+    // The conversation the elicitation belongs to. Omitted (undefined) targets
+    // the active conversation; a side-chat approval card passes its child id so
+    // the verdict resolves the CHILD's elicitation, not the main conversation's.
+    conversationId?: string,
   ) => Promise<void>;
   /**
    * Set sticky effort; PATCH only when the active session supports it.
@@ -774,6 +1185,13 @@ export interface ChatActions {
    */
   setClaudePermissionMode: (mode: string) => Promise<void>;
   /**
+   * Switch a running codex-native session's approval/sandbox mode (e.g. to
+   * ``"read-only"``). Rejects when the live Codex thread could not accept the
+   * update, so callers surface the error rather than assuming it landed.
+   * No-ops when there is no active conversation.
+   */
+  setCodexApprovalMode: (mode: string) => Promise<void>;
+  /**
    * Fetch the next page of older messages and prepend them to `blocks`.
    *
    * No-ops when `hasMoreHistory` is false, `loadingMoreHistory` is true,
@@ -799,13 +1217,18 @@ export interface ChatActions {
    * Refetch runner-backed session state for the active conversation.
    *
    * Used when a native runner comes online after being unreachable: the
-   * runner-owned fields (skills, Codex model catalog, terminal/session
+   * runner-owned fields (Codex model catalog, terminal/session
    * metadata) may have changed while the browser only had a stale cached
    * snapshot. No-ops for inactive or missing conversations.
    */
   refreshSessionState: (conversationId?: string) => Promise<void>;
   /** Dismiss the too-many-tabs banner for the current over-budget episode. */
   dismissStreamBudgetBanner: () => void;
+  /**
+   * Dismiss the /btw sidechat overlay.
+   * TODO: reconcile with terminal Escape on native sessions.
+   */
+  dismissBtwSidechat: () => void;
 }
 
 /**
@@ -819,6 +1242,15 @@ export interface ChatActions {
 export interface ChatState extends ConversationState, AppChatState, ChatActions {}
 
 let queryClient: QueryClient | null = null;
+
+// Any semantic stream event makes a snapshot already in flight potentially
+// stale. Heartbeats are filtered before this revision is bumped.
+const streamEventRevisions = new Map<string, number>();
+conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
+
+// Snapshot reconciliation must teach the already-running stream pump which
+// native preview messages have finalized, including warm session revisits.
+const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
 
 /**
  * Evict a conversation from the live registry.
@@ -917,6 +1349,19 @@ const sendChains = new Map<string | symbol, SendChain>();
 // session is created inside the chained work, so they can't key by id. A
 // non-string key can never collide with a conversation id.
 const NEW_SESSION_SEND_CHAIN_KEY = Symbol("new-session");
+
+// Re-export for callers that already import it from the store.
+export { isTempConvId } from "@/lib/tempConversationId";
+
+/**
+ * A temp URL with no live registry entry — a reload or fresh tab landed on a
+ * `temp:` id whose client-only conversation no longer exists (it can't be
+ * re-created). ChatPage redirects these to landing so the URL-keyed landing
+ * selection isn't stuck on a permanently read-only phantom chat.
+ */
+export function isStaleTempConvId(id: string | null | undefined): boolean {
+  return isTempConvId(id) && conversationRegistry.peek(id as string) === undefined;
+}
 
 /**
  * Take a slot in a conversation's send chain.
@@ -1100,6 +1545,8 @@ const WORKSPACE_INVALIDATION_DEBOUNCE_MS = 750;
 // instantly.
 const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
+export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -1262,15 +1709,18 @@ const pendingInitialPrompts = new Map<string, PendingInitialPrompt>();
  *
  * @param conversationId The new conversation's id, e.g. `"conv_abc123"`.
  * @param prompt The user's first message (already sanitized by the
- *   dialog) plus its matched skill invocation, if any. Prompts with
- *   empty `text` are ignored so a blank prompt never queues an
- *   auto-send.
+ *   dialog) plus its matched skill invocation, if any. Prompts with no
+ *   content — empty `text` AND no `files` — are ignored so a blank
+ *   prompt never queues an auto-send. An image-only draft (blank text
+ *   with attachments) is real content and queues normally: the send
+ *   path omits the `input_text` block for blank text, so the first
+ *   message arrives as `input_image` blocks alone.
  */
 export function setPendingInitialPrompt(
   conversationId: string,
   prompt: PendingInitialPrompt,
 ): void {
-  if (!prompt.text) return;
+  if (!prompt.text && !prompt.files?.length) return;
   pendingInitialPrompts.set(conversationId, prompt);
 }
 
@@ -1297,6 +1747,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   redirectToConversationId: null,
   blocks: [],
   pendingUserMessages: [],
+  btwSidechat: null,
   queuedMessages: [],
   activeResponse: null,
   interruptedResponseIds: [],
@@ -1315,10 +1766,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   selectedModel: loadPickerPref(PICKER_PREF_MODEL_KEY),
   sessionModelOverride: null,
   sessionReasoningEffort: null,
+  sessionEffortSeeded: false,
+  sessionModelSeeded: false,
+  sessionHostId: null,
   costControlModeOverride: null,
   subagentRoutingOverride: null,
   codexPlanMode: false,
   claudePermissionMode: "",
+  codexApprovalMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
   oldestItemId: null,
@@ -1327,10 +1782,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
+  pendingRetryStableId: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
   sessionHarness: null,
+  awaitingSideChatFor: null,
+  sideChatToOpen: null,
+  sideChatDrafts: {},
   subAgentName: null,
   contextWindow: null,
   tokensUsed: null,
@@ -1338,30 +1797,33 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   sessionUsageByModel: null,
   gitBranch: null,
   todos: [],
-  skills: [],
   codexModelOptions: [],
   terminalPending: false,
   runnerLaunchedAt: null,
   viewers: [],
   sandboxStatus: null,
   mcpStartup: null,
+  mcpStartupLaunch: { pending: false, dismissed: false },
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files) => {
+  enqueueMessage: (text, files, replyDraft) => {
     const { conversationId, boundAgentId } = get();
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
+    const stableId = randomUUID().replace(/-/g, "");
     setActive((s) => ({
       queuedMessages: [
         ...s.queuedMessages,
         {
           queueId,
           text,
+          stableId,
           conversationId,
           ...(boundAgentId !== null ? { agentId: boundAgentId } : {}),
           ...(files && files.length > 0 ? { files } : {}),
+          ...(replyDraft ? { replyDraft } : {}),
         },
       ],
     }));
@@ -1413,7 +1875,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (target === undefined || agentId === null) return;
     // Remove BEFORE the POST so a concurrent flush can't also send it.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId) });
-    void s.send(target.text, agentId, target.files);
+    void s.send(target.text, agentId, target.files, { replyDraft: target.replyDraft });
   },
 
   clearQueuedMessages: (conversationId) => {
@@ -1460,7 +1922,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (head === undefined) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
     setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
-    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files);
+    void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, {
+      replyDraft: head.replyDraft,
+    });
   },
 
   flushBackgroundQueues: () => {
@@ -1542,7 +2006,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         ];
         await postEvent(conversationId, {
           type: "message",
-          data: { role: "user", content },
+          data: { role: "user", content, stable_id: head.stableId },
         });
       })()
         .catch(() => {
@@ -1571,21 +2035,75 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  clearSideChatToOpen: () => {
+    useChatStore.setState({ sideChatToOpen: null });
+  },
+  openSideChatWithDraft: (childSessionId, draft, parentId) => {
+    useChatStore.setState((s) => ({
+      sideChatToOpen: { childId: childSessionId, parentId },
+      sideChatDrafts: draft ? { ...s.sideChatDrafts, [childSessionId]: draft } : s.sideChatDrafts,
+    }));
+  },
+  clearSideChatDraft: (childSessionId) => {
+    useChatStore.setState((s) => {
+      if (!(childSessionId in s.sideChatDrafts)) return {};
+      return {
+        sideChatDrafts: Object.fromEntries(
+          Object.entries(s.sideChatDrafts).filter(([key]) => key !== childSessionId),
+        ),
+      };
+    });
+  },
   send: async (text, agentId, files, opts) => {
     if (!agentId) {
       throw new Error("chatStore.send: no agentId");
     }
+    // Target session: an explicit pin (navigate-first background POST) overrides
+    // the visible conversation, so a send whose session was created while the
+    // user moved to another chat still lands on the right one, not the one on
+    // screen. `pinnedSetter` routes every write for this send there.
+    const pinnedId = opts?.pinnedConversationId ?? null;
+    const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
+    const retryId =
+      pinnedId === null
+        ? get().pendingRetryStableId
+        : (setterForState(pinnedId)?.pendingRetryStableId ?? null);
+    if (retryId !== null) pinnedSetter({ pendingRetryStableId: null });
+    const stableId = opts?.stableId ?? retryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
     // into the running task's inbox. Keep `activeResponse` untouched in
     // that case so the in-flight bubble keeps its "streaming" lifecycle
     // until its own `response.completed` arrives.
-    const alreadyStreaming = get().status === "streaming";
-    if (!alreadyStreaming) {
+    //
+    // `reusePendingTempId` is the navigate-first first turn: the entry was
+    // pre-set to "streaming" by `beginLocalConversation` (for the create-window
+    // shimmer) but has no `sendLatchedAt`. Treat it as NOT-already-streaming so
+    // this send arms the latch and owns the failure-settle — otherwise a failed
+    // first turn would strand the conversation in "streaming" with no watchdog.
+    // A codex `/side` command is forked into its own side chat: it gets no
+    // bubble here, and this session must not latch into "Working…" either —
+    // nothing runs here, so nothing would ever arrive to clear it.
+    // Only the native-fork harness (Codex) routes `/side` through `send` as
+    // plaintext — the runner forks in-process. Generic harnesses intercept
+    // `/side` in the composer and call the server side-chat endpoint instead, so
+    // their `/side` text never reaches `send`.
+    const opensSideChat =
+      usesNativeSideChatFork(get().sessionHarness) && isSideChatCommand(text.trim());
+    if (opensSideChat) {
+      useChatStore.setState({ awaitingSideChatFor: pinnedId ?? get().conversationId });
+    }
+    const alreadyStreaming =
+      opts?.reusePendingTempId != null
+        ? false
+        : pinnedId === null
+          ? get().status === "streaming"
+          : setterForState(pinnedId)?.status === "streaming";
+    if (!alreadyStreaming && !opensSideChat) {
       // Latch on the SAME entry as `status`, in one patch, so they can't
       // diverge — a new chat buffers both on root and `adoptPreSessionState`
       // moves them onto the entry together.
-      setActive({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
     }
 
     // Push to `pendingUserMessages` BEFORE the POST so the bubble
@@ -1594,8 +2112,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // response (separate TCP connections; either can resolve first).
     // FIFO promotion in the consumed handler matches this pending
     // entry to the eventual server item id.
-    pendingSeq += 1;
-    const tempId = `pend_${pendingSeq}`;
+    // Reuse a bubble already on the entry (navigate-first flow) rather than
+    // mint a new one, so the message the user has already seen isn't duplicated.
+    const reuseTempId = opts?.reusePendingTempId ?? null;
+    let tempId: string;
+    if (reuseTempId !== null) {
+      tempId = reuseTempId;
+    } else {
+      pendingSeq += 1;
+      tempId = `pend_${pendingSeq}`;
+    }
     const pendingFileBlocks: MessageContentBlock[] = (files ?? []).map((file) => {
       const filename = file.name || "image.png";
       // Key the placeholder id on the File's stable identity, not its name:
@@ -1603,7 +2129,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // id would collide across attachments and strand a ghost chip (React
       // dedupes on the shared key) until a refresh replaces it with the
       // server's unique file_id.
-      const fileId = `pending:${attachmentKey(file)}`;
+      const fileId = `${PENDING_FILE_PREFIX}${attachmentKey(file)}`;
       return file.type.startsWith("image/")
         ? { type: "input_image" as const, file_id: fileId, filename }
         : { type: "input_file" as const, file_id: fileId, filename };
@@ -1613,30 +2139,35 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ...(text.trim() ? [{ type: "input_text" as const, text }] : []),
     ];
     const selfAuthor = getCurrentAuthorId();
-    setActive((s) => ({
-      pendingUserMessages: [
-        ...s.pendingUserMessages,
-        {
-          tempId,
-          content,
-          createdAtS: Math.floor(Date.now() / 1000),
-          ...(selfAuthor !== null ? { author: selfAuthor } : {}),
-        },
-      ],
-      // A new turn does NOT supersede the background-shell tally: shells
-      // launched in an earlier turn keep running across the turn boundary, so
-      // the composer pill must stay lit alongside the "Working…" shimmer rather
-      // than blink off the moment the user sends. The count is sticky (see the
-      // `session_status` handler) and the next Stop hook re-reports it
-      // authoritatively. Only the parked-dialog reason clears — a fresh send is
-      // not parked on a dialog.
-      blockedOn: null,
-    }));
+    if (reuseTempId === null) {
+      pinnedSetter((s) => ({
+        pendingUserMessages: opensSideChat
+          ? s.pendingUserMessages
+          : [
+              ...s.pendingUserMessages,
+              {
+                tempId,
+                content,
+                createdAtS: Math.floor(Date.now() / 1000),
+                ...(selfAuthor !== null ? { author: selfAuthor } : {}),
+              },
+            ],
+        // A new turn does NOT supersede the background-shell tally: shells
+        // launched in an earlier turn keep running across the turn boundary, so
+        // the composer pill must stay lit alongside the "Working…" shimmer rather
+        // than blink off the moment the user sends. The count is sticky (see the
+        // `session_status` handler) and the next Stop hook re-reports it
+        // authoritatively. Only the parked-dialog reason clears — a fresh send is
+        // not parked on a dialog.
+        blockedOn: null,
+      }));
+    }
 
     // Pin the destination before joining the send chain: a stalled prior
     // send can delay this POST past a session switch, and resolving the
     // target afterward would leak the message into the now-active session.
-    const submitConversationId = get().conversationId;
+    // An explicit pin (navigate-first background POST) wins over the visible id.
+    const submitConversationId = pinnedId ?? get().conversationId;
 
     // Take our place in THIS conversation's send chain: wait for its prior
     // send's network work, then hand off to the next via `releaseSend` in the
@@ -1690,6 +2221,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         data: {
           role: "user",
           content: serverContent,
+          stable_id: stableId,
         },
       });
       // Policy denied the input — the server returned immediately
@@ -1748,17 +2280,27 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const draftSessionId = postedSessionId ?? submitConversationId;
       if (draftSessionId !== null && (text.trim() !== "" || (files?.length ?? 0) > 0)) {
         setterFor(draftSessionId)({
-          failedSendDraft: { conversationId: draftSessionId, text, files: files ?? [] },
+          failedSendDraft: {
+            conversationId: draftSessionId,
+            text,
+            files: files ?? [],
+            stableId,
+            ...(opts?.replyDraft ? { replyDraft: opts.replyDraft } : {}),
+          },
         });
       }
       // Settle the conversation this send targeted, wherever the user is now:
       // its bubble must roll back and its status must not stay "streaming"
-      // forever. When the throw came from session setup itself
-      // (`postedSessionId` never resolved) there is no target conversation, so
-      // it belongs to the active one — the landing composer's own failure.
-      const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
+      // forever. Target `postedSessionId ?? submitConversationId` (mirroring the
+      // draft restore above): a bind failure throws before `postedSessionId` is
+      // assigned, but the pin/submit id already names the session — so a failed
+      // navigate-first first turn settles the REAL new session, not whatever
+      // chat the user has since switched to. Null id (the landing composer's own
+      // failure) falls back to the active conversation.
+      const failTarget = postedSessionId ?? submitConversationId;
+      const failSet = failTarget === null ? setActive : setterFor(failTarget);
       const failGet = (): ChatState =>
-        postedSessionId === null ? get() : (setterForState(postedSessionId) ?? get());
+        failTarget === null ? get() : (setterForState(failTarget) ?? get());
       // Roll back the optimistic bubble — no server idle will fire.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
@@ -1801,12 +2343,19 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (!agentId) {
       throw new Error("chatStore.sendSlashCommand: no agentId");
     }
+    // See `send`: an explicit pin (navigate-first background dispatch) targets
+    // the just-created session even after the user moved to another chat.
+    const pinnedId = opts?.pinnedConversationId ?? null;
+    const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     // Mirror `send`'s lifecycle scaffolding (streaming flag + send-chain
     // serialization) so a skill invocation behaves like any other turn.
-    const alreadyStreaming = get().status === "streaming";
+    const alreadyStreaming =
+      pinnedId === null
+        ? get().status === "streaming"
+        : setterForState(pinnedId)?.status === "streaming";
     if (!alreadyStreaming) {
       // See `send`: latch and status on one entry, in one patch.
-      setActive({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
+      pinnedSetter({ status: "streaming", activeResponse: null, sendLatchedAt: Date.now() });
     }
     // Optimistic echo of the typed command, mirroring `send`. Without it
     // the chat shows nothing until the server's `slash_command` receipt
@@ -1820,7 +2369,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const tempId = `pend_${pendingSeq}`;
     const commandText = args ? `/${name} ${args}` : `/${name}`;
     const selfAuthor = getCurrentAuthorId();
-    setActive((s) => ({
+    pinnedSetter((s) => ({
       pendingUserMessages: [
         ...s.pendingUserMessages,
         {
@@ -1834,7 +2383,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // Pin the destination at submit time — see `send` above for why a late
     // resolve mis-routes to the session the user has since switched to.
-    const submitConversationId = get().conversationId;
+    const submitConversationId = pinnedId ?? get().conversationId;
 
     const { waitForPrior, rekey, releaseSend } = enterSendChain(submitConversationId);
 
@@ -1889,10 +2438,12 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       const message = err instanceof Error ? err.message : String(err);
       // Settle the conversation this command targeted, wherever the user is
       // now: its echo must roll back and its status must not stay "streaming"
-      // forever. A throw from session setup itself (`postedSessionId` never
-      // resolved) has no target conversation, so it belongs to the active one —
-      // the landing composer's own failure. Mirrors `send`'s catch.
-      const failSet = postedSessionId === null ? setActive : setterFor(postedSessionId);
+      // forever. Target `postedSessionId ?? submitConversationId` (mirrors
+      // `send`'s catch): a bind failure throws before `postedSessionId` is set,
+      // but the pin/submit id already names the session, so a failed pinned
+      // command settles the real session, not the visible one. Null → active.
+      const failTarget = postedSessionId ?? submitConversationId;
+      const failSet = failTarget === null ? setActive : setterFor(failTarget);
       // Roll back the optimistic echo — no receipt will reconcile it.
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
@@ -1993,6 +2544,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
 
+    // A client-only conversation (temp:*) shown while `createSession` is in
+    // flight has no server session to bind — its entry holds the optimistic
+    // first-message bubble locally. Paint it and return; the background create
+    // rekeys it to the real id (which then binds). If the entry is gone (a stale
+    // temp URL survived a reload — it can't be re-created), reset to landing
+    // state as a backstop; ChatPage redirects the URL to `/` (isStaleTempConvId).
+    if (isTempConvId(conversationId)) {
+      if (conversationRegistry.peek(conversationId) === undefined) {
+        conversationRegistry.setActive(null);
+        rootSetState({ conversationId: null } as Parameters<typeof rootSetState>[0]);
+        rootSetState(createInitialConversationState() as Parameters<typeof rootSetState>[0]);
+        return;
+      }
+      conversationRegistry.acquire(conversationId);
+      mirrorActiveEntry();
+      return;
+    }
+
     // Sends the server hasn't acknowledged, carried across the re-bind below.
     let unsentOnRebind: PendingUserMessage[] = [];
     if (!wasLive) {
@@ -2026,7 +2595,22 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // Paint whatever the entry already holds. For a live entry that is the
     // current transcript; for a fresh one it is the initial state.
     mirrorActiveEntry();
-    if (wasLive) return;
+    if (wasLive) {
+      // An open stream is not proof the entry is current: a session stream
+      // routed to the wrong replica stays open and heartbeats while delivering
+      // no events, and a reconnect loop that never re-opens holds the
+      // controller too. Verify the instantly-painted transcript against the
+      // committed snapshot in the background; item-id dedupe makes this a
+      // no-op when the entry really is current.
+      const controller = entry.getState().abortController;
+      void reconcileOnReconnect(
+        conversationId,
+        entrySetter(entry),
+        entryGetter(entry),
+        controller === null ? undefined : nativePreviewTombstonesByController.get(controller),
+      );
+      return;
+    }
 
     // Cold entry: bind its stream and hydrate history. `hydratePending` replays
     // the snapshot's un-consumed native messages — correct here because a fresh
@@ -2046,11 +2630,17 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
-  submitApproval: async (elicitationId, action, content, meta) => {
-    const sessionId = get().conversationId;
+  submitApproval: async (elicitationId, action, content, meta, conversationId) => {
+    // Operate on the passed conversation (a side-chat child) or the active one.
+    // A side-chat pane renders the same approval card but its elicitation lives
+    // in the CHILD's entry, so reading/writing the active conversation's blocks
+    // would answer the wrong session and leave the child blocked.
+    const sessionId = conversationId ?? get().conversationId;
     if (!sessionId) return;
+    const scopedState = conversationId ? (setterForState(conversationId) ?? get()) : get();
+    const write = setterFor(sessionId);
     const targetSessionId =
-      get().blocks.find(
+      scopedState.blocks.find(
         (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === elicitationId,
       )?.targetSessionId ?? sessionId;
     // Optimistically flip the matching elicitation block to
@@ -2067,7 +2657,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       ...(content === undefined ? {} : { content }),
       ...(meta === undefined ? {} : { _meta: meta }),
     };
-    setActive((s) => ({
+    write((s) => ({
       blocks: s.blocks.map((b) =>
         b.type === "elicitation" && b.elicitationId === elicitationId
           ? { ...b, status: "responded", response: responseValue }
@@ -2097,7 +2687,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // outlive a switch away, and rolling back the VISIBLE conversation would
       // reopen an unrelated chat's card while leaving this one wrongly
       // answered.
-      setterFor(sessionId)((s) => ({
+      write((s) => ({
         blocks: s.blocks.map((b) =>
           b.type === "elicitation" && b.elicitationId === elicitationId
             ? { ...b, status: "pending", response: null }
@@ -2127,6 +2717,18 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   clearPendingComposerAttachments: () => setActive({ pendingComposerAttachments: [] }),
 
   dismissStreamBudgetBanner: () => rootSetState({ streamBudgetBannerDismissed: true }),
+
+  dismissBtwSidechat: () => {
+    const { conversationId } = get();
+    setActive({ btwSidechat: null });
+    // Mirror the close to the terminal so its own /btw overlay (a separate
+    // surface) shuts in lockstep. Best-effort and fire-and-forget: the pane
+    // overlay also auto-dismisses on the next injected message, so a failed
+    // or no-op forward changes nothing the user sees.
+    if (conversationId) {
+      void postEvent(conversationId, { type: "external_btw_dismiss", data: {} }).catch(() => {});
+    }
+  },
 
   markRunnerLaunched: () => setActive({ runnerLaunchedAt: Date.now() }),
 
@@ -2164,7 +2766,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Harness has no effort control: undo the optimistic session-scoped write
       // so this conversation doesn't claim an effort the server will never hold.
       if (!supportsEffortControl(session)) {
-        setterFor(conversationId)({ sessionReasoningEffort: null });
+        setterFor(conversationId)({ sessionReasoningEffort: null, sessionEffortSeeded: false });
         return;
       }
       await updateSession(conversationId, { reasoningEffort: effort });
@@ -2351,6 +2953,24 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  setCodexApprovalMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const previous = get().codexApprovalMode;
+    // Pinned for the same reason as `setCostControlMode` — see there.
+    const patchSet = setterFor(conversationId);
+    // Optimistic, then reconciled against the mode the server confirms the
+    // Codex thread landed on.
+    patchSet({ codexApprovalMode: mode });
+    try {
+      const session = await updateSession(conversationId, { codexApprovalMode: mode });
+      patchSet({ codexApprovalMode: codexApprovalModeFromSession(session) ?? "" });
+    } catch (err) {
+      patchSet({ codexApprovalMode: previous });
+      throw err;
+    }
+  },
+
   loadMoreHistory: async () => {
     const { conversationId, oldestItemId, loadingMoreHistory, hasMoreHistory, historyGeneration } =
       get();
@@ -2395,6 +3015,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     } catch {
       // A stale failure must not disable scroll-up on the NEW window.
       if (stale()) return;
+      // A `stale_cursor` 400 lands here too: the oldest loaded item was
+      // deleted, so this window's back-cursor is unrecoverable without
+      // re-hydrating. Stopping scroll-up matches the pre-existing behaviour
+      // for any page failure; a reconnect or revisit rebuilds the window.
       // Disable further fetches on error — a persistent server failure
       // would otherwise re-trigger the scroll listener on every scroll event.
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
@@ -2669,6 +3293,39 @@ function mirrorActiveEntry(): void {
   rootSetState(entry.getState() as Parameters<typeof rootSetState>[0]);
 }
 
+/**
+ * Bind a conversation's live stream WITHOUT making it the on-screen
+ * conversation, so a side chat can stream in its Workspace-rail tab beside the
+ * still-active main chat. The cold path of `switchTo` minus
+ * `setActive`/`mirrorActiveEntry` — it hydrates the entry and opens its stream,
+ * but the root projection (what `useChatStore` reads) keeps pointing at the main
+ * chat; a side-chat surface reads the child entry via `useConversationEntryState`.
+ *
+ * No-op when the entry is already live and healthy (stream bound or still
+ * loading), and for a blank or client-only (temp) id. When a prior attempt left
+ * the entry with a load error, it is released and re-bound so a failed side chat
+ * can recover on retry (a plain membership check would strand it forever).
+ *
+ * @param id Conversation id to stream, e.g. a side-chat child.
+ */
+export async function ensureConversationStreamed(id: string): Promise<void> {
+  if (id === "" || isTempConvId(id)) return;
+  const existing = conversationRegistry.peek(id);
+  if (existing !== undefined) {
+    // Reuse only while a load is in flight (guards a double-bind) or the stream
+    // is actually live. A non-reconnectable `server_closed` tears down the
+    // controller WITHOUT setting a load error, so an error-free entry can still
+    // be dead — reusing it would strand a remounted pane on stale state. This
+    // mirrors switchTo's `isConversationStreamCurrent` liveness gate.
+    if (existing.getState().loadingConversation || isConversationStreamCurrent(id)) return;
+    // Dead or failed: drop the entry so the acquire below rebinds.
+    conversationRegistry.release(id);
+  }
+  const entry = conversationRegistry.acquire(id);
+  entry.setState({ loadingConversation: true, conversationLoadError: null });
+  await bindStream(id, entrySetter(entry), entryGetter(entry), true);
+}
+
 // Route `useChatStore.setState` so a conversation-scoped write reaches the
 // active entry rather than the root store's projection of it.
 //
@@ -2938,6 +3595,54 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
 }
 
 /**
+ * Show pending MCP startup only until live assistant text supersedes it.
+ * Shared by SSE and snapshots so late progress cannot resurrect the band.
+ * Settled failures/cancellations remain setup diagnostics, not chat content.
+ */
+function activeMcpStartup(
+  servers: Record<string, McpServerStartup> | null | undefined,
+  dismissed: boolean,
+): Record<string, McpServerStartup> | null {
+  if (dismissed || !servers) return null;
+  const anyStarting = Object.values(servers).some((r) => r.status === "starting");
+  return anyStarting ? servers : null;
+}
+
+function updateMcpStartupLaunch(
+  launch: ConversationState["mcpStartupLaunch"],
+  pending: boolean,
+): ConversationState["mcpStartupLaunch"] {
+  return pending === launch.pending
+    ? launch
+    : { pending, dismissed: pending ? false : launch.dismissed };
+}
+
+/** Joined requests may predate live text, so they cannot prove a new launch. */
+function mcpStartupBeforeSnapshot(
+  id: string,
+  state: Pick<ConversationState, "mcpStartupLaunch"> | null,
+): ConversationState["mcpStartupLaunch"] | undefined {
+  if (queryClient?.getQueryState(["session", id])?.fetchStatus === "fetching") return undefined;
+  return state?.mcpStartupLaunch;
+}
+
+function mcpStartupSnapshotPatch(
+  session: Session,
+  state: Pick<ConversationState, "mcpStartupLaunch">,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+): Pick<ConversationState, "mcpStartup" | "mcpStartupLaunch"> {
+  // Fresh text creates a new latch object; older snapshots cannot rearm it.
+  const launch =
+    state.mcpStartupLaunch === launchBeforeFetch
+      ? updateMcpStartupLaunch(state.mcpStartupLaunch, session.terminalPending ?? false)
+      : state.mcpStartupLaunch;
+  return {
+    mcpStartupLaunch: launch,
+    mcpStartup: activeMcpStartup(session.mcpStartup, launch.dismissed),
+  };
+}
+
+/**
  * Store fields derived from the session's agent binding, computed from a
  * session snapshot.
  *
@@ -2957,10 +3662,16 @@ async function reconcilePendingElicitations(id: string): Promise<void> {
  */
 function sessionBindingPatch(
   session: Session,
+  state: Pick<
+    ConversationState,
+    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
+  >,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Pick<
   ChatState,
   | "isNativeTerminalSession"
   | "nativeVendorOwnsModel"
+  | "sessionModelSeeded"
   | "boundAgentId"
   | "boundAgentName"
   | "llmModel"
@@ -2972,14 +3683,16 @@ function sessionBindingPatch(
   | "subagentRoutingOverride"
   | "codexPlanMode"
   | "claudePermissionMode"
+  | "codexApprovalMode"
   | "contextWindow"
   | "gitBranch"
-  | "skills"
   | "codexModelOptions"
   | "terminalPending"
   | "sandboxStatus"
   | "mcpStartup"
+  | "mcpStartupLaunch"
 > {
+  const retainModelSeed = state.sessionModelSeeded && session.llmModel == null;
   return {
     isNativeTerminalSession: isNativeTerminalSessionFn(session),
     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
@@ -2989,9 +3702,12 @@ function sessionBindingPatch(
       isNativeTerminalSessionFn(session) && nativeModelFamilyForSession(session) === null,
     boundAgentId: session.agentId,
     boundAgentName: session.agentName,
-    llmModel: session.llmModel ?? null,
+    llmModel: retainModelSeed ? state.llmModel : (session.llmModel ?? null),
+    sessionModelSeeded: retainModelSeed,
     pendingModelChange: null,
-    sessionModelOverride: session.modelOverride ?? null,
+    sessionModelOverride: retainModelSeed
+      ? state.sessionModelOverride
+      : (session.modelOverride ?? null),
     sessionHarness: session.harness ?? null,
     subAgentName: session.subAgentName ?? null,
     costControlModeOverride: session.costControlModeOverride ?? null,
@@ -3000,13 +3716,15 @@ function sessionBindingPatch(
     claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
+    codexApprovalMode: isCodexNativeSession(session)
+      ? (codexApprovalModeFromSession(session) ?? "")
+      : "",
     contextWindow: session.contextWindow ?? null,
     gitBranch: session.gitBranch ?? null,
-    skills: session.skills ?? [],
     codexModelOptions: session.codexModelOptions ?? [],
     terminalPending: session.terminalPending ?? false,
     sandboxStatus: session.sandboxStatus ?? null,
-    mcpStartup: session.mcpStartup ?? null,
+    ...mcpStartupSnapshotPatch(session, state, launchBeforeFetch),
   };
 }
 
@@ -3027,6 +3745,7 @@ function sessionBindingPatch(
  */
 async function refreshSessionBinding(id: string): Promise<void> {
   if (queryClient === null) return;
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, setterForState(id));
   let session: Session;
   try {
     session = await queryClient.fetchQuery({
@@ -3038,11 +3757,12 @@ async function refreshSessionBinding(id: string): Promise<void> {
   } catch {
     return;
   }
+  void queryClient?.invalidateQueries({ queryKey: ["skills", id] });
   // Apply to the conversation this refresh was for, not whichever is on screen:
   // an agent switch in a backgrounded conversation must still re-derive its
   // binding (most importantly `isNativeTerminalSession`, which gates the
   // optimistic-bubble lifecycle). `setterFor` no-ops once it is evicted.
-  setterFor(id)(sessionBindingPatch(session));
+  setterFor(id)((s) => sessionBindingPatch(session, s, launchBeforeFetch));
 }
 
 /**
@@ -3067,6 +3787,8 @@ async function bindStream(
 ): Promise<void> {
   racedNativeModelOptions.delete(id);
   const controller = new AbortController();
+  const ignoredNativeMessageIds = new Set<string>();
+  nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
@@ -3108,7 +3830,9 @@ async function bindStream(
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction).
-  void startStreamPump(id, controller, set, get).finally(() => releaseStreamSlot(id));
+  void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
+    releaseStreamSlot(id),
+  );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
   // (browser throttling), so a pending ApprovalCard that was answered on
@@ -3139,6 +3863,7 @@ async function bindStream(
   if (queryClient === null) {
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   try {
     // One larger page, so opening a session is a single round trip that then
     // stays still — rather than a small page followed by background growth
@@ -3154,12 +3879,10 @@ async function bindStream(
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
+    const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
+    snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
     // Sticky-pref handoff for CLI-created sessions with no override.
-    // Binding-derived fields (isNativeTerminalSession, bound agent,
-    // model/skills metadata) — shared with the session.agent_changed
-    // refresh path; see sessionBindingPatch.
-    const bindingPatch = sessionBindingPatch(session);
     // Sub-agents inherit orchestrator choices.
     const isSubAgentSession = session.parentSessionId != null;
     const canApplyEffort = supportsEffortControl(session);
@@ -3199,6 +3922,8 @@ async function bindStream(
     // inside the updater because it depends on the catalog bind race.
     let resolvedStickyModel: string | null = null;
     set((state) => {
+      const currentBlocks = withoutNativePreviews(state.blocks, snapshotNativeMessageIds);
+      const bindingPatch = sessionBindingPatch(session, state, launchBeforeFetch);
       const racedOptions = racedNativeModelOptions.get(id);
       const catalogWonBindRace =
         bindingPatch.codexModelOptions.length === 0 && (racedOptions?.length ?? 0) > 0;
@@ -3206,14 +3931,14 @@ async function bindStream(
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
       const seenItemIds = new Set(
-        state.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+        currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
       const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
       // Dedupe against any elicitation blocks already produced by
       // the live pump (the snapshot may race ahead of or behind
       // the SSE event — match by elicitationId).
       const seenElicitationIds = new Set(
-        state.blocks
+        currentBlocks
           .filter((b): b is typeof b & { type: "elicitation" } => b.type === "elicitation")
           .map((b) => b.elicitationId),
       );
@@ -3238,7 +3963,7 @@ async function bindStream(
       // re-binds.)
       const allBlocks = [
         ...unique,
-        ...withoutRebuiltUserInputCards(state.blocks, unique),
+        ...withoutRebuiltUserInputCards(currentBlocks, unique),
         ...uniquePendingElicitations,
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
@@ -3368,10 +4093,8 @@ async function bindStream(
         // This conversation's own effective effort, which is what a warm switch
         // back re-projects (it does not re-bind, so it cannot recompute it).
         sessionReasoningEffort: effectiveEffort,
-        // Session truth for the `/model` readout — overrides the snapshot
-        // value spread via `...bindingPatch` so the claude-native sticky
-        // handoff (fired above, silent) shows immediately.
-        sessionModelOverride: session.modelOverride ?? null,
+        // Server hydration supersedes any optimistic effort seed.
+        sessionEffortSeeded: false,
         tokensUsed: session.lastTotalTokens ?? null,
         sessionCostUsd: session.totalCostUsd ?? null,
         sessionUsageByModel: session.usageByModel ?? null,
@@ -3497,7 +4220,8 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
 
 /**
  * Session-snapshot state every reconnect path recovers: `sessionStatus`,
- * token/context/cost counters, and — when the turn ended during the gap —
+ * token/context/cost counters, the MCP startup band, and — when the turn
+ * ended during the gap —
  * the terminal `activeResponse` transition the missed `session.status`
  * event would have applied, so "Working…" clears.
  *
@@ -3509,8 +4233,15 @@ const RECONNECT_BACKFILL_MAX_PAGES = 4;
  * already-running native session) would leave the turn's bubble non-streaming
  * and its tool cards static for the rest of the turn.
  */
-function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState> {
-  const patch: Partial<ChatState> = { sessionStatus: session.status };
+function reconnectStatusPatch(
+  session: Session,
+  s: ChatState,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+): Partial<ChatState> {
+  const patch: Partial<ChatState> = {
+    sessionStatus: session.status,
+    ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
+  };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
   patch.backgroundTaskCount = session.backgroundTaskCount ?? 0;
@@ -3566,6 +4297,70 @@ function reconnectStatusPatch(session: Session, s: ChatState): Partial<ChatState
     patch.status = "streaming";
   }
   return patch;
+}
+
+/**
+ * Reconcile the visible conversation's lifecycle from its persisted snapshot.
+ *
+ * A stream pump can keep receiving heartbeats while missing a lifecycle event.
+ * Periodically re-read durable status, discarding a snapshot if any semantic
+ * stream event arrives during the fetch.
+ */
+async function reconcileActiveSessionStatus(
+  id: string,
+  controller: AbortController,
+  set: Setter,
+  get: Getter,
+): Promise<void> {
+  if (
+    queryClient === null ||
+    controller.signal.aborted ||
+    conversationRegistry.getActive()?.id !== id ||
+    get().abortController !== controller
+  ) {
+    return;
+  }
+  const stateBeforeFetch = get();
+  const revisionBeforeFetch = streamEventRevisions.get(id) ?? 0;
+  const snapshotController = new AbortController();
+  const abortSnapshot = () => snapshotController.abort();
+  controller.signal.addEventListener("abort", abortSnapshot, { once: true });
+  const snapshotTimeout = window.setTimeout(
+    abortSnapshot,
+    ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
+  );
+  let session: Session;
+  try {
+    // This read must not join the shared React Query request: an older request
+    // could have started before the live event this reconciliation follows.
+    session = await getSessionSlim(id, { signal: snapshotController.signal });
+  } catch {
+    return;
+  } finally {
+    window.clearTimeout(snapshotTimeout);
+    controller.signal.removeEventListener("abort", abortSnapshot);
+  }
+  const current = get();
+  if (
+    controller.signal.aborted ||
+    isConversationDisposed(id) ||
+    conversationRegistry.getActive()?.id !== id ||
+    get().abortController !== controller ||
+    (streamEventRevisions.get(id) ?? 0) !== revisionBeforeFetch ||
+    current.sessionStatus !== stateBeforeFetch.sessionStatus ||
+    current.status !== stateBeforeFetch.status ||
+    current.activeResponse !== stateBeforeFetch.activeResponse ||
+    current.backgroundTaskCount !== stateBeforeFetch.backgroundTaskCount ||
+    current.backgroundTasks !== stateBeforeFetch.backgroundTasks ||
+    current.mcpStartup !== stateBeforeFetch.mcpStartup ||
+    current.contextWindow !== stateBeforeFetch.contextWindow ||
+    current.tokensUsed !== stateBeforeFetch.tokensUsed ||
+    current.sessionCostUsd !== stateBeforeFetch.sessionCostUsd ||
+    current.sessionUsageByModel !== stateBeforeFetch.sessionUsageByModel
+  ) {
+    return;
+  }
+  set((s) => reconnectStatusPatch(session, s, stateBeforeFetch.mcpStartupLaunch));
 }
 
 /**
@@ -3759,6 +4554,8 @@ async function rehydrateWindowOnReconnect(
   preGapElicitations: { pending: Set<string>; autoResolved: Set<string> },
   set: Setter,
   get: Getter,
+  ignoredNativeMessageIds: Set<string>,
+  launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
@@ -3769,11 +4566,14 @@ async function rehydrateWindowOnReconnect(
     return;
   }
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
+  snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    const tail = s.blocks.filter((b) => {
+    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
+    const tail = currentBlocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
       // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
       if (b.type === "elicitation" || b.type === "error") return true;
@@ -3788,7 +4588,7 @@ async function rehydrateWindowOnReconnect(
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
     return {
-      ...reconnectStatusPatch(session, s),
+      ...reconnectStatusPatch(session, s, launchBeforeFetch),
       blocks:
         reconcileElicitationBlocks(
           merged,
@@ -3832,8 +4632,14 @@ async function rehydrateWindowOnReconnect(
  * failure just means the next reconnect retries. All writes are
  * `historyGeneration`-guarded so a window reset mid-fetch voids them.
  */
-async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promise<void> {
+async function reconcileOnReconnect(
+  id: string,
+  set: Setter,
+  get: Getter,
+  ignoredNativeMessageIds: Set<string> = new Set<string>(),
+): Promise<void> {
   if (queryClient === null) return;
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
   // while we fetch — those are at the new end of the transcript, not proof
@@ -3882,7 +4688,11 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     let older: SessionItemsPage;
     try {
       older = await fetchSessionItemsPage(id, { olderThan: cursor });
-    } catch {
+    } catch (error) {
+      // A cursor whose item was deleted can never be paged past. Stop the
+      // backfill with the gap still uncovered so the full rehydrate below
+      // runs, instead of leaving items no path can fetch.
+      if (isStaleCursorError(error)) break;
       return;
     }
     if (stale()) return;
@@ -3892,19 +4702,31 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     if (older.items.length === 0) break; // no progress; avoid refetching the same cursor
   }
   /* oxlint-enable no-await-in-loop */
+  const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
+  snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   if (!covered) {
-    await rehydrateWindowOnReconnect(id, session, preGapIds, preGapElicitations, set, get);
+    await rehydrateWindowOnReconnect(
+      id,
+      session,
+      preGapIds,
+      preGapElicitations,
+      set,
+      get,
+      ignoredNativeMessageIds,
+      launchBeforeFetch,
+    );
     return;
   }
 
   const snapshotBlocks = itemsToBlocks(items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   set((s) => {
+    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
     const seen = new Set(
-      s.blocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
+      currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
-    const patch: Partial<ChatState> = reconnectStatusPatch(session, s);
+    const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(
@@ -3913,7 +4735,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
     if (recoveredUserInputs > 0) {
       patch.pendingUserMessages = s.pendingUserMessages.slice(recoveredUserInputs);
     }
-    let nextBlocks = s.blocks;
+    let nextBlocks = currentBlocks;
     if (unseen.length > 0) {
       // Splice the gap's committed items ahead of the active turn's
       // replayed in-flight region (its itemId-less blocks, rebuilt by the
@@ -3924,7 +4746,7 @@ async function reconcileOnReconnect(id: string, set: Setter, get: Getter): Promi
       const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
       // A card answered before the gap whose call the gap persisted comes
       // back rebuilt in `unseen` — drop the live copy before anchoring.
-      const kept = withoutRebuiltUserInputCards(s.blocks, unseen);
+      const kept = withoutRebuiltUserInputCards(currentBlocks, unseen);
       let at = -1;
       if (rid) {
         at = kept.findIndex((b) => b.ctx.responseId === rid && !b.ctx.itemId);
@@ -4041,8 +4863,21 @@ export async function startStreamPump(
   controller: AbortController,
   set: Setter,
   get: Getter,
+  ignoredNativeMessageIds: Set<string> = new Set<string>(),
 ): Promise<void> {
+  nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   let failedOpens = 0;
+  let statusReconcileInFlight = false;
+  const statusReconcileTimer =
+    typeof window === "undefined"
+      ? null
+      : window.setInterval(() => {
+          if (statusReconcileInFlight) return;
+          statusReconcileInFlight = true;
+          void reconcileActiveSessionStatus(id, controller, set, get).finally(() => {
+            statusReconcileInFlight = false;
+          });
+        }, ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS);
   // Consecutive 404s only — reset on any non-404 outcome (success or a
   // different-status failure), so a 404 has to persist across attempts to
   // count toward the cap below.
@@ -4115,7 +4950,7 @@ export async function startStreamPump(
           // surfaces as offline liveness via ConnectionIndicator.
           if (streamRes.status === 401 || streamRes.status === 403) {
             console.warn(`Session ${id}: stream unavailable (${streamRes.status}), giving up`);
-            finalizeActive(set, "failed", `stream unavailable (${streamRes.status})`, null);
+            failUnavailableStream(set, `stream unavailable (${streamRes.status})`);
             set({ status: "idle" });
             break;
           }
@@ -4190,9 +5025,17 @@ export async function startStreamPump(
         });
         // Start the pump, then reconcile the snapshot concurrently (race-safe
         // via itemId dedup) — mirrors bindStream's stream-then-snapshot order.
-        const pumpPromise = pumpStreamEvents(id, guardedBody, controller, set, get);
+        const pumpPromise = pumpStreamEvents(
+          id,
+          guardedBody,
+          controller,
+          set,
+          get,
+          undefined,
+          ignoredNativeMessageIds,
+        );
         if (reconnecting) {
-          await reconcileOnReconnect(id, set, get);
+          await reconcileOnReconnect(id, set, get, ignoredNativeMessageIds);
         }
         let reason = await pumpPromise;
 
@@ -4211,6 +5054,7 @@ export async function startStreamPump(
       }
     }
   } finally {
+    if (statusReconcileTimer !== null) window.clearInterval(statusReconcileTimer);
     if (get().abortController === controller) {
       set({ abortController: null });
     }
@@ -4323,6 +5167,40 @@ function isLiveProvisionalBlock(b: AnyBlock): boolean {
   return b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) ?? false;
 }
 
+/** Suppress future chunks for a provisional preview that is no longer valid. */
+function ignoreLivePreview(block: AnyBlock | undefined, ignoredMessageIds: Set<string>): void {
+  const itemId = block?.ctx.itemId;
+  if (!itemId?.startsWith(LIVE_ITEM_PREFIX)) return;
+  ignoredMessageIds.add(itemId.slice(LIVE_ITEM_PREFIX.length));
+}
+
+/** Return persisted native preview ids finalized by assistant messages. */
+function nativeCompletedMessageIds(items: ConversationItem[]): Set<string> {
+  return new Set(
+    items
+      .filter(
+        (item): item is MessageItem =>
+          isMessageItem(item) &&
+          item.role === "assistant" &&
+          typeof item.stream_message_id === "string" &&
+          item.stream_message_id.length > 0,
+      )
+      .map((item) => item.stream_message_id!),
+  );
+}
+
+/** Remove provisional previews whose authoritative snapshot item is present. */
+function withoutNativePreviews(blocks: AnyBlock[], messageIds: Set<string>): AnyBlock[] {
+  if (messageIds.size === 0) return blocks;
+  return blocks.filter((block) => {
+    const itemId = block.ctx.itemId;
+    return (
+      !itemId?.startsWith(LIVE_ITEM_PREFIX) ||
+      !messageIds.has(itemId.slice(LIVE_ITEM_PREFIX.length))
+    );
+  });
+}
+
 /**
  * Build a provisional in-flight assistant-text block for live streaming.
  *
@@ -4383,18 +5261,28 @@ function makeLiveTextBlock(itemId: string, text: string, responseId: string): Te
 function applyLiveDelta(set: Setter, messageId: string, delta: string): void {
   const itemId = LIVE_ITEM_PREFIX + messageId;
   set((s) => {
+    const startupPatch =
+      delta.length > 0
+        ? {
+            mcpStartup: null,
+            mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
+          }
+        : {};
     const at = s.blocks.findIndex((b) => b.ctx.itemId === itemId);
     if (at === -1) {
       const live = s.activeResponse;
       const responseId = live?.state === "streaming" ? live.responseId : itemId;
-      return { blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)] };
+      return {
+        ...startupPatch,
+        blocks: [...s.blocks, makeLiveTextBlock(itemId, delta, responseId)],
+      };
     }
     const existing = s.blocks[at]!;
     if (existing.type !== "text_done") return {};
     const fullText = existing.fullText + delta;
     const next = s.blocks.slice();
     next[at] = { ...existing, fullText, hasCodeBlocks: fullText.includes("```") };
-    return { blocks: next };
+    return { ...startupPatch, blocks: next };
   });
 }
 
@@ -4467,6 +5355,9 @@ async function* tapLiveDeltas(
   get: Getter,
 ): AsyncIterable<StreamEvent> {
   for await (const ev of events) {
+    if (ev.type === "message_done" && ev.messageId !== undefined) {
+      ignored.add(ev.messageId);
+    }
     if (ev.type === "text_delta" && ev.messageId !== undefined) {
       if (!isConversationDisposed(id) && !ignored.has(ev.messageId)) {
         // A scheduled wake streams its first deltas ahead of the batch
@@ -4584,6 +5475,7 @@ export async function pumpStreamEvents(
   set: Setter,
   get: Getter,
   scheduler: FrameScheduler = createRafScheduler(),
+  ignoredMessages: Set<string> = new Set<string>(),
 ): Promise<StreamEndReason> {
   const stream = new BlockStream();
   const sseResult: SseStreamResult = { sawDone: false };
@@ -4598,9 +5490,8 @@ export async function pumpStreamEvents(
   // to the BlockStream reducer. The reducer is intentionally pure
   // (block factory) — session-scoped state lives on the store, not in
   // the reducer's internal state. See migration plan §5.3.
-  // A scheduled wake can stream before its new turn id arrives. Ignore the
-  // rest of that message so it cannot attach to the completed prior turn.
-  const ignoredWakeMessages = new Set<string>();
+  // Ignore the rest of messages whose previews are stale or already replaced
+  // by authoritative items, so late transport delivery cannot recreate them.
   const events = tapLiveDeltas(
     tapSessionEvents(rawEvents, id, (elicitationId) => {
       // A fast native approval can resolve in the few milliseconds between
@@ -4622,7 +5513,7 @@ export async function pumpStreamEvents(
       };
     }),
     id,
-    ignoredWakeMessages,
+    ignoredMessages,
     set,
     get,
   );
@@ -4671,7 +5562,22 @@ export async function pumpStreamEvents(
         );
       }
       if (fresh.length === 0) return extra ?? {};
-      return { ...(extra ?? {}), blocks: [...s.blocks, ...fresh] };
+      // Only newly accepted text counts, not snapshot hydration or duplicates.
+      const hasAssistantText = fresh.some((b) =>
+        b.type === "text_chunk"
+          ? b.text.length > 0
+          : b.type === "text_done" && b.fullText.length > 0,
+      );
+      return {
+        ...(extra ?? {}),
+        ...(hasAssistantText
+          ? {
+              mcpStartup: null,
+              mcpStartupLaunch: { ...s.mcpStartupLaunch, dismissed: true },
+            }
+          : {}),
+        blocks: [...s.blocks, ...fresh],
+      };
     });
   };
 
@@ -4710,6 +5616,7 @@ export async function pumpStreamEvents(
       ) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
+          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
           flush();
           set((s) => {
             const at = s.blocks.findIndex(isLiveProvisionalBlock);
@@ -4793,6 +5700,7 @@ export async function pumpStreamEvents(
       if (block.type === "text_done" && get().isNativeTerminalSession) {
         const provIdx = get().blocks.findIndex(isLiveProvisionalBlock);
         if (provIdx !== -1) {
+          ignoreLivePreview(get().blocks[provIdx], ignoredMessages);
           // The done item has no message id. Native messages are sequential,
           // so remove the oldest preview and let the committed item follow
           // the normal reducer path.
@@ -4840,6 +5748,7 @@ export async function pumpStreamEvents(
         // after this event, or a stream drop). Normal messages already
         // had their preview replaced when their `text_done` committed, so
         // this is usually a no-op.
+        get().blocks.forEach((candidate) => ignoreLivePreview(candidate, ignoredMessages));
         set((s) => ({
           status: "idle",
           blocks: s.blocks.some(isLiveProvisionalBlock)
@@ -4905,18 +5814,24 @@ export async function pumpStreamEvents(
  * Returns `null` if the event does not describe a user message.
  */
 function userContentFromEvent(event: SessionInputConsumedEvent): MessageContentBlock[] | null {
-  if (event.isMeta === true) return null;
   if (event.itemType !== "message") return null;
   if (event.data.role !== "user") return null;
   const raw = event.data.content;
   if (!Array.isArray(raw)) return null;
-  return raw.filter(
+  const content = raw.filter(
     (b): b is MessageContentBlock =>
       typeof b === "object" &&
       b !== null &&
       "type" in b &&
       (b.type === "input_text" || b.type === "input_image" || b.type === "input_file"),
   );
+  // A Claude background-task wake is hidden context (`is_meta`) that still
+  // has to start a new turn on screen: render it as a system marker. Every
+  // other meta message (injected skill text) stays hidden.
+  const marker = taskNotificationMarkerContent(content);
+  if (marker !== null) return marker;
+  if (event.isMeta === true) return null;
+  return content;
 }
 
 function hasCommittedItem(blocks: AnyBlock[], itemId: string): boolean {
@@ -5006,7 +5921,7 @@ interface RefetchRunnerBackedSessionStateOptions {
 /**
  * Refetch runner-backed session state and apply it to the store.
  *
- * Skills and native model options are runner-owned. When a session
+ * Native model options are runner-owned. When a session
  * binds before those background fetches land, the snapshot carries empty
  * lists. The server later sends a bare nudge; refetching the snapshot is
  * how the store pulls the cache-warmed fields without clobbering live chat
@@ -5026,11 +5941,15 @@ async function refetchRunnerBackedSessionState(
   conversationId: string,
   options: RefetchRunnerBackedSessionStateOptions = {},
 ): Promise<void> {
-  // Liveness, not foreground: `session_skills` / `session_model_options` are
+  // Liveness, not foreground: `session_model_options` events are
   // one-shot nudges with no replay, and a live background conversation is never
-  // re-bound on return — dropping the nudge here would leave its slash menu and
+  // re-bound on return — dropping the nudge here would leave its
   // model catalog empty for as long as the entry stays live.
   if (isConversationDisposed(conversationId)) return;
+  const launchBeforeFetch = mcpStartupBeforeSnapshot(
+    conversationId,
+    setterForState(conversationId),
+  );
   let session: Session;
   try {
     if (queryClient !== null) {
@@ -5057,7 +5976,7 @@ async function refetchRunnerBackedSessionState(
   // The conversation may have been backgrounded (or evicted) while the request
   // was in flight. Runner-backed state is conversation-scoped, so apply it to
   // the conversation it was fetched for rather than dropping it — a background
-  // session's resolved skills / model catalog must be there when the user
+  // session's model catalog must be there when the user
   // returns. `setterForState` / `setterFor` no-op once it has been evicted.
   const currentState = setterForState(conversationId);
   if (currentState === null) return;
@@ -5068,11 +5987,8 @@ async function refetchRunnerBackedSessionState(
   // the reported-model semantics, so a delayed catalog only hydrates state.
   const statePatch: Partial<ConversationState> =
     options.applyBindingPatch === true
-      ? sessionBindingPatch(session)
-      : {
-          skills: session.skills ?? [],
-          codexModelOptions: session.codexModelOptions ?? [],
-        };
+      ? sessionBindingPatch(session, currentState, launchBeforeFetch)
+      : { codexModelOptions: session.codexModelOptions ?? [] };
   setterFor(conversationId)(statePatch);
 }
 
@@ -5222,7 +6138,10 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Toggle the Terminal-pill spinner. The runner sets pending=true
       // before auto-creating the terminal and clears it once the
       // terminal lands or auto-create fails.
-      applyToConversation({ terminalPending: event.pending });
+      applyToConversation((s) => ({
+        terminalPending: event.pending,
+        mcpStartupLaunch: updateMcpStartupLaunch(s.mcpStartupLaunch, event.pending),
+      }));
       return;
     case "session_sandbox_status":
       // Advance the managed-sandbox provisioning indicator. `ready`
@@ -5234,13 +6153,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       });
       return;
     case "session_mcp_startup": {
-      // Mirror the harness's per-MCP-server startup map. Cleared once
-      // every server settles `ready` (the band disappears); failures and
-      // cancellations are retained so the page can say which servers
-      // never came up.
-      const records = Object.values(event.servers);
-      const allReady = records.length === 0 || records.every((r) => r.status === "ready");
-      applyToConversation({ mcpStartup: allReady ? null : event.servers });
+      // Mirror the harness's per-MCP-server startup map while the round
+      // is in flight; cleared once no server is still `starting`.
+      // Failures/cancellations are setup diagnostics (host logs), not
+      // conversation content — retaining them rendered an inline notice
+      // in the chat viewport and pinned the message-flow branch open.
+      applyToConversation((s) => ({
+        mcpStartup: activeMcpStartup(event.servers, s.mcpStartupLaunch.dismissed),
+      }));
       return;
     }
     case "session_usage": {
@@ -5282,6 +6202,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // outcome of the ask.
       applyToNamedConversation(event.conversationId, {
         llmModel: event.model,
+        sessionModelSeeded: false,
         pendingModelChange: null,
       });
       return;
@@ -5316,6 +6237,12 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // wrong until a refresh.
       applyToNamedConversation(event.conversationId, {
         sessionReasoningEffort: event.reasoningEffort,
+        // The live report is the AUTHORITATIVE per-session effort — including an
+        // explicit null ("reset to agent default"). Keep the authority flag set
+        // so a background reset-to-null is retained through a warm A→B→A switch
+        // (never falling back to another session's sticky pick). Cold hydration
+        // is different: bind folds the sticky pref into the value on purpose.
+        sessionEffortSeeded: true,
       });
       // `selectedEffort` is the app-global sticky pick, so only adopt a value
       // reported by the conversation the user is actually looking at.
@@ -5338,6 +6265,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // Guard by conversation id so a late frame from an aborted stream
       // cannot paint Plan mode onto the newly-opened conversation.
       applyToNamedConversation(event.conversationId, { codexPlanMode: event.mode === "plan" });
+      return;
+    case "session_codex_approval_mode":
+      // A Codex approval switch made in the web picker or the native TUI's
+      // /permissions popup; the server has confirmed it's the live mode.
+      applyToNamedConversation(event.conversationId, {
+        codexApprovalMode: event.approvalMode,
+      });
       return;
     case "session_presence":
       // Full-state replacement — every presence event carries the
@@ -5395,13 +6329,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       }
       return;
     case "compaction_failed":
-      // Compaction failed — history is unchanged. Remove the compaction_loading
-      // block so the "Compacting…" shimmer disappears without leaving a marker.
+      // Compaction failed — history is unchanged. Remove every
+      // compaction_loading block so the "Compacting…" shimmer disappears
+      // without leaving a marker: a long compaction re-announces progress,
+      // so more than one loading block may be present.
       applyToConversation((s) => {
-        const idx = [...s.blocks].reverse().findIndex((b) => b.type === "compaction_loading");
-        if (idx === -1) return {};
-        const realIdx = s.blocks.length - 1 - idx;
-        return { blocks: [...s.blocks.slice(0, realIdx), ...s.blocks.slice(realIdx + 1)] };
+        const blocks = s.blocks.filter((b) => b.type !== "compaction_loading");
+        return blocks.length === s.blocks.length ? {} : { blocks };
       });
       return;
     case "policy_denied":
@@ -5652,7 +6586,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       return;
     }
     case "session_input_consumed":
-      if (event.isMeta === true) return;
+      // Hidden meta inputs stay hidden — except a background-task wake,
+      // which `userContentFromEvent` re-labels as a system marker.
+      if (event.isMeta === true && userContentFromEvent(event) === null) return;
       // Promote the matching optimistic bubble into committed history.
       // Three ways to find it, in order of precision:
       //   1. By id — the server tells us which pending-input entry this
@@ -5807,6 +6743,22 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       finalizeCurrentActive("cancelled", event.responseId, sourceConversationId);
       return;
     case "session_created":
+      // A side chat the user asked for (via `/side`, the `+` tray, or the rail's
+      // "+"): open it as a soft tab in the main chat's Workspace rail — the user
+      // stays in the main conversation, the side chat streams beside it. Guarded
+      // on `awaitingSideChatFor` so an agent-spawned sub-agent never opens a tab.
+      useChatStore.setState((s) => {
+        if (!event.childSessionId || s.awaitingSideChatFor !== event.conversationId) return {};
+        // Open on the user's explicit side-chat latch: they just asked for a
+        // side chat on THIS parent, so the child arriving under it is the one to
+        // open. (A concurrent ordinary sub-agent under the same parent could in
+        // theory be opened instead — a known, narrow edge; the latch is armed
+        // only by an explicit side-chat request, so it is rare in practice.)
+        return {
+          awaitingSideChatFor: null,
+          sideChatToOpen: { childId: event.childSessionId, parentId: event.conversationId },
+        };
+      });
       // Sub-agent spawn signal. Invalidate the parent's child-sessions
       // query so the execution-log panel re-fetches and renders the
       // new child without waiting for the next poll or manual refresh.
@@ -5838,6 +6790,21 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // runner moved to the new one — so its optimistic bubble would otherwise
       // spin forever. Drop it; resuming starts a fresh turn.
       applyToNamedConversation(event.conversationId, { pendingUserMessages: [] });
+      return;
+    case "session_btw_sidechat":
+      // Transient /btw sidechat overlay: show the question + answer in a
+      // dismissable panel. Guard on active conversation so late events from
+      // switched-away streams don't hijack the UI. Clear pendingUserMessages
+      // and activeResponse (mirroring superseded behavior) to reset state.
+      applyToNamedConversation(event.conversationId, {
+        btwSidechat: {
+          question: event.question,
+          answer: event.answer,
+          truncated: event.truncated,
+        },
+        pendingUserMessages: [],
+        activeResponse: null,
+      });
       return;
     case "session_resource_created":
       if (event.resource.type === "terminal") {
@@ -5875,15 +6842,6 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // for any terminal without a client attach.
       useTerminalActivityStore.getState().pulse(event.terminalId);
       return;
-    case "session_skills":
-      // The runner's skills just resolved (server's background fetch
-      // populated its cache). Skills are fetched off the snapshot hot
-      // path, so the bind-time snapshot served an empty list; this is
-      // the first moment the slash-command menu can be filled. Refetch
-      // the now-warm snapshot and apply its `skills`. Fire and forget —
-      // refetchRunnerBackedSessionState self-guards against a stale apply.
-      void refetchRunnerBackedSessionState(event.conversationId);
-      return;
     case "session_model_options":
       // A runner-owned native model catalog just resolved. Refetch the
       // cache-warmed snapshot so the picker and any delayed sticky handoff
@@ -5918,7 +6876,15 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         const updated: ElicitationBlock = {
           ...target,
           status: "responded",
-          response: { action: "auto_resolved" },
+          // Carry the verdict when the event delivers one so an approval
+          // answered on another surface reads "Approved"/"Rejected";
+          // fall back to the neutral pill only when it is truly unknown.
+          // "unanswered" refines that pill: nobody answered before the
+          // agent stopped waiting, so the card can say what to do next.
+          response: {
+            action: event.action ?? "auto_resolved",
+            ...(event.reason ? { reason: event.reason } : {}),
+          },
         };
         return {
           blocks: [...s.blocks.slice(0, matchIdx), updated, ...s.blocks.slice(matchIdx + 1)],
@@ -6112,6 +7078,9 @@ async function* tapSessionEvents(
   onElicitationResolved?: (elicitationId: string) => void,
 ): AsyncIterable<StreamEvent> {
   for await (const event of events) {
+    if (!isConversationDisposed(conversationId)) {
+      streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+    }
     handleSessionEvent(event, conversationId);
     if (event.type === "elicitation_resolved") {
       onElicitationResolved?.(event.elicitationId);
@@ -6168,6 +7137,39 @@ function finalizeActive(
     const responseId = s.activeResponse?.responseId ?? responseIdOverride ?? "";
     return {
       activeResponse: { responseId, state, error, completedAt: Date.now() },
+    };
+  });
+}
+
+const STREAM_UNAVAILABLE_CODE = "stream_unavailable";
+
+/** Fail the active turn and surface one fallback when no bubble can show it. */
+function failUnavailableStream(set: Setter, error: string): void {
+  set((s) => {
+    const activeResponse =
+      s.activeResponse === null
+        ? null
+        : { ...s.activeResponse, state: "failed" as const, error, completedAt: Date.now() };
+    const blocks = s.blocks.filter(
+      (block) => block.type !== "error" || block.code !== STREAM_UNAVAILABLE_CODE,
+    );
+    const hasVisibleFailure =
+      activeResponse !== null &&
+      buildBubbles(blocks, activeResponse).some(
+        (bubble) => bubble.kind === "assistant" && bubble.responseId === activeResponse.responseId,
+      );
+    if (hasVisibleFailure) {
+      return blocks.length === s.blocks.length ? { activeResponse } : { activeResponse, blocks };
+    }
+    return {
+      ...(activeResponse !== null ? { activeResponse } : {}),
+      blocks: [
+        ...blocks,
+        makeClientErrorBlock(
+          "The live connection to the assistant is unavailable. Reload the page to reconnect.",
+          STREAM_UNAVAILABLE_CODE,
+        ),
+      ],
     };
   });
 }
