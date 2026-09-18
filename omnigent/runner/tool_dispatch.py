@@ -984,15 +984,24 @@ def _surface_only_spec(agent_spec: AgentSpec) -> AgentSpec:
 
     Only the *presence* of ``os_env`` decides whether ``sys_os_*`` is
     registered, but building one honours ``fork`` (mkdtemp + full working-tree
-    copy) and ``start_in_scratch`` (raises without an active sandbox). Neither
-    changes the tool names, so the surface probe drops both.
+    copy), ``start_in_scratch``, and COW path validation. These do not change
+    tool names; the probe must not resolve COW paths outside the session cwd.
     """
+    from omnigent.inner.datamodel import OSEnvSandboxSpec
+    from omnigent.sandbox.copy_on_write import has_copy_on_write
+
     os_env = agent_spec.os_env
-    if os_env is None or not (os_env.fork or os_env.start_in_scratch):
+    disposable = has_copy_on_write(os_env)
+    if os_env is None or not (os_env.fork or os_env.start_in_scratch or disposable):
         return agent_spec
     return dataclasses.replace(
         agent_spec,
-        os_env=dataclasses.replace(os_env, fork=False, start_in_scratch=False),
+        os_env=dataclasses.replace(
+            os_env,
+            fork=False,
+            start_in_scratch=False,
+            sandbox=OSEnvSandboxSpec(type="none") if disposable else os_env.sandbox,
+        ),
     )
 
 
