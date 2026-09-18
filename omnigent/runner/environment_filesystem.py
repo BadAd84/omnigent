@@ -143,6 +143,29 @@ def _glob_to_regex(pattern: str) -> str:
     return "^" + "".join(out) + "$"
 
 
+def _path_query(q: str) -> str | None:
+    """Normalized form of a path-shaped search query, or ``None`` for a plain one.
+
+    A query containing ``/`` names a path, not just a name fragment, so the
+    search matcher additionally compares it against each entry's absolute
+    path — that is what lets a pasted absolute path (``/home/u/ws/src/a.py``),
+    a ``./``-prefixed path, or a subpath that crosses the search root's own
+    name (``ws/src/a.py``) find the file. Normalization collapses ``./``
+    prefixes and trailing slashes so those forms compare equal to the real
+    path. Plain queries (no ``/``) return ``None`` and keep the historical
+    name/relative-path substring semantics — matching them against absolute
+    paths would make any word from the root's own prefix match everything.
+
+    :param q: Stripped, lowercased query.
+    :returns: The normalized path form, or ``None`` when the query is not
+        path-shaped or normalizes to ``.``.
+    """
+    if "/" not in q:
+        return None
+    normalized = os.path.normpath(q)
+    return None if normalized == "." else normalized
+
+
 def split_glob_list(raw: str | None) -> list[str]:
     """Split a comma-separated glob list on top-level commas only.
 
@@ -683,7 +706,12 @@ class CallerProcessFilesystem:
         - ``include``: when non-empty, the entry is kept only if its path
           matches at least one include glob.
         - ``query``: when non-empty, the entry's name or relative path must
-          contain ``query`` (case-insensitive substring match).
+          contain ``query`` (case-insensitive substring match). A path-shaped
+          query — one containing ``/`` — is additionally matched, after
+          :func:`_path_query` normalization, against the entry's absolute
+          path, so a pasted absolute path, a ``./``-prefixed path, or a
+          subpath that includes the search root's own directory name still
+          finds the entry.
 
         Directory matches let the UI reveal a folder from a search, so a query
         like ``"src"`` surfaces the ``src`` directory alongside files under it.
@@ -717,6 +745,7 @@ class CallerProcessFilesystem:
             # A query is required; a whitespace-only query would match every
             # file, so return nothing instead of walking the whole tree.
             return [], False
+        qp = _path_query(q)
 
         start, _prefix = self._target(path)
 
@@ -731,6 +760,8 @@ class CallerProcessFilesystem:
                 "import os, json, re",
                 "from collections import deque",
                 f"q = {_json.dumps(q)}",
+                # json.dumps(None) would emit JSON's `null`, not Python's None.
+                f"qp = {_json.dumps(qp) if qp is not None else 'None'}",
                 f"limit = {limit}",
                 f"start = {_json.dumps(start)}",
                 f"budget = {_SEARCH_SCAN_BUDGET}",
@@ -754,6 +785,16 @@ truncated = False
 stop = False
 
 
+def hit(name, rel, full):
+    if q in name.lower() or q in rel.lower():
+        return True
+    if qp is None:
+        return False
+    # Path-shaped queries also match the entry's absolute path, so a pasted
+    # absolute path or a subpath crossing the search root still finds it.
+    return qp in rel.lower() or qp in os.path.abspath(full).lower()
+
+
 def match_dir(dirpath, dname):
     dfull = os.path.join(dirpath, dname)
     dp = os.path.relpath(dfull, start)
@@ -764,7 +805,7 @@ def match_dir(dirpath, dname):
         return
     if inc and not any(r.match(dp) for r in inc):
         return
-    if q not in dname.lower() and q not in dp.lower():
+    if not hit(dname, dp, dfull):
         return
     try:
         st = os.stat(dfull)
@@ -782,7 +823,7 @@ def match_file(dirpath, fname):
         return
     if inc and not any(r.match(p) for r in inc):
         return
-    if q not in fname.lower() and q not in p.lower():
+    if not hit(fname, p, full):
         return
     try:
         st = os.stat(full)
