@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
-BUG_REVIEW_VERSION = 3
+BUG_REVIEW_VERSION = 4
 
 
 class BugActionability(StrEnum):

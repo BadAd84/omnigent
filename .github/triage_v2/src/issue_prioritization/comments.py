@@ -75,13 +75,14 @@ def build_triage_comment(
                 marker,
                 "🤖 **Automated triage**",
                 "",
-                "Closing as **not planned** because this report does not describe an "
-                "observed user-facing failure.",
+                "Based on the report reviewed, we recommend closing as **not planned** "
+                "because it does not describe an observed user-facing failure.",
                 "",
                 _plain_text(review.reason),
                 "",
                 "We prioritize bugs that affect users; code-path analysis alone is not enough. "
-                "If you encounter this problem, please open a new issue with what you did, "
+                "If this issue is closed and you encounter this problem, "
+                "please open a new issue with what you did, "
                 "what happened, and relevant logs or session details.",
             )
         )
@@ -93,7 +94,7 @@ def build_triage_comment(
             marker,
             "🤖 **Automated triage**",
             "",
-            *_bug_review_lines(item),
+            *_bug_review_lines(item, plan),
             f"- **Bot assessment:** {item.issue.impact.label} impact",
             *priority_lines,
             *information_lines,
@@ -105,11 +106,28 @@ def build_triage_comment(
     )
 
 
-def _bug_review_lines(item: RankedIssue) -> tuple[str, ...]:
+def _bug_review_lines(item: RankedIssue, plan: MutationPlan) -> tuple[str, ...]:
     issue = item.issue
     review = issue.bug_review
     if issue.issue_type != IssueType.BUG or review is None:
         return ()
+    if "non_actionable_stale_assessment" in plan.blocked:
+        return ("**Automatic closure skipped:** The issue changed or closed after review.", "")
+    if review.actionability == BugActionability.NON_ACTIONABLE:
+        exemptions = tuple(
+            label
+            for label in ("security", "duplicate", "pinned")
+            if f"non_actionable_{label}_exempt" in plan.blocked
+        )
+        if not exemptions:
+            return (f"**Bug assessment:** {_plain_text(review.reason)}", "")
+        return (
+            f"**Bug assessment:** {_plain_text(review.reason)}",
+            "",
+            "Automatic closure was skipped because this issue is exempt "
+            f"({', '.join(exemptions)}). No response deadline is set.",
+            "",
+        )
     if review.actionability != BugActionability.ACTIONABLE:
         return (f"**More evidence needed:** {_plain_text(review.reason)}", "")
     clarification = review.clarification

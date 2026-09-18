@@ -429,7 +429,11 @@ def main() -> None:
             args.model_endpoint,
             args.source_revision,
             issue.labels,
-            status="applied",
+            status=(
+                "skipped_stale"
+                if "non_actionable_stale_assessment" in applied_plans[0].blocked
+                else "applied"
+            ),
             labels_after=labels_after,
             plan=applied_plans[0],
             decision=decision,

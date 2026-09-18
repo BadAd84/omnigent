@@ -10,6 +10,7 @@ from issue_prioritization.artifacts import RankedIssue
 from issue_prioritization.domain import Impact, Issue, IssueType, Priority, ScoreResult, ScoreStep
 from issue_prioritization.github import (
     GitHubClient,
+    GitHubIssueSource,
     GitHubLegacyPriorityOwnership,
     GitHubMutationSink,
     GitHubNotFound,
@@ -369,6 +370,72 @@ def test_client_includes_only_author_follow_up_comments() -> None:
     assert "The session ID is abc-123." in issue.body
     assert "Could you share logs?" not in issue.body
     assert "Original report" in issue.body
+
+
+def test_author_evidence_is_retained_across_long_comments_and_pages() -> None:
+    payload = {
+        "number": 7,
+        "title": "Possible session failure",
+        "body": "Source analysis suggests a problem",
+        "user": {"login": "community"},
+        "labels": [],
+        "created_at": "2026-08-06T00:00:00Z",
+        "state": "open",
+    }
+    observation = "I ran this workflow and my session failed."
+    comments = [
+        {"user": {"login": "community"}, "body": "Log details. " * 400 + observation},
+        *({"user": {"login": "community"}, "body": f"Follow-up {n}"} for n in range(100)),
+    ]
+    pages = []
+
+    def transport(method, path, body):
+        if "/comments" not in path:
+            return payload
+        page = int(path.rsplit("=", 1)[1])
+        pages.append(page)
+        return comments[(page - 1) * 100 : page * 100]
+
+    issue = GitHubClient("token", "org/repo", transport).issue_for_triage(7)
+
+    assert pages == [1, 2]
+    assert observation in issue.body
+    assert all(comment["body"] in issue.body for comment in comments)
+    assert issue.body.endswith(payload["body"])
+
+
+def test_live_source_skips_deleted_and_closed_snapshot_issues():
+    from types import SimpleNamespace
+
+    from issue_prioritization.bronze import BronzeIssue
+
+    issue = BronzeIssue(7, "Title", "Body", "url", "author", (), datetime.now(UTC), 0, 2)
+    snapshots = [SimpleNamespace(number=n, duplicate_count=2) for n in (5, 6, 7)]
+
+    def load_issue(number):
+        if number == 5:
+            raise GitHubNotFound("Deleted")
+        return None if number == 6 else issue
+
+    source = GitHubIssueSource(
+        SimpleNamespace(load_open_issues=lambda: snapshots),
+        SimpleNamespace(issue_for_triage=load_issue),
+    )
+    assert source.load_open_issues() == [issue]
+
+
+def test_live_source_does_not_fall_back_to_snapshot_on_api_failure():
+    from types import SimpleNamespace
+
+    def load_issue(number):
+        raise RuntimeError("GitHub unavailable")
+
+    source = GitHubIssueSource(
+        SimpleNamespace(load_open_issues=lambda: [SimpleNamespace(number=7)]),
+        SimpleNamespace(issue_for_triage=load_issue),
+    )
+    with pytest.raises(RuntimeError, match="GitHub unavailable"):
+        source.load_open_issues()
 
 
 def test_client_ignores_closed_issues_and_pull_requests() -> None:

@@ -20,6 +20,7 @@ from issue_prioritization.domain import (
 )
 
 _PRIORITY_LABELS = {priority.value for priority in Priority}
+MAX_BUG_REVIEW_CHARACTERS = 100_000
 _TYPE_LABELS = {
     "bug": IssueType.BUG,
     "feature": IssueType.ENHANCEMENT,
@@ -128,13 +129,15 @@ class PromptClassifier:
                 EvidenceKind.NONE,
             ):
                 raise ValueError("a non_actionable bug cannot claim observed failure evidence")
-            bug_review.validate_source(issue.body[:12000])
+            bug_review.validate_source(issue.body)
             closure_confirmed = False
             if non_actionable and bug_review.source_only_quote is not None:
                 confirmation_prompt = Template(
                     files("issue_prioritization").joinpath("bug_closure_prompt.txt").read_text()
                 ).substitute(
-                    source_only_quote=bug_review.source_only_quote, body=issue.body[:12000]
+                    source_only_quote=bug_review.source_only_quote,
+                    title=issue.title,
+                    body=issue.body,
                 )
                 confirmation = _parse_json_object(self.query(confirmation_prompt))
                 closure_confirmed = confirmation.get("source_only") is True
@@ -182,6 +185,10 @@ def build_prompt(
     *,
     review_bugs: bool = False,
 ) -> str:
+    if review_bugs and len(issue.title) + len(issue.body) > MAX_BUG_REVIEW_CHARACTERS:
+        raise ValueError(
+            "Report exceeds the complete-evidence review limit; manual review required"
+        )
     area_lines = [
         f"- {area.key}: label={area.issue_label}. {area.definition}"
         for area in sorted(areas.by_key.values(), key=lambda item: item.key)
@@ -192,7 +199,7 @@ def build_prompt(
         title=issue.title,
         labels=", ".join(issue.labels) if issue.labels else "none",
         author=issue.author,
-        body=issue.body[:12000],
+        body=issue.body if review_bugs else issue.body[:12000],
         code_analysis_guidance=(
             "Code analysis alone is not usable evidence of an observed user-facing failure. "
             "Apply the bug review below: close clearly source-only concerns as non_actionable, "

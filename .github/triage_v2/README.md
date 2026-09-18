@@ -155,9 +155,17 @@ Immediate closure removes `needs-info`; reporters who later observe a failure
 are asked to open a new issue. These reports have no reply deadline and do not
 enter the author-reply reopening workflow. Security, duplicate, and
 pinned issues remain exempt from closure. The shared mutation sink posts the
-explanation before closing and checks live report content and author replies
-before acting. Dry-run artifacts expose `close_as_non_actionable` without
-writing comments or changing issue state.
+recommendation before closing and checks live report content and author replies
+before acting. The comment does not claim that closure succeeded. A stale
+assessment skips closure for that issue and lets the remaining batch continue;
+GitHub outages and invalid assessments still fail the run. Exempt reports explain
+why closure was skipped and have no response deadline. Dry-run artifacts expose
+`close_as_non_actionable` without writing comments or changing issue state.
+
+Bug review reads the complete title, body, and all author follow-ups, including
+older and long comments. Both model calls see the full evidence. Reports exceeding
+100,000 characters (title plus assembled body) are skipped for manual review,
+without a comment, labels, or a request to repeat information already provided.
 
 The report must describe an actual incorrect result experienced through a user
 workflow. CLI/API failures, data loss, reliability, and performance count as
@@ -217,9 +225,12 @@ Production defaults remain off. The event workflow reads
 `review_bugs` variable/job parameter (default `false`); configure both together
 so periodic assessments do not overwrite event assessments with the old rubric.
 The periodic pipeline refreshes cached bugs when this option or the review
-rubric version changes. It persists the optional review in `bug_review_json`; existing rows
-without it remain readable. No deployment or repository-variable change is
-needed to run a local preview.
+rubric version changes. With bug review enabled, it refreshes snapshot issues
+from GitHub using the same evidence assembly as event triage and the final closure
+check. This requires `--github-secret-scope` for read access even in dry-run mode;
+the write gate remains independent. It persists the optional review in
+`bug_review_json`; existing rows without it remain readable. No deployment or
+repository-variable change is needed to run a local preview.
 
 ## Databricks dry-run
 
