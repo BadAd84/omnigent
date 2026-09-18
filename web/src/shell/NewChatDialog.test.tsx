@@ -1292,6 +1292,23 @@ describe("model picker hotkey", () => {
     // not just the harness list.
     expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
   });
+
+  it("drills into the model submenu once a chord pressed mid-catalog-load resolves", () => {
+    // Chord on a fresh screen while the agent catalog is still loading:
+    // there is no config content to drill into yet.
+    mockAgents(undefined);
+    renderLanding();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    expect(screen.queryByTestId("new-chat-landing-agent-models")).toBeNull();
+
+    // The catalog resolving must complete the drill-in from that single
+    // press — previously a second chord was required.
+    mockAgents(DEFAULT_LANDING_AGENTS);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "catalog resolved" },
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toBeVisible();
+  });
 });
 
 /**

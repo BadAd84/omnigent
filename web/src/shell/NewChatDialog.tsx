@@ -1334,6 +1334,18 @@ function NewChatPickerLoading({
   );
 }
 
+/** Focus the first actionable row of the open config submenu, retrying a few
+ *  frames since the submenu mounts on the commit after the drill-in state. */
+function focusFirstConfigMenuItem(attempts = 5): void {
+  requestAnimationFrame(() => {
+    const item = document.querySelector<HTMLElement>(
+      '.composer-agent-config-menu [role^="menuitem"]:not([data-disabled]):not([aria-disabled="true"])',
+    );
+    if (item) item.focus();
+    else if (attempts > 0) focusFirstConfigMenuItem(attempts - 1);
+  });
+}
+
 /**
  * Unified two-level agent/harness picker for the landing composer.
  *
@@ -1454,6 +1466,9 @@ export function AgentHarnessPicker({
   // Tracks the last-applied openNonce so the imperative-open effect (below,
   // after the drill-in state it drives) skips the initial value.
   const appliedOpenNonce = useRef(0);
+  // Hotkey drill-in still owed because the selected entry's config content
+  // didn't exist at press time (catalog probe pending); canceled on close.
+  const pendingHotkeyDrillIn = useRef(false);
   const queryClient = useQueryClient();
   const info = useServerInfo();
   // Feature ON → single "needs setup" badge; OFF → per-reason original text.
@@ -1524,22 +1539,33 @@ export function AgentHarnessPicker({
     if (!open) {
       setMenuPage(null);
       setConfigAgentId(null);
+      pendingHotkeyDrillIn.current = false;
     }
   }, [open]);
 
   // The landing's model-picker hotkey (Ctrl+Shift+M) bumps openNonce. Open the menu and
   // drill straight into the selected harness's edit submenu (Models / Effort),
   // the same jump the row's Edit affordance performs, so the chord lands on the
-  // model list rather than the harness list. Falls back to the list when the
-  // selected entry has no config to edit.
+  // model list rather than the harness list. The chord can fire before the
+  // catalog probe delivers the config content, so the drill-in stays pending
+  // until the content exists rather than being consumed with the nonce. Falls
+  // back to the list when the selected entry has no config to edit.
   useEffect(() => {
-    if (!openNonce || openNonce === appliedOpenNonce.current) return;
-    appliedOpenNonce.current = openNonce;
-    setOpen(true);
-    if (effectiveAgentId && selectedConfigContent != null) {
-      setConfigAgentId(effectiveAgentId);
-      if (isMobile) setMenuPage("config");
+    const chordFired = openNonce !== 0 && openNonce !== appliedOpenNonce.current;
+    if (chordFired) {
+      appliedOpenNonce.current = openNonce;
+      pendingHotkeyDrillIn.current = true;
+      setOpen(true);
     }
+    if (!pendingHotkeyDrillIn.current) return;
+    if (!effectiveAgentId || selectedConfigContent == null) return;
+    pendingHotkeyDrillIn.current = false;
+    setConfigAgentId(effectiveAgentId);
+    if (isMobile) setMenuPage("config");
+    // On a deferred drill-in the root list is already mounted and holds focus,
+    // and Radix only auto-focuses a submenu that mounts with its parent, so
+    // land focus on the first model row the way a direct drill-in does.
+    if (!chordFired) focusFirstConfigMenuItem();
   }, [openNonce, effectiveAgentId, selectedConfigContent, isMobile]);
 
   const renderEntry = (agent: AvailableAgent): ReactNode => {
