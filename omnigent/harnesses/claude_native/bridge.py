@@ -76,6 +76,7 @@ from omnigent.inner.hook_scripts.subagent_router import (
 )
 from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
+from omnigent.util.hook_python import SAFE_PATH_FLAG
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
@@ -1917,7 +1918,7 @@ def build_mcp_config(bridge_dir: Path, *, python_executable: str | None = None) 
             _MCP_SERVER_NAME: {
                 "command": python,
                 "args": [
-                    "-I",
+                    SAFE_PATH_FLAG,
                     "-m",
                     "omnigent.harnesses.claude_native.bridge",
                     "serve-mcp",
@@ -1997,14 +1998,11 @@ def build_hook_settings(
     :returns: JSON-serializable Claude settings fragment.
     """
     python = python_executable or sys.executable
-    # -I (isolated mode) prevents Python from adding the session's
-    # working directory to sys.path, which would shadow the installed
-    # omnigent package with a local checkout in the cwd (e.g. a
-    # git worktree that has its own omnigent/ directory on a
-    # different branch).
+    # SAFE_PATH_FLAG keeps the session's working directory off sys.path, so a
+    # worktree carrying its own omnigent/ cannot shadow the installed package.
     command_parts = [
         python,
-        "-I",
+        SAFE_PATH_FLAG,
         "-m",
         "omnigent.harnesses.claude_native.hook",
         "--bridge-dir",
@@ -2017,7 +2015,7 @@ def build_hook_settings(
     hook = {"type": "command", "command": command}
     framework_context_parts = [
         python,
-        "-I",
+        SAFE_PATH_FLAG,
         "-m",
         "omnigent.harnesses.claude_native.hook",
         "framework-context",
@@ -2122,7 +2120,7 @@ def build_hook_settings(
         # restarting Claude.
         permission_command_parts = [
             python,
-            "-I",
+            SAFE_PATH_FLAG,
             "-m",
             "omnigent.harnesses.claude_native.hook",
             "permission-request",
@@ -2158,7 +2156,7 @@ def build_hook_settings(
         evaluate_policy_python = shlex.join(
             [
                 python,
-                "-I",
+                SAFE_PATH_FLAG,
                 "-m",
                 "omnigent.harnesses.claude_native.hook",
                 "evaluate-policy",
@@ -2208,7 +2206,7 @@ def build_hook_settings(
         # emits no output and the spawn proceeds unchanged.
         router_command_parts = [
             python,
-            "-I",
+            SAFE_PATH_FLAG,
             "-m",
             "omnigent.inner.hook_scripts.claude_router_hook",
             "--bridge-dir",
@@ -2289,7 +2287,7 @@ def _claude_route_turn_hook(bridge_dir: Path, python: str) -> _JsonObject:
         "command": shlex.join(
             [
                 python,
-                "-I",
+                SAFE_PATH_FLAG,
                 "-m",
                 "omnigent.harnesses.claude_native.hook",
                 "route-turn",
