@@ -67,7 +67,7 @@ async def _assert_failure_on_both_streams(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status_code", [204, 400, 503])
+@pytest.mark.parametrize("status_code", [400, 503])
 async def test_harness_rejection_has_a_valid_queued_failure(status_code: int) -> None:
     class RejectedHarnessClient(_ScriptedHarnessClient):
         @contextlib.asynccontextmanager
@@ -84,6 +84,49 @@ async def test_harness_rejection_has_a_valid_queued_failure(status_code: int) ->
     assert error["status"] == status_code
     assert error["code"] == "runner_error"
     assert error["message"] == f"turn failed (status {status_code})"
+
+
+@pytest.mark.asyncio
+async def test_harness_in_band_injection_reports_no_failure() -> None:
+    """A 204 means the live turn absorbed the payload, so nothing failed.
+
+    The harness answers 204 when it pushes the message into the turn that is
+    already streaming, which is a success with no second stream to proxy.
+    Treating it as a rejection surfaced a healthy turn as failed.
+    """
+
+    class InjectingHarnessClient(_ScriptedHarnessClient):
+        @contextlib.asynccontextmanager
+        async def stream(
+            self, method: str, url: str, *, json: dict[str, Any], timeout: Any
+        ) -> AsyncIterator[httpx.Response]:
+            yield httpx.Response(204)
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(InjectingHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{_SESSION_ID}/events?stream=true",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hello"}],
+                "harness": "openai-agents",
+            },
+        )
+        queued = _drain_session_event_queue(app.state.session_event_queues.get(_SESSION_ID))
+
+    assert response.status_code == 200
+    direct = [
+        json.loads(line.removeprefix("data:"))
+        for line in response.text.splitlines()
+        if line.startswith("data:")
+    ]
+    for events in (direct, queued):
+        assert [event for event in events if event["type"] == "response.failed"] == []
 
 
 @pytest.mark.asyncio

@@ -8958,6 +8958,21 @@ def create_runner_app(
                     json=event_body,
                     timeout=None,
                 ) as harness_resp:
+                    if harness_resp.status_code == 204:
+                        # The harness pushed this payload into the turn that is
+                        # already streaming (steering, or a sessions-native
+                        # in-band injection) so there is no second stream to
+                        # proxy: the owning turn publishes the response and ends
+                        # its own stream. Close this one quietly — reporting a
+                        # failure would mark a healthy turn failed and clear the
+                        # owner's live-turn markers from under it.
+                        _logger.info(
+                            "harness accepted an in-band injection for %s; the "
+                            "streaming turn carries the response",
+                            conv_id,
+                            extra={"session_id": conv_id},
+                        )
+                        return
                     if harness_resp.status_code != 200:
                         _logger.error(
                             "harness rejected turn delivery for %s with status %d",
