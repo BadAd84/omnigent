@@ -688,10 +688,12 @@ then goes straight to Step 4 to land it.) Once the set is genuinely green:
   will be published automatically, so do not prepare a PR body or run Step 4.
   This takes precedence even when CI appended a generic publisher contract.
 - **Workflow-owned publication (`skip_push: false` plus an explicit CI publisher
-  contract)** — do not push or make any `gh` write. Complete Step 3.4, including
-  the deferred live-validation preparation described in Step 4.4, then write the
-  final handoff and stop. The publisher performs the GitHub writes; do not run
-  the PR-facing CI/preview/review loop in the rest of Step 4.
+  contract)** — do not push or make any `gh` write. Prepare and validate
+  `.omnigent/pr-body.md` using the body-writing instructions in Step 3.4, but do
+  not run its `gh pr create` command. Complete the deferred live-validation
+  preparation described in Step 4.4, then write the final handoff and stop. The
+  publisher performs the GitHub writes; do not run the PR-facing
+  CI/preview/review loop in the rest of Step 4.
 - **Direct publication (no publisher contract)** — perform all of Step 3, then
   drive the published PR through Step 4.
 
@@ -1513,7 +1515,10 @@ Field meanings:
   treat like `runner`). Judge from `files_changed`; default `server`, use `both`
   when unsure. Tells the write-back which command to render.
 - `validation_prompt` — the Step 4.4 paste-to-an-agent prompt that reproduces the
-  journey and confirms the fix. Empty when no PR was opened.
+  journey and confirms the fix. Empty when no PR was opened, except for
+  workflow-owned author publication: in that mode no PR exists during the agent
+  session, but this field must retain the deferred prompt for the publisher and
+  Linear write-back.
 - `maintainer_review` — who you requested review from in Step 4.5 (the issue
   assignee(s)), or why you couldn't (no assignee / assignee is the author, and
   what you did instead). Empty when no PR was opened.
