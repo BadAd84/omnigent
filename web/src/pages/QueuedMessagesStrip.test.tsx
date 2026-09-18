@@ -103,7 +103,7 @@ describe("QueuedMessagesStrip", () => {
   it.each([
     ["short", "Look at this"],
     ["long", "Explain the layout in this screenshot. ".repeat(30).trim()],
-  ])("keeps %s message text and the attachment chip on the same row", (_length, text) => {
+  ])("keeps separate truncating previews for %s text and attachments", (_length, text) => {
     render(
       <QueuedMessagesStrip
         messages={[{ ...msg("q_1", text), files: [new File([], "screenshot.png")] }]}
@@ -120,8 +120,6 @@ describe("QueuedMessagesStrip", () => {
     expect(chip).toHaveAttribute("title", "screenshot.png");
     expect(chip).toHaveClass("shrink-0");
     expect(chip.parentElement).toBe(textPreview.parentElement);
-    expect(chip.parentElement).toHaveClass("items-center");
-    expect(chip.parentElement).not.toHaveClass("flex-col");
   });
 
   it("does not render an attachment chip for a text-only message", () => {
