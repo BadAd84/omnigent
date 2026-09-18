@@ -9,6 +9,7 @@ import ntpath
 import posixpath
 import secrets
 import time
+import weakref
 from collections.abc import Callable
 from typing import Any
 
@@ -235,6 +236,34 @@ def _is_absolute_workspace(path: str) -> bool:
     :returns: ``True`` when the path is absolute under any platform's rules.
     """
     return posixpath.isabs(path) or ntpath.isabs(path) or path.startswith("\\")
+
+
+_workspace_change_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = (
+    weakref.WeakValueDictionary()
+)
+
+
+def _workspace_change_lock(session_id: str) -> asyncio.Lock:
+    """Per-session lock ordering a workspace change's forward + persist.
+
+    The runner forward and the workspace persist are two steps; two concurrent
+    PATCHes could interleave them and leave the runner's live cwd permanently
+    diverged from the stored workspace (runner applied B last, store persisted
+    A last). Serializing the pair per session makes the last persisted value
+    the last one the runner applied. In-process only — coordinating
+    cross-replica writers would need versioned updates. Weak values let a
+    session's lock vanish once no change holds or awaits it.
+
+    :param session_id: Session whose workspace changes are ordered.
+    :returns: The session's lock.
+    """
+    lock = _workspace_change_locks.get(session_id)
+    if lock is None:
+        # No await between the miss and the store, so two coroutines on the
+        # event loop cannot both create a lock for the same session.
+        lock = asyncio.Lock()
+        _workspace_change_locks[session_id] = lock
+    return lock
 
 
 def register_core_routes(
@@ -2574,71 +2603,75 @@ def register_core_routes(
         # and enforce reach; forward, then persist the absolute path it returns.
         # Not silent-gated: this moves the runner's cwd, it adds no pane item.
         if set_workspace:
-            # Captured before the forward: if the persist below fails after the
-            # runner already applied the change, the runner is rolled back here.
-            _prior_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            _prior_workspace = _prior_conv.workspace if _prior_conv is not None else None
-            _workspace_forward = await _forward_session_change_to_runner(
-                session_id,
-                runner_router,
-                {"type": "workspace_change", "workspace": body.workspace or ""},
-            )
-            _resolved_workspace: str | None = None
-            if _workspace_forward is not None and _workspace_forward.status_code == 200:
-                try:
-                    _wf_body = json.loads(_workspace_forward.body)
-                except (ValueError, TypeError):
-                    _wf_body = None
-                if isinstance(_wf_body, dict) and isinstance(_wf_body.get("workspace"), str):
-                    _resolved_workspace = _wf_body["workspace"]
-            if _resolved_workspace is None:
-                if _workspace_forward is not None and _workspace_forward.status_code >= 400:
-                    # The runner rejected the location. Preserve its verdict:
-                    # out-of-reach (403) is a permission refusal, anything else
-                    # is bad input.
-                    raise OmnigentError(
-                        f"runner rejected the working-directory change: {_workspace_forward.body}",
-                        code=(
-                            ErrorCode.FORBIDDEN
-                            if _workspace_forward.status_code == 403
-                            else ErrorCode.INVALID_INPUT
-                        ),
-                    )
-                if body.workspace and _is_absolute_workspace(body.workspace):
-                    # No runner to resolve against, but an absolute wire-form
-                    # path is already the canonical target on the owner's
-                    # machine, so persist it as-is (owner-gated above).
-                    _resolved_workspace = body.workspace
-                else:
-                    # A relative path only means something against the runner's
-                    # live env root; with no runner the server can't resolve it.
-                    raise OmnigentError(
-                        "session runner is offline; cannot resolve the working "
-                        "directory for this session",
-                        code=ErrorCode.RUNNER_UNAVAILABLE,
-                    )
-            try:
-                await asyncio.to_thread(
-                    conversation_store.set_workspace, session_id, _resolved_workspace
+            async with _workspace_change_lock(session_id):
+                # Captured before the forward: if the persist below fails after the
+                # runner already applied the change, the runner is rolled back here.
+                _prior_conv = await asyncio.to_thread(
+                    conversation_store.get_conversation, session_id
                 )
-            except Exception as exc:
-                # The runner applied the change when it answered the forward; a
-                # failed persist would leave its live cwd diverged from the
-                # stored snapshot, so point it back at the previously persisted
-                # workspace (best-effort) before surfacing the error.
+                _prior_workspace = _prior_conv.workspace if _prior_conv is not None else None
+                _workspace_forward = await _forward_session_change_to_runner(
+                    session_id,
+                    runner_router,
+                    {"type": "workspace_change", "workspace": body.workspace or ""},
+                )
+                _resolved_workspace: str | None = None
                 if _workspace_forward is not None and _workspace_forward.status_code == 200:
-                    with contextlib.suppress(Exception):
-                        await _forward_session_change_to_runner(
-                            session_id,
-                            runner_router,
-                            {
-                                "type": "workspace_change",
-                                "workspace": _prior_workspace or "",
-                            },
+                    try:
+                        _wf_body = json.loads(_workspace_forward.body)
+                    except (ValueError, TypeError):
+                        _wf_body = None
+                    if isinstance(_wf_body, dict) and isinstance(_wf_body.get("workspace"), str):
+                        _resolved_workspace = _wf_body["workspace"]
+                if _resolved_workspace is None:
+                    if _workspace_forward is not None and _workspace_forward.status_code >= 400:
+                        # The runner rejected the location. Preserve its verdict:
+                        # out-of-reach (403) is a permission refusal, anything else
+                        # is bad input.
+                        raise OmnigentError(
+                            "runner rejected the working-directory change: "
+                            f"{_workspace_forward.body}",
+                            code=(
+                                ErrorCode.FORBIDDEN
+                                if _workspace_forward.status_code == 403
+                                else ErrorCode.INVALID_INPUT
+                            ),
                         )
-                if isinstance(exc, ConversationNotFoundError):
-                    raise _session_not_found() from exc
-                raise
+                    if body.workspace and _is_absolute_workspace(body.workspace):
+                        # No runner to resolve against, but an absolute wire-form
+                        # path is already the canonical target on the owner's
+                        # machine, so persist it as-is (owner-gated above).
+                        _resolved_workspace = body.workspace
+                    else:
+                        # A relative path only means something against the runner's
+                        # live env root; with no runner the server can't resolve it.
+                        raise OmnigentError(
+                            "session runner is offline; cannot resolve the working "
+                            "directory for this session",
+                            code=ErrorCode.RUNNER_UNAVAILABLE,
+                        )
+                try:
+                    await asyncio.to_thread(
+                        conversation_store.set_workspace, session_id, _resolved_workspace
+                    )
+                except Exception as exc:
+                    # The runner applied the change when it answered the forward; a
+                    # failed persist would leave its live cwd diverged from the
+                    # stored snapshot, so point it back at the previously persisted
+                    # workspace (best-effort) before surfacing the error.
+                    if _workspace_forward is not None and _workspace_forward.status_code == 200:
+                        with contextlib.suppress(Exception):
+                            await _forward_session_change_to_runner(
+                                session_id,
+                                runner_router,
+                                {
+                                    "type": "workspace_change",
+                                    "workspace": _prior_workspace or "",
+                                },
+                            )
+                    if isinstance(exc, ConversationNotFoundError):
+                        raise _session_not_found() from exc
+                    raise
         level = await _get_permission_level(user_id, session_id, permission_store)
         # PATCH callers consume only the snapshot's scalar fields (clients
         # hydrate transcripts via GET /sessions/{id}/items), so skip the

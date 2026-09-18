@@ -23,6 +23,7 @@ from omnigent.runtime.harnesses.process_manager import (
     _cwd_env_key,
     _HarnessEndpoint,
     _model_env_key,
+    _requested_cwd,
     _SubprocessEntry,
 )
 
@@ -150,6 +151,53 @@ async def test_get_client_respawns_only_when_cwd_changes(
     assert closes == ["/ws"], closes
 
     final = pm._entries.get(conv)
+    if final is not None:
+        await final.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_acp_cli_cwd_change_respawns_via_the_shared_acp_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog ACP CLI harnesses respawn on a cwd change under ``HARNESS_ACP_CWD``.
+
+    Rows like ``grok`` share the generic ACP wrap, whose spawn env carries
+    the cwd as ``HARNESS_ACP_CWD`` rather than ``HARNESS_GROK_CWD``; keying
+    the respawn check off the harness name alone would silently never fire
+    for them and a re-rooted session would keep running in the old directory.
+
+    :param monkeypatch: Pytest monkeypatch fixture used to mock the
+        subprocess-spawn boundary.
+    """
+    pm = HarnessProcessManager()
+    pm._started = True
+
+    spawns: list[str | None] = []
+
+    async def _fake_spawn(conv: str, harness: str, env: dict[str, str] | None) -> _SubprocessEntry:
+        cwd = _requested_cwd(harness, env)
+        spawns.append(cwd)
+        return _SubprocessEntry(
+            process=_AliveProc(),  # type: ignore[arg-type]  # stand-in process
+            client=httpx.AsyncClient(),
+            endpoint=_HarnessEndpoint(socket_path=Path("/tmp/fake-grok.sock")),
+            harness=harness,
+            cwd=cwd,
+        )
+
+    async def _fake_close(entry: _SubprocessEntry) -> None:
+        await entry.client.aclose()
+
+    monkeypatch.setattr(pm, "_spawn_entry", _fake_spawn)
+    monkeypatch.setattr(pm, "_close_entry", _fake_close)
+
+    await pm.get_client("conv_grok", "grok", env={"HARNESS_ACP_CWD": "/ws"})
+    await pm.get_client("conv_grok", "grok", env={"HARNESS_ACP_CWD": "/ws"})  # cache hit
+    await pm.get_client("conv_grok", "grok", env={"HARNESS_ACP_CWD": "/ws/sub"})  # respawn
+
+    assert spawns == ["/ws", "/ws/sub"], spawns
+
+    final = pm._entries.get("conv_grok")
     if final is not None:
         await final.client.aclose()
 

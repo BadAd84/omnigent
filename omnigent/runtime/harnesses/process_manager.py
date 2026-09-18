@@ -518,6 +518,28 @@ def _cwd_env_key(harness: str) -> str:
     return f"HARNESS_{harness.upper().replace('-', '_')}_CWD"
 
 
+def _requested_cwd(harness: str, env: dict[str, str] | None) -> str | None:
+    """
+    The working directory this call's spawn env requests, or ``None``.
+
+    Harnesses sharing the generic ACP wrap — the catalog ACP CLI rows
+    (``grok``, ``jcode``, …) and namespaced ``acp:<slug>`` agents — carry
+    their cwd under ``HARNESS_ACP_CWD`` rather than a per-name key, so the
+    per-name lookup falls back to the shared ACP key. Non-ACP spawn envs
+    never set the ACP key, so the fallback cannot misread them.
+
+    :param harness: Harness name as the caller passed it, e.g. ``"grok"``.
+    :param env: The call's spawn-env overrides, or ``None``.
+    :returns: The requested cwd string, or ``None`` when the env names none.
+    """
+    if not env:
+        return None
+    value = env.get(_cwd_env_key(harness))
+    if value is not None:
+        return value
+    return env.get("HARNESS_ACP_CWD")
+
+
 _LIVE_MODEL_CONFIG_HARNESSES = frozenset({"qwen"})
 
 
@@ -849,10 +871,10 @@ class HarnessProcessManager:
                     respawn_reason = "harness_respawn_model_switch"
             if entry is not None and harness != "any":
                 # The working directory is baked into the subprocess env at
-                # spawn (``HARNESS_<H>_CWD``), so a session workspace change
-                # must respawn — otherwise the cached process keeps running
-                # turns from the old directory.
-                requested_cwd = (env or {}).get(_cwd_env_key(harness))
+                # spawn (``HARNESS_<H>_CWD`` / ``HARNESS_ACP_CWD``), so a
+                # session workspace change must respawn — otherwise the cached
+                # process keeps running turns from the old directory.
+                requested_cwd = _requested_cwd(harness, env)
                 if requested_cwd is not None and requested_cwd != entry.cwd:
                     _logger.info(
                         "harness %s for conversation %s: cwd changed %r -> %r; respawning",
@@ -1337,7 +1359,7 @@ class HarnessProcessManager:
                 # ``get_client`` — both are fixed process env vars, not
                 # re-read per turn.
                 model=(env or {}).get(_model_env_key(harness)),
-                cwd=(env or {}).get(_cwd_env_key(harness)),
+                cwd=_requested_cwd(harness, env),
             )
         except BaseException:
             # From spawn onward the process must have exactly one owner:

@@ -384,3 +384,86 @@ async def test_absolute_workspace_stays_owner_gated_under_py313_ntpath(
     conv = store.get_conversation(session_id)
     assert conv is not None
     assert conv.workspace == "/home/user/project"
+
+
+async def test_concurrent_changes_persist_the_last_applied_workspace(
+    db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Two racing changes leave the store agreeing with the runner.
+
+    The forward and the persist are two steps. Without per-session ordering,
+    change A could forward first, stall before persisting, and then overwrite
+    change B's already-persisted value — the runner living in B while the
+    stored workspace says A, permanently. The persisted workspace must equal
+    the last workspace the runner applied.
+    """
+    import asyncio as _asyncio
+    import contextlib
+    import json as _json
+    import time as _time
+
+    from omnigent.server.routes import sessions as sessions_facade
+    from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+
+    app, session_id, store = _seed_session(
+        db_uri,
+        tmp_path,
+        grants={_OWNER: LEVEL_OWNER},
+        workspace="/home/user/project",
+    )
+
+    applied: list[str] = []
+    a_forwarded = _asyncio.Event()
+
+    async def _forward(
+        _sid: object, _router: object, payload: dict[str, str]
+    ) -> _RunnerForwardResult:
+        workspace = payload["workspace"]
+        # Deterministic interleave: B forwards only after A has forwarded, so
+        # without ordering B's forward+persist land inside A's forward→persist
+        # window and A's stale persist overwrites B's. Bounded: when the pair
+        # is serialized and B goes first, A cannot forward until B finishes,
+        # so B stops waiting instead of deadlocking against the ordering.
+        if workspace == "/ws/a":
+            a_forwarded.set()
+        else:
+            with contextlib.suppress(TimeoutError):
+                await _asyncio.wait_for(a_forwarded.wait(), timeout=1.0)
+        applied.append(workspace)
+        return _RunnerForwardResult(
+            status_code=200,
+            body=_json.dumps(
+                {"object": "session.workspace_changed", "workspace": workspace}
+            ),
+        )
+
+    real_set_workspace = SqlAlchemyConversationStore.set_workspace
+
+    def _slow_set_workspace(
+        self: SqlAlchemyConversationStore, conversation_id: str, workspace: str
+    ) -> None:
+        # Stall change A between its forward and its persist, inviting change
+        # B to forward AND persist in that window (runs on a worker thread via
+        # asyncio.to_thread, so only this persist is delayed).
+        if workspace == "/ws/a":
+            _time.sleep(0.2)
+        real_set_workspace(self, conversation_id, workspace)
+
+    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", _forward)
+    monkeypatch.setattr(SqlAlchemyConversationStore, "set_workspace", _slow_set_workspace)
+
+    async with _client(app, _OWNER) as c:
+        resp_a, resp_b = await _asyncio.gather(
+            c.patch(f"/v1/sessions/{session_id}", json={"workspace": "/ws/a"}),
+            c.patch(f"/v1/sessions/{session_id}", json={"workspace": "/ws/b"}),
+        )
+        assert resp_a.status_code == 200, resp_a.text
+        assert resp_b.status_code == 200, resp_b.text
+
+    assert len(applied) == 2, applied
+    conv = store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.workspace == applied[-1], (
+        f"Persisted workspace {conv.workspace!r} diverged from the runner's "
+        f"last applied workspace {applied[-1]!r} — forward+persist interleaved."
+    )

@@ -283,7 +283,7 @@ export function FilesPanel({
   const workspaceRoot = envQuery.data?.root ?? null;
   // The picker browses the host's filesystem, the same source the new-session
   // workspace chip uses.
-  const { session } = useSession(conversationId);
+  const { session, isLoading: sessionLoading } = useSession(conversationId);
   // Absolute path currently browsed. Null tracks the workspace root. Seeded
   // from the per-conversation cache so the location survives the panel
   // unmounting while a file is open in the viewer.
@@ -301,6 +301,23 @@ export function FilesPanel({
     setBrowseLocation((conversationId && browseLocationCache.get(conversationId)) || null);
     setBrowseError(null);
   }, [conversationId]);
+  // After a reload the panel would otherwise open at the environment root even
+  // when a persisted re-root means turns and new shells run in a subfolder.
+  // Seed the browsed location from the saved workspace once per conversation,
+  // only while the user hasn't navigated, and only for a location inside the
+  // root (absolute outside-root browsing is owner-gated server-side).
+  const workspaceSeedRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!conversationId || workspaceSeedRef.current === conversationId) return;
+    if (!workspaceRoot || sessionLoading) return;
+    workspaceSeedRef.current = conversationId;
+    if (browseLocation !== null || browseLocationCache.get(conversationId)) return;
+    const saved = session?.workspace?.replace(/\/$/, "") ?? "";
+    const root = workspaceRoot.replace(/\/$/, "");
+    if (!saved || saved === root || !saved.startsWith(`${root}/`)) return;
+    browseLocationCache.set(conversationId, saved);
+    setBrowseLocation(saved);
+  }, [conversationId, workspaceRoot, session, sessionLoading, browseLocation]);
   const workingDir = browseLocation ?? workspaceRoot;
   // The wire form: "" means the workspace root (the historical relative
   // contract). A location INSIDE the workspace is sent relative to it, and
