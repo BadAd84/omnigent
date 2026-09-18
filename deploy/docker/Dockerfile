@@ -390,6 +390,15 @@ COPY --from=builder /build /build
 RUN pip install --no-cache-dir /build /build/sdks/python-client /build/sdks/ui \
  && ! grep -R --include='*.pth' --include='*.egg-link' -nE '/build(/|$)' /opt/venv/lib/python*/site-packages
 
+# Precompile bytecode so cold imports read .pyc instead of recompiling source.
+# The host start path and the warm-pool readiness probe (a fresh interpreter
+# every second) otherwise pay full compilation each time, since
+# PYTHONDONTWRITEBYTECODE stays on at runtime. unchecked-hash .pyc survive the
+# COPY mtime reset and are trusted without a source check in this immutable
+# image. `|| true`: a dependency that cannot compile only misses the optimization
+# for itself, so it must not fail the build.
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv || true
+
 # Sandbox launchers exec commands through `bash -lc`, and Debian's
 # /etc/profile unconditionally resets PATH for login shells — the ENV
 # PATH above would silently drop off and `omnigent` / `pip` would
@@ -436,6 +445,10 @@ RUN apt-get update \
 # path. Copying these to /app/ would break the import paths silently.
 COPY --from=server-builder /opt/venv /opt/venv
 COPY --from=server-builder /build /build
+# Precompile bytecode (venv deps + the editable omnigent source under /build) so
+# server cold starts read .pyc instead of recompiling; PYTHONDONTWRITEBYTECODE
+# stays on at runtime and unchecked-hash .pyc are trusted as-is in the image.
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv /build/omnigent || true
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app

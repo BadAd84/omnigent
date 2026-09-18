@@ -181,6 +181,13 @@ RUN set -eu; \
 COPY --from=builder /opt/venv /opt/venv
 COPY --from=builder /build /build
 
+# Precompile bytecode (venv deps + editable omnigent source under /build) so
+# cold imports read .pyc rather than recompiling: host start, and the warm-pool
+# readiness probe that runs a fresh interpreter every second.
+# PYTHONDONTWRITEBYTECODE stays on at runtime. `|| true`: an uncompilable
+# dependency must not fail the build.
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv /build/omnigent || true
+
 RUN echo 'export PATH="/opt/venv/bin:${PATH}"' > /etc/profile.d/omnigent-venv.sh
 
 # Optional extra harness CLIs, off by default — see install-harness-cli.sh and
@@ -213,6 +220,10 @@ USER 0
 
 COPY --from=server-builder /opt/venv /opt/venv
 COPY --from=server-builder /build /build
+# Precompile bytecode (venv deps + editable omnigent source) so server cold
+# starts read .pyc instead of recompiling; PYTHONDONTWRITEBYTECODE stays on at
+# runtime. `|| true`: an uncompilable dependency must not fail the build.
+RUN /opt/venv/bin/python -m compileall -q -j 0 --invalidation-mode unchecked-hash /opt/venv /build/omnigent || true
 COPY deploy/docker/entrypoint.py /app/entrypoint.py
 
 WORKDIR /app
