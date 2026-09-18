@@ -77,6 +77,25 @@ def test_auth_flow_renews_idle_expired_token(expired_login) -> None:
     assert request.headers.get("Authorization") == "Bearer fresh"
 
 
+def test_auth_flow_survives_refused_refresh(expired_login, monkeypatch) -> None:
+    """When the server refuses the renewal (revoked / aged-out grant), the
+    per-request refresh must fall through to the SDK fallback instead of
+    sending the lapsed bearer or raising."""
+    from omnigent.chat import _DatabricksTokenAuth
+
+    monkeypatch.setattr(
+        httpx,
+        "post",
+        lambda url, **_kw: httpx.Response(
+            400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        ),
+    )
+    auth = _DatabricksTokenAuth(server_url=_SERVER_URL, session_id=None)
+    flow = auth.auth_flow(httpx.Request("GET", f"{_SERVER_URL}/v1/usage"))
+    request = next(flow)
+    assert request.headers.get("Authorization") != "Bearer stale"
+
+
 def test_server_auth_treats_expired_login_as_credential(expired_login) -> None:
     """An expired-but-refreshable login still yields an Auth instance —
     otherwise the client is built with no auth and 401s before

@@ -643,6 +643,65 @@ def test_refresh_stored_token_refused_leaves_entry(token_dir, monkeypatch) -> No
     assert entry["refresh_token"] == "refresh-1"
 
 
+def test_refresh_refused_warns_once_until_renewed(token_dir, monkeypatch, caplog) -> None:
+    """A persistently-refused grant warns once per process, not per request.
+
+    A client that renews per request must not repeat the refusal warning
+    on every call while the grant stays dead; a later successful refresh
+    re-arms the warning for the next time the credential lapses.
+    """
+    import logging
+
+    import httpx
+
+    from omnigent import cli_auth
+
+    monkeypatch.setattr(cli_auth, "_warned_refresh_refused_servers", set(), raising=False)
+
+    def _store_expired() -> None:
+        cli_auth.store_token(
+            "http://localhost:6767",
+            token="stale",
+            user_id="a@x",
+            expires_at=time.time() - 10,
+            refresh_token="refresh-1",
+        )
+
+    def _refused(url, **_kw):
+        return httpx.Response(
+            400, json={"error": "invalid_grant"}, request=httpx.Request("POST", url)
+        )
+
+    def _renewed(url, **_kw):
+        return httpx.Response(
+            200,
+            json={"access_token": "fresh", "refresh_token": "refresh-2", "expires_in": 3600},
+            request=httpx.Request("POST", url),
+        )
+
+    def _refused_warnings() -> list[logging.LogRecord]:
+        return [
+            r
+            for r in caplog.records
+            if r.levelno == logging.WARNING and "refused" in r.getMessage()
+        ]
+
+    _store_expired()
+    monkeypatch.setattr(httpx, "post", _refused)
+    with caplog.at_level(logging.DEBUG, logger="omnigent.cli_auth"):
+        assert cli_auth.refresh_stored_token("http://localhost:6767") is None
+        assert cli_auth.refresh_stored_token("http://localhost:6767") is None
+        assert len(_refused_warnings()) == 1
+
+        monkeypatch.setattr(httpx, "post", _renewed)
+        assert cli_auth.refresh_stored_token("http://localhost:6767") == "fresh"
+
+        _store_expired()
+        monkeypatch.setattr(httpx, "post", _refused)
+        assert cli_auth.refresh_stored_token("http://localhost:6767") is None
+        assert len(_refused_warnings()) == 2
+
+
 def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -> None:
     """A concurrent refresher already renewed → return the valid token
     without a network call (the lock-then-recheck path)."""

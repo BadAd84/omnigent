@@ -287,6 +287,11 @@ def load_token(server_url: str, *, min_remaining_seconds: float = 0.0) -> str | 
 # loop doesn't repeat the warning every few seconds.
 _warned_expired_servers: set[str] = set()
 
+# Servers already warned about a refused refresh, so a long-lived client
+# that renews per request doesn't repeat the warning while the grant
+# stays dead server-side.
+_warned_refresh_refused_servers: set[str] = set()
+
 
 def _warn_expired_once(server_url: str, expires_at: float, *, has_refresh: bool) -> None:
     """Warn (once per process per server) that a stored token expired.
@@ -460,6 +465,12 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         _logger.warning("Token refresh against %s failed: %s", normalized, exc)
         return None
     if resp.status_code != 200:
+        if normalized in _warned_refresh_refused_servers:
+            _logger.debug(
+                "Token refresh against %s refused (HTTP %d)", normalized, resp.status_code
+            )
+            return None
+        _warned_refresh_refused_servers.add(normalized)
         _logger.warning(
             "Token refresh against %s refused (HTTP %d) — run `omnigent login %s` "
             "to re-authenticate.",
@@ -497,9 +508,10 @@ def _refresh_locked(server_url: str, normalized: str, timeout: float) -> str | N
         expires_at=time.time() + expires_in,
         refresh_token=new_refresh,
     )
-    # A fresh token means any earlier expiry warning is stale; allow
-    # a new one if this credential ever lapses again.
+    # A fresh token means any earlier expiry or refusal warning is stale;
+    # allow a new one if this credential ever lapses again.
     _warned_expired_servers.discard(normalized)
+    _warned_refresh_refused_servers.discard(normalized)
     _logger.info("Refreshed login session for %s", normalized)
     return access_token
 
