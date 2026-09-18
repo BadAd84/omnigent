@@ -364,6 +364,8 @@ from omnigent.stores.host_store import Host, HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.telemetry import emit as _tel_emit
+from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
+from omnigent.telemetry.anon import current_anon_user_id as _tel_current_anon
 from omnigent.telemetry.events import NativeSessionUsageEvent as _TelNativeSessionUsageEvent
 from omnigent.telemetry.events import SessionCreatedEvent as _TelSessionCreatedEvent
 from omnigent.telemetry.events import TurnEndEvent as _TelTurnEndEvent
@@ -1667,6 +1669,8 @@ async def _persist_external_session_usage(
     body: SessionEventInput,
     conversation_store: ConversationStore,
     conv: Conversation | None = None,
+    user_id: str | None = None,
+    host_installation_id: str | None = None,
 ) -> int | None:
     """
     Persist and broadcast a token-usage update from a terminal-backed runtime.
@@ -1686,6 +1690,11 @@ async def _persist_external_session_usage(
         own-usage persist: its monotonic-clamp baseline must be a fresh read
         (see :func:`_persist_native_cumulative_usage`). ``None`` makes each
         step resolve the row itself.
+    :param user_id: The flush POST's authenticated caller, hashed into the
+        usage telemetry event. ``None`` falls back to the ambient request user.
+    :param host_installation_id: Installation ID of the machine that posted the
+        flush, read from the request header. Recorded on the usage telemetry
+        event; ``None`` leaves the field unset rather than costing a lookup.
     :returns: The persisted ``context_tokens`` when present, else ``None``.
     :raises OmnigentError: On missing / malformed fields.
     """
@@ -1737,6 +1746,12 @@ async def _persist_external_session_usage(
             _TelNativeSessionUsageEvent(
                 installation_id=_get_installation_id(),
                 session_id=session_id,
+                anon_user_id=(
+                    _tel_anon_user_id(user_id, _get_installation_id())
+                    if user_id is not None
+                    else _tel_current_anon()
+                ),
+                host_installation_id=host_installation_id,
                 input_tokens=int(_n_in) if _n_in is not None else None,
                 output_tokens=int(_n_out) if _n_out is not None else None,
                 cost_usd=(float(_n_cost) if isinstance(_n_cost, (int, float)) else None),
@@ -2438,11 +2453,7 @@ async def _persist_external_conversation_item(
         e.g. ``"conv_abc123"``.
     :param conv: Conversation row for title seeding.
     :param body: External item event body.
-    :param conversation_store: Store used to append the item. An optional async
-        ``run_in_thread_with_background_lease(method_name, *args, **kwargs)``
-        hook owns dispatch and resource lifetime for the append. It must acquire
-        resources before submission and release them after the worker exits,
-        even if its awaiter is cancelled. Hook failures propagate to the caller.
+    :param conversation_store: Store used to append the item.
     :param created_by: Authenticated identity of the actor whose
         request triggered the forwarder POST, e.g.
         ``"alice@example.com"``. Used to attribute user messages typed
@@ -2535,13 +2546,7 @@ async def _persist_external_conversation_item(
         event=SessionEventInput(type=item.type, data=item.data.model_dump()),
         enabled=enabled and (drained is None or drained.background_titles_enabled),
     )
-    # A store with request-scoped resources must retain them until the worker
-    # finishes, including when the awaiting request is cancelled.
-    run_in_thread = getattr(conversation_store, "run_in_thread_with_background_lease", None)
-    if run_in_thread is not None:
-        persisted_items = await run_in_thread("append", session_id, batch)
-    else:
-        persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
+    persisted_items = await asyncio.to_thread(conversation_store.append, session_id, batch)
     persisted = persisted_items[-1]
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
@@ -7092,6 +7097,11 @@ async def _relay_runner_stream_once(
                             _TelTurnEndEvent(
                                 installation_id=_get_installation_id(),
                                 session_id=session_id,
+                                anon_user_id=_tel_current_anon(),
+                                # The relay task has no request to carry the
+                                # header, and resolving the host would cost a
+                                # read per turn end — so the field is skipped.
+                                host_installation_id=None,
                                 status=_turn_status,
                                 latency_ms=_latency_ms,
                                 model=_turn_model,
@@ -9361,8 +9371,6 @@ async def _create_session_from_existing_agent(
     # Emit session.created exactly once at creation time.
     # Best-effort: skip if the host opted out via HostHelloFrame.
     try:
-        import hashlib as _hashlib
-
         _hr: HostRegistry | None = getattr(request.app.state, "host_registry", None)
         _host_opted_out = (
             _hr is not None
@@ -9371,10 +9379,7 @@ async def _create_session_from_existing_agent(
         )
         if not _host_opted_out:
             _install_id = _get_installation_id()
-            _anon_uid: str | None = None
-            if user_id is not None:
-                _salt = f"{_install_id}:{user_id}" if _install_id else user_id
-                _anon_uid = _hashlib.sha256(_salt.encode()).hexdigest()[:16]
+            _anon_uid = _tel_anon_user_id(user_id, _install_id)
             _client_header = request.headers.get("x-omnigent-client")
             _surface = (
                 _client_header

@@ -163,6 +163,7 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             "OMNIGENT_AUTH_PROVIDER": "header",
             "OMNIGENT_LOCAL_SINGLE_USER": "1",
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+            "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
             "NO_PROXY": "127.0.0.1,localhost",
         }
     )
@@ -379,6 +380,7 @@ def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, bui
             "OMNIGENT_AUTH_PROVIDER": "header",
             "OMNIGENT_LOCAL_SINGLE_USER": "1",
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
+            "AGY_CLI_DISABLE_AUTO_UPDATE": "true",
             "DATABRICKS_CONFIG_FILE": str(profile_file),
         }
     )

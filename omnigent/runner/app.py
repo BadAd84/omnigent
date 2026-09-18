@@ -68,7 +68,11 @@ from omnigent.harness_plugins import (
     model_env_keys,
     spawn_env_builders,
 )
-from omnigent.inner.native_attachments import has_unresolved_file_id, resolve_file_id_block
+from omnigent.inner.native_attachments import (
+    framework_notice_block,
+    has_unresolved_file_id,
+    resolve_file_id_block,
+)
 from omnigent.llms.summarize import (
     build_summarization_input,
     build_summarization_prompt,
@@ -535,6 +539,15 @@ _WAKE_POST_TRANSIENT_4XX = frozenset({408, 409, 425, 429})
 # the Databricks Apps ingress) can drop the long-lived HTTP connection.
 # Matches the AP-side ``_SESSION_STREAM_HEARTBEAT_INTERVAL_S``.
 _SESSION_STREAM_HEARTBEAT_S = 15.0
+
+# How long a required-terminal exit waits for the session's in-flight turn
+# stream to converge before releasing the harness subprocess. The harness
+# usually reports the failure that killed its pane (e.g. a prompt-readiness
+# timeout) on that very stream; releasing at once would close the client the
+# runner is reading and turn the report into a bare transport error. A pane
+# that died on its own leaves the harness parked on a readiness wait, so the
+# wait is bounded and the stream failure is then attributed to the exit.
+_TERMINAL_EXIT_RELEASE_GRACE_S = 2.0
 
 # Lazy singleton LLM client for the runner process. Created on first use so
 # the runner does not import llms at startup (imports are expensive and the
@@ -1363,6 +1376,20 @@ def _is_context_overflow_error(event: _JsonObject) -> tuple[int, int] | None:
     return 128000, 128001
 
 
+def _response_failed_payload(
+    error: Mapping[str, object],
+    source: str = "execution",
+) -> _JsonObject:
+    """Build a failure envelope with required error fields and a legacy mirror."""
+    failure_error = {**_normalize_turn_error(error), **error}
+    return {
+        "type": "response.failed",
+        "source": source,
+        "response": {"status": "failed", "error": failure_error},
+        "error": failure_error,
+    }
+
+
 def _response_failed_event(
     error: Mapping[str, object],
     source: str = "execution",
@@ -1382,10 +1409,7 @@ def _response_failed_event(
         so it can persist the right ``ErrorData.source``.
     :returns: UTF-8 encoded SSE frame bytes.
     """
-    response = {"status": "failed", "error": error}
-    payload = json.dumps(
-        {"type": "response.failed", "source": source, "response": response, "error": error}
-    )
+    payload = json.dumps(_response_failed_payload(error, source=source))
     return f"event: response.failed\ndata: {payload}\n\n".encode()
 
 
@@ -1409,15 +1433,18 @@ async def _resolve_forwarded_message_content(
     resolved: list[_JsonObject] = []
     changed = False
     for block in content:
-        new_block = None
+        result = None
         if isinstance(block, dict) and has_unresolved_file_id(block):
-            new_block = await resolve_file_id_block(
+            result = await resolve_file_id_block(
                 block, session_id=session_id, client=server_client
             )
-        if new_block is None:
+        if result is None:
             resolved.append(block)
         else:
+            new_block, notice = result
             resolved.append(new_block)
+            if notice is not None:
+                resolved.append(framework_notice_block(notice))
             changed = True
 
     return resolved if changed else content
@@ -3016,6 +3043,11 @@ def create_runner_app(
     # Desynced conversations; cleared when a fresh turn binds.
     _desynced_sessions: set[str] = set()
     app.state.desynced_sessions = _desynced_sessions
+    # Required-terminal exits whose handler released the session's harness
+    # subprocess. The release closes the httpx client an in-flight
+    # ``proxy_stream`` is reading, which surfaces there as a transport error;
+    # the stream's failure handler consumes the record to report the exit.
+    _required_terminal_exit_errors: dict[str, dict[str, str]] = {}
     # Monotonic epoch stamped at each turn bind; lets recovery detect a replacement that ran
     # and finished during a teardown await (slot empty, but epoch advanced).
     _turn_epoch_seq = itertools.count(1)
@@ -3357,12 +3389,12 @@ def create_runner_app(
         runner log) and attaches the live pane snapshot as a ``Last captured
         terminal output:`` block, which the web UI renders as diagnostics.
         """
-        cause = str(exc).strip()
-        message = (
-            f"Harness stream connection error: {cause}"
-            if cause
-            else "Harness stream connection error."
-        )
+        # httpx raises several transport errors with no message at all
+        # (``ReadError()``), which left the whole diagnostic as the bare
+        # sentence. Fall back to the exception type so the message always names
+        # which transport failure ended the stream.
+        cause = str(exc).strip() or type(exc).__name__
+        message = f"Harness stream connection error: {cause}"
         pane = _live_terminal_pane_snapshot(conv_id)
         if pane:
             message = f"{message}\n\nLast captured terminal output:\n{pane}"
@@ -3373,6 +3405,12 @@ def create_runner_app(
             return
 
         async def _release() -> None:
+            # Let a live turn stream converge first (bounded): the harness's own
+            # failure event may already be on the wire, and releasing now would
+            # sever the stream carrying it.
+            deadline = time.monotonic() + _TERMINAL_EXIT_RELEASE_GRACE_S
+            while session_id in _live_response_id and time.monotonic() < deadline:
+                await asyncio.sleep(0.05)
             try:
                 await process_manager.release(session_id)
             except Exception:
@@ -3414,6 +3452,12 @@ def create_runner_app(
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
 
+        # Record the exit before releasing the harness: the release severs any
+        # in-flight turn stream, whose failure handler then reports this exit
+        # instead of the transport error the severed socket raises.
+        error = _build_required_terminal_error(event)
+        _required_terminal_exit_errors[event.session_id] = error
+
         if event.terminal_name in ("qwen", "antigravity") and event.session_key == "main":
             _publish_event(event.session_id, {"type": "session.status", "status": "idle"})
             _release_required_terminal_session(event.session_id)
@@ -3423,7 +3467,6 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        error = _build_required_terminal_error(event)
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
@@ -4630,6 +4673,7 @@ def create_runner_app(
         _turn_bind_epoch.pop(session_id, None)
         _desync_terminalized.pop(session_id, None)
         _desynced_sessions.discard(session_id)
+        _required_terminal_exit_errors.pop(session_id, None)
         _native_pane_status.pop(session_id, None)
         _ingest_next_seq.pop(session_id, None)
         _ingest_now_serving.pop(session_id, None)
@@ -7921,10 +7965,11 @@ def create_runner_app(
             superseded.relay.close()
 
         async def _notify_tools_changed() -> None:
+            from threading import Event
+
+            cancelled = Event()
             try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, post_tools_changed, bridge_dir
-                )
+                await asyncio.to_thread(post_tools_changed, bridge_dir, cancelled=cancelled)
             except (RuntimeError, OSError):
                 # Fire-and-forget below, so anything escaping here resurfaces as
                 # an unretrieved task exception at ERROR. Re-advertising the tool
@@ -7936,11 +7981,16 @@ def create_runner_app(
                     exc_info=True,
                     extra={"session_id": session_id},
                 )
+            finally:
+                # Cancelling an executor future does not stop its worker thread.
+                cancelled.set()
 
         if await_notify:
             await _notify_tools_changed()
         else:
-            _notify_task = asyncio.create_task(_notify_tools_changed())
+            _notify_task = asyncio.create_task(
+                _notify_tools_changed(), name=f"tools-changed:{session_id}"
+            )
             _background_tasks.add(_notify_task)
             _notify_task.add_done_callback(_background_tasks.discard)
 
@@ -8568,6 +8618,9 @@ def create_runner_app(
                     },
                 )
 
+        # A required-terminal exit recorded before this turn belongs to an
+        # earlier stream; only exits observed from here on can end this one.
+        _required_terminal_exit_errors.pop(conv_id, None)
         try:
             client = await manager.get_client(conv_id, harness_name, env=spawn_env)
         except RuntimeError as exc:
@@ -8604,7 +8657,11 @@ def create_runner_app(
                         conv_id,
                         exc,
                         exc_info=True,
-                        extra={"session_id": conv_id},
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "runner_turn_spec_resolution_failed",
+                            "attributes": {"phase": "eager", "exception_type": type(exc).__name__},
+                        },
                     )
                     _eager_spec_error = (
                         type(exc).__name__,
@@ -8662,7 +8719,11 @@ def create_runner_app(
                     conv_id,
                     exc,
                     exc_info=True,
-                    extra={"session_id": conv_id},
+                    extra={
+                        "session_id": conv_id,
+                        "event_name": "runner_turn_spec_resolution_failed",
+                        "attributes": {"phase": "lazy", "exception_type": type(exc).__name__},
+                    },
                 )
                 return None, (
                     type(exc).__name__,
@@ -8690,13 +8751,7 @@ def create_runner_app(
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
-                _fail = {
-                    "type": "response.failed",
-                    "error": {
-                        "message": _err_msg,
-                        "type": _err_type,
-                    },
-                }
+                _fail = _response_failed_payload({"message": _err_msg, "type": _err_type})
                 _publish_event(conv_id, _fail)
                 _on_proxy_stream_end(
                     conv_id,
@@ -8780,15 +8835,18 @@ def create_runner_app(
                             "harness rejected turn delivery for %s with status %d",
                             conv_id,
                             harness_resp.status_code,
-                            extra={"session_id": conv_id},
-                        )
-                        _fail_status = {
-                            "type": "response.failed",
-                            "source": "harness",
-                            "error": {
-                                "status": harness_resp.status_code,
+                            extra={
+                                "session_id": conv_id,
+                                "event_name": "harness_turn_rejected",
+                                "attributes": {
+                                    "harness": harness_name,
+                                    "http_status": harness_resp.status_code,
+                                },
                             },
-                        }
+                        )
+                        _fail_status = _response_failed_payload(
+                            {"status": harness_resp.status_code}, source="harness"
+                        )
                         _publish_event(
                             conv_id,
                             _fail_status,
@@ -8979,13 +9037,9 @@ def create_runner_app(
                                         ) = await _resolve_turn_spec_lazy()
                                         if _lazy_err is not None:
                                             _err_type, _err_msg = _lazy_err
-                                            _fail = {
-                                                "type": "response.failed",
-                                                "error": {
-                                                    "message": _err_msg,
-                                                    "type": _err_type,
-                                                },
-                                            }
+                                            _fail = _response_failed_payload(
+                                                {"message": _err_msg, "type": _err_type}
+                                            )
                                             _publish_event(conv_id, _fail)
                                             _on_proxy_stream_end(
                                                 conv_id,
@@ -9045,6 +9099,9 @@ def create_runner_app(
                                                     ),
                                                     publish_event=_publish_event,
                                                     filesystem_registry=filesystem_registry,
+                                                    effective_harness=_session_harness_name(
+                                                        conv_id
+                                                    ),
                                                 )
                                             )
                                         )
@@ -9190,41 +9247,60 @@ def create_runner_app(
                     ),
                     "type": "_ContextWindowOverflow",
                 }
-                _overflow_fail = {
-                    "type": "response.failed",
-                    "source": "llm",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                _overflow_fail = _response_failed_payload(_error, source="llm")
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="llm")
 
             except (httpx.HTTPError, RuntimeError) as exc:
-                _logger.exception(
-                    "proxy stream connection error for %s: %s",
-                    conv_id,
-                    exc,
-                    extra={
-                        "session_id": conv_id,
-                        "event_name": "harness_stream_failed",
-                        "attributes": {
-                            "harness": harness_name,
-                            "response_id": _response_id,
+                _exit_error = _required_terminal_exit_errors.pop(conv_id, None)
+                if _exit_error is not None:
+                    # The runner ended this stream itself: the session's required
+                    # terminal exited and its handler released the harness
+                    # subprocess, closing this client mid-read. Report the exit
+                    # and its pane diagnostics, not the transport symptom.
+                    _logger.warning(
+                        "harness stream for %s ended by required terminal exit: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_ended_by_terminal_exit",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
                         },
-                    },
-                )
-                _error = {
-                    "code": "connection_error",
-                    "message": _harness_stream_failure_message(conv_id, exc),
-                    "type": type(exc).__name__,
-                }
-                _http_fail = {
-                    "type": "response.failed",
-                    "source": "harness",
-                    "response": {"status": "failed", "error": _error},
-                    "error": _error,
-                }
+                    )
+                    # The status event's code is derived from ``type``.
+                    _error = {**_exit_error, "type": _exit_error["code"]}
+                else:
+                    # Name the type as well as the text: the messageless httpx
+                    # errors otherwise log a trailing colon and nothing, so one
+                    # signature covered every transport cause.
+                    _logger.exception(
+                        "proxy stream connection error for %s: %s: %s",
+                        conv_id,
+                        type(exc).__name__,
+                        exc,
+                        extra={
+                            "session_id": conv_id,
+                            "event_name": "harness_stream_failed",
+                            "attributes": {
+                                "harness": harness_name,
+                                "response_id": _response_id,
+                                "exception_type": type(exc).__name__,
+                            },
+                        },
+                    )
+                    _error = {
+                        "code": "connection_error",
+                        "message": _harness_stream_failure_message(conv_id, exc),
+                        "type": type(exc).__name__,
+                    }
+                _http_fail = _response_failed_payload(_error, source="harness")
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(_error, source="harness")
@@ -11872,6 +11948,7 @@ def create_runner_app(
     async def cleanup_session_resources(
         session_id: str,
     ) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -11899,6 +11976,7 @@ def create_runner_app(
 
     @app.post("/v1/sessions/{session_id}/reset-state")
     async def reset_session_state(session_id: str) -> JSONResponse:
+        _required_terminal_exit_errors.pop(session_id, None)
         _codex_terminal_ensure_locks.pop(session_id, None)
         _claude_terminal_ensure_locks.pop(session_id, None)
         _pi_terminal_ensure_locks.pop(session_id, None)
@@ -12192,6 +12270,7 @@ def create_runner_app(
                         harness_client=None,
                         publish_event=_publish_event,
                         filesystem_registry=filesystem_registry,
+                        effective_harness=_session_harness_name(session_id),
                     )
                 except Exception as exc:
                     _logger.exception(

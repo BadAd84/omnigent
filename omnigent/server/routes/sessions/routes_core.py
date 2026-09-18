@@ -30,11 +30,12 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id
+from omnigent.db.utils import generate_agent_id, generate_file_id
 from omnigent.debug_logging import add_audit_attrs, debug_event
 from omnigent.entities import (
     CommentsFingerprint,
     Conversation,
+    StoredFile,
     synthesize_conversation_title,
 )
 from omnigent.entities.permission import SessionPermission
@@ -204,6 +205,7 @@ from omnigent.stores.conversation_store import (
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
+    SIDE_CHAT_LABEL_KEY,
     ConversationNotFoundError,
     pinned_label_key,
     runner_seen_is_fresh,
@@ -1279,6 +1281,10 @@ def register_core_routes(
             # Pins are per-user: filter to the caller's own pin key.
             pinned_owner=user_id,
         )
+        # Side chats surface only as Workspace-rail tabs, so drop any
+        # side-chat-labeled fork from the sidebar list (it is still a normal
+        # session, just not listed as a top-level one here).
+        page.data = [conv for conv in page.data if SIDE_CHAT_LABEL_KEY not in (conv.labels or {})]
         # list_conversations may return rows with agent_id=None for
         # legacy conversations; skip them before building the batch IDs.
         conv_ids = [conv.id for conv in page.data if conv.agent_id is not None]
@@ -2876,6 +2882,11 @@ def register_core_routes(
                 )
             extra_labels[_CODEX_NATIVE_BYPASS_SANDBOX_LABEL_KEY] = "1"
 
+        # A side-chat fork is hidden from the left sidebar (it surfaces only as a
+        # Workspace-rail tab). Stamp the label the sessions-list filter reads.
+        if body.side_chat:
+            extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
+
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
         # runner carries history into the native harness. Same-family: clone
@@ -2965,6 +2976,42 @@ def register_core_routes(
         else:
             fork_project_id = fork_resolution.project_id
 
+        # The deep-copied items reference the source's session-scoped file
+        # resources by raw file_id (attachment blocks are persisted
+        # pre-resolution), but a fork owns none of those rows — its own file
+        # endpoints would 404, so the web transcript shows broken
+        # attachments and a native transcript rebuild receives the file_id
+        # unresolved. Pre-allocate a fork-owned id per source file; the store
+        # rewrites the copied items to those ids, and a fork-owned row per id
+        # is created right after the fork commits. Each row points at the
+        # SOURCE's blob (blob_key), so the fork shares the bytes and copies
+        # nothing — reference-counted deletion keeps that blob alive until
+        # every referencing row is gone.
+        #
+        # This is pure metadata: we deliberately do NOT probe the artifact
+        # store for each blob (an S3 HEAD / Volumes stat per file is real
+        # per-fork latency). A file whose blob happens to be gone yields a
+        # fork row that 404s on read — exactly how the source itself already
+        # degrades — so a probe would only trade latency for the same outcome.
+        fork_file_id_map: dict[str, str] = {}
+        fork_source_files: list[StoredFile] = []
+        if file_store is not None and artifact_store is not None:
+            files_after: str | None = None
+            while True:
+                files_page = await asyncio.to_thread(
+                    file_store.list,
+                    source_id,
+                    limit=1000,
+                    after=files_after,
+                    order="asc",
+                )
+                for stored_file in files_page.data:
+                    fork_source_files.append(stored_file)
+                    fork_file_id_map[stored_file.id] = generate_file_id()
+                if not files_page.has_more or not files_page.data:
+                    break
+                files_after = files_page.last_id
+
         try:
             new_conv = await asyncio.to_thread(
                 conversation_store.fork_conversation,
@@ -2999,6 +3046,7 @@ def register_core_routes(
                 presentation_labels=presentation_labels,
                 up_to_response_id=body.up_to_response_id,
                 project_id=fork_project_id,
+                file_id_map=fork_file_id_map,
             )
         except LookupError as exc:
             raise OmnigentError(
@@ -3013,6 +3061,50 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             ) from exc
 
+        # Create the fork-owned rows the rewritten items now reference —
+        # before the fork is announced or returned, so no reader sees the ids
+        # dangling. Each row points at the SOURCE's blob (blob_key), so no
+        # bytes move: the fork shares the source's artifact and both sessions
+        # resolve the same content independently, and the source's
+        # source_metadata (e.g. an image's pre-downscale dimensions) is
+        # carried so the fork's copy is not left less descriptive than the
+        # original. Row creation is best-effort and touches no artifact store:
+        # a failed create is logged and skipped — nothing to roll back since
+        # no blob was written — so forking never fails on a deleted file, and
+        # a source file whose blob is already gone just yields a row that
+        # 404s on read, exactly as the source already does.
+        #
+        # Accepted residual race (not closed here): a source-file/session
+        # delete that runs fully concurrently with this fork can pass its
+        # own orphan check before the row below is inserted, then delete the
+        # shared blob after the fork completes, 404-ing the fork's attachment.
+        # Forking a session while deleting its attachments is unlikely enough
+        # that we accept it rather than add cross-operation locking or
+        # deferred blob GC; the copy-bytes alternative is the fallback if it
+        # ever proves to matter.
+        if file_store is not None and artifact_store is not None:
+            for stored_file in fork_source_files:
+                copied_file_id = fork_file_id_map[stored_file.id]
+                try:
+                    await asyncio.to_thread(
+                        file_store.create,
+                        filename=stored_file.filename,
+                        bytes=stored_file.bytes,
+                        content_type=stored_file.content_type,
+                        session_id=new_conv.id,
+                        file_id=copied_file_id,
+                        blob_key=stored_file.blob_key or stored_file.id,
+                        source_metadata=stored_file.source_metadata,
+                    )
+                except Exception:
+                    _logger.warning(
+                        "failed to create fork file row %s in fork %s of session %s",
+                        copied_file_id,
+                        new_conv.id,
+                        source_id,
+                        exc_info=True,
+                    )
+
         # Grant ownership BEFORE scheduling the managed launch, mirroring
         # both create paths: a managed-guard failure (misconfigured server,
         # unconfigured provider) must not leave the just-forked session
@@ -3020,8 +3112,12 @@ def register_core_routes(
         if permission_store is not None and user_id is not None:
             await asyncio.to_thread(permission_store.ensure_user, user_id)
             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
-        # Push the forked session to this user's other open tabs.
-        _announce_session_added(user_id, new_conv.id)
+        # Push the forked session to this user's other open tabs — but NOT a
+        # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
+        # row, so announcing it would leak it into every open sidebar (the
+        # real-time path bypasses the list-endpoint's side-chat filter).
+        if not body.side_chat:
+            _announce_session_added(user_id, new_conv.id)
 
         from omnigent.server.managed_hosts import read_managed_repo_workspaces
 

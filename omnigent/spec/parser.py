@@ -192,7 +192,7 @@ def parse(root: Path, *, expand_env: bool = True) -> AgentSpec:
     if not config_path.exists():
         raise FileNotFoundError(f"config.yaml not found in {root}")
 
-    raw = yaml.load(config_path.read_text(), Loader=_ConfigYamlLoader)
+    raw = yaml.load(config_path.read_text(encoding="utf-8"), Loader=_ConfigYamlLoader)
     if not isinstance(raw, dict):
         raise OmnigentError(
             f"config.yaml must be a YAML mapping, got {type(raw).__name__}",
@@ -2109,7 +2109,7 @@ def _read_contained_file(root: Path, value: str) -> str | None:
         if resolved.startswith(root_prefix):
             candidate = Path(resolved)
             if candidate.is_file():
-                return candidate.read_text()
+                return candidate.read_text(encoding="utf-8")
     except OSError:
         pass
     return None
@@ -2506,7 +2506,7 @@ def _parse_skill(skill_md: Path) -> SkillSpec:
         ``strict=False``) can catch them uniformly.
     """
     try:
-        text = skill_md.read_text()
+        text = skill_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
         # UnicodeDecodeError (a non-UTF-8 SKILL.md) is a ValueError, not an
         # OSError — funnel it through OmnigentError too so the lenient
@@ -2725,17 +2725,6 @@ def _parse_inline_mcp_servers(
                     code=ErrorCode.INVALID_INPUT,
                 )
             databricks_profile = str(raw_profile)
-        # Optional per-server tool allow-list (the YAML ``tools:`` whitelist) —
-        # only these tool names are exposed to the model; ``None`` exposes all.
-        # Mirrors ``MCPTool.tools`` and is filtered downstream in
-        # server/mcp_pool.py + runner/mcp_manager.py.
-        raw_allow = val.get("tools")
-        if raw_allow is not None and not isinstance(raw_allow, list):
-            raise OmnigentError(
-                f"Inline MCP server {name!r} 'tools' must be a list of tool names",
-                code=ErrorCode.INVALID_INPUT,
-            )
-        tool_allowlist = [str(t) for t in raw_allow] if raw_allow else None
         servers.append(
             MCPServerConfig(
                 name=name,
@@ -2750,10 +2739,43 @@ def _parse_inline_mcp_servers(
                 headers=headers,
                 env=env,
                 databricks_profile=databricks_profile,
-                tools=tool_allowlist,
+                tools=_parse_mcp_tool_allowlist(name, val, "inline MCP server"),
             )
         )
     return servers
+
+
+def _parse_mcp_tool_allowlist(
+    name: object,
+    raw: dict[str, object],
+    source: object,
+) -> list[str] | None:
+    """
+    Parse the optional per-server ``tools:`` allow-list.
+
+    Only these tool names are exposed to the model; ``None`` exposes
+    all. Mirrors ``MCPTool.tools`` and is filtered downstream in
+    ``server/mcp_pool.py`` + ``runner/mcp_manager.py``. Shared by the
+    inline (``config.yaml``) and sidecar (``tools/mcp/*.yaml``) MCP
+    parsers so both forms honour the same allow-list — a restriction
+    silently accepted in one form and dropped in the other would fail
+    open, granting more tools than the spec asked for.
+
+    :param name: The MCP server's ``name`` field, used in the error
+        message.
+    :param raw: Parsed YAML mapping for the MCP server.
+    :param source: Path (sidecar) or label (inline) identifying the
+        YAML source, used in the error message.
+    :returns: List of allowed tool names, or ``None`` to expose all.
+    :raises OmnigentError: If ``tools`` is present and not a list.
+    """
+    raw_allow = raw.get("tools")
+    if raw_allow is not None and not isinstance(raw_allow, list):
+        raise OmnigentError(
+            f"MCP server {name!r} 'tools' must be a list of tool names: {source}",
+            code=ErrorCode.INVALID_INPUT,
+        )
+    return [str(t) for t in raw_allow] if raw_allow else None
 
 
 def _discover_mcp_servers(
@@ -2782,7 +2804,7 @@ def _discover_mcp_servers(
         return []
     servers: list[MCPServerConfig] = []
     for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-        raw = yaml.safe_load(yaml_file.read_text())
+        raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise OmnigentError(
                 f"MCP config must be a YAML mapping: {yaml_file}",
@@ -2872,6 +2894,7 @@ def _parse_http_mcp_server(
         url=url_str,
         headers=expand_env_vars(headers) if expand_env else headers,
         description=str(raw_description) if raw_description is not None else None,
+        tools=_parse_mcp_tool_allowlist(name, raw, yaml_file),
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
@@ -2970,6 +2993,7 @@ def _parse_stdio_mcp_server(
         args=[str(a) for a in raw_args],
         env=env,
         description=str(raw_description) if raw_description is not None else None,
+        tools=_parse_mcp_tool_allowlist(name, raw, yaml_file),
         timeout=(
             _parse_int_field(raw["timeout"], f"MCP server {name!r}.timeout")
             if "timeout" in raw
