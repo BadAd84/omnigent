@@ -2601,9 +2601,24 @@ async def _execute_subagent_tool(
                 "fresh session with the requested budget."
             )
         child_wrapper_label = _session_wrapper_label(existing)
-        # A continued child keeps its create-time routing; the summary's
-        # routed_model is its persisted model_override.
+        # The summary's routed_model is set only when a routing decision
+        # produced the override; a pinned args.model persists model_override
+        # without one, so fall back to the child snapshot's effective model.
         child_model = _optional_string(existing.get("routed_model"))
+        if child_model is None:
+            try:
+                snap_resp = await server_client.get(
+                    f"/v1/sessions/{child_session_id}", timeout=10.0
+                )
+                child_snap = (
+                    _string_object_dict(snap_resp.json()) if snap_resp.status_code == 200 else None
+                )
+            except (httpx.HTTPError, RuntimeError, ValueError):
+                child_snap = None
+            if child_snap is not None:
+                child_model = _optional_string(
+                    child_snap.get("model_override")
+                ) or _optional_string(child_snap.get("llm_model"))
         existing_work = _runner_app.get_subagent_work(child_session_id)
         if existing_work is not None and existing_work.status == "launching":
             # The child's turn hasn't started streaming yet, so there is no

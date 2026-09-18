@@ -4367,29 +4367,51 @@ async def test_sys_session_send_handle_reports_persisted_model(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("routed_model", "expected"),
+    ("routed_model", "snapshot", "expected"),
     [
         pytest.param(
-            "databricks-claude-opus-4-8", "databricks-claude-opus-4-8", id="routed-child"
+            "databricks-claude-opus-4-8",
+            None,
+            "databricks-claude-opus-4-8",
+            id="routed-child",
         ),
-        pytest.param(None, None, id="unrouted-child"),
+        pytest.param(
+            None,
+            {
+                "model_override": "databricks-claude-sonnet-4-6",
+                "llm_model": "spec-default-model",
+            },
+            "databricks-claude-sonnet-4-6",
+            id="pinned-child",
+        ),
+        pytest.param(
+            None,
+            {"model_override": None, "llm_model": "spec-default-model"},
+            "spec-default-model",
+            id="spec-default-child",
+        ),
+        pytest.param(None, None, None, id="snapshot-unavailable"),
     ],
 )
 async def test_sys_session_send_continued_child_handle_reports_routed_model(
     monkeypatch: pytest.MonkeyPatch,
     routed_model: str | None,
+    snapshot: dict[str, str | None] | None,
     expected: str | None,
 ) -> None:
     """
-    Continuing a named child returns a handle with its routed model.
+    Continuing a named child returns a handle with its effective model.
 
     A continuation carries no ``args.model`` (overrides apply only at
-    create), so the handle's ``model`` comes from the child summary's
-    ``routed_model`` — the persisted ``model_override``. A child that was
-    never routed reports ``None`` rather than a guessed value.
+    create). The handle's ``model`` comes from the child summary's
+    ``routed_model`` when a routing decision produced one; otherwise from
+    the child snapshot's ``model_override``/``llm_model``, since a pinned
+    override sets no ``routed_model``. When neither source is available
+    the handle reports ``None`` rather than a guessed value.
 
     :param monkeypatch: Pytest monkeypatch fixture.
     :param routed_model: The summary's ``routed_model`` projection.
+    :param snapshot: Child snapshot fields; ``None`` 404s the lookup.
     :param expected: The ``model`` the handle must carry.
     """
     from omnigent.runner import app as runner_app
@@ -4418,6 +4440,10 @@ async def test_sys_session_send_continued_child_handle_reports_routed_model(
                     ]
                 },
             )
+        if request.method == "GET" and request.url.path == "/v1/sessions/conv_existing_routed":
+            if snapshot is None:
+                return httpx.Response(404, json={"error": "session_not_found"})
+            return httpx.Response(200, json={"id": "conv_existing_routed", **snapshot})
         if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_existing_routed":
             return httpx.Response(200, json={"ok": True})
         if (
