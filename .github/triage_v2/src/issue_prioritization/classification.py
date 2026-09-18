@@ -128,18 +128,7 @@ class PromptClassifier:
             ):
                 raise ValueError("a non_actionable bug cannot claim observed failure evidence")
             bug_review.validate_source(issue.body)
-            closure_confirmed = False
-            if non_actionable and bug_review.source_only_quote is not None:
-                confirmation_prompt = Template(
-                    files("issue_prioritization").joinpath("bug_closure_prompt.txt").read_text()
-                ).substitute(
-                    source_only_quote=bug_review.source_only_quote,
-                    title=issue.title,
-                    body=issue.body,
-                )
-                confirmation = _parse_json_object(self.query(confirmation_prompt))
-                closure_confirmed = confirmation.get("source_only") is True
-            if non_actionable and not closure_confirmed:
+            if non_actionable and bug_review.source_only_quote is None:
                 bug_review = replace(
                     bug_review,
                     actionability=BugActionability.NEEDS_INFO,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from datetime import UTC, datetime
+from unittest.mock import Mock
 
 import pytest
 
@@ -43,19 +44,21 @@ def issue(body=SOURCE_ONLY, labels=("Bug",)):
     return BronzeIssue(7, "Session failure", body, "url", "author", labels, NOW, 0, 0)
 
 
-def preview(decision="non_actionable", *, value=None, report=None, confirmed=True):
+def preview(decision="non_actionable", *, value=None, report=None):
     value = value or response(decision)
     report = report or issue(BODY if decision == "actionable" else SOURCE_ONLY)
-    replies = iter([json.dumps(value), json.dumps({"source_only": confirmed})])
-    return prioritize_issue(
+    query = Mock(side_effect=[json.dumps(value)])
+    result = prioritize_issue(
         report,
-        PromptClassifier(lambda _: next(replies), AreaCatalog({}, {}), review_bugs=True),
+        PromptClassifier(query, AreaCatalog({}, {}), review_bugs=True),
         ScoringConfig.default(),
         AreaCatalog({}, {}),
         LabelManifest(()),
         "preview",
         PipelineMode.DRY_RUN,
     )
+    query.assert_called_once()
+    return result
 
 
 @pytest.mark.parametrize("decision", ["actionable", "needs_info", "non_actionable"])
@@ -119,19 +122,14 @@ def test_other_types_and_disabled_review_keep_existing_behavior(kind, enabled):
     assert classifier.classify(issue(BODY).content()).bug_review is None
 
 
-@pytest.mark.parametrize("confirmed", [False, None, "true"])
-def test_uncertain_second_check_requests_clarification(confirmed):
-    run, classification, _, _ = preview(confirmed=confirmed)
+def test_missing_closure_quote_requests_clarification():
+    value = response("non_actionable")
+    value["bug_review"]["source_only_quote"] = None
+    run, classification, _, _ = preview(value=value)
     assert classification.bug_review.actionability == "needs_info"
     assert classification.bug_review.source_only_quote is None
     assert run.mutations[0].target.needs_info
     assert not run.mutations[0].close_as_non_actionable
-
-
-def test_missing_closure_quote_requests_clarification():
-    value = response("non_actionable")
-    value["bug_review"]["source_only_quote"] = None
-    assert preview(value=value)[0].mutations[0].target.needs_info
 
 
 @pytest.mark.parametrize(
@@ -152,23 +150,18 @@ def test_inconsistent_or_ungrounded_model_output_is_rejected(bad):
         preview(decision, value=value)
 
 
-def test_both_model_calls_see_evidence_after_the_old_cutoff():
+def test_single_model_call_sees_evidence_after_the_old_cutoff():
     observation = "I reproduced the failure yesterday."
     report = issue(SOURCE_ONLY + " Source detail." * 1000 + observation)
-    prompts = []
-
-    def query(prompt):
-        prompts.append(prompt)
-        return json.dumps(
-            response("non_actionable") if len(prompts) == 1 else {"source_only": False}
-        )
+    query = Mock(side_effect=[json.dumps(response("actionable"))])
 
     classification = PromptClassifier(query, AreaCatalog({}, {}), review_bugs=True).classify(
         report.content()
     )
-    assert len(prompts) == 2
-    assert all(observation in prompt and report.title in prompt for prompt in prompts)
-    assert classification.bug_review.actionability == "needs_info"
+    query.assert_called_once()
+    prompt = query.call_args.args[0]
+    assert report.body in prompt and report.title in prompt
+    assert classification.bug_review.actionability == "actionable"
 
 
 def test_oversized_report_is_not_partially_reviewed():

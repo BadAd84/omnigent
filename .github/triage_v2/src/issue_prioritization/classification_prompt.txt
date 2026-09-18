@@ -80,8 +80,6 @@ candidates are supplied, return none, null, [], and 0.0 for duplicate fields.
 Allowed areas:
 $allowed_areas
 
-$bug_review_rubric
-
 Issue #$issue_number
 Title: $title
 Labels: $labels
@@ -91,3 +89,5 @@ $body
 
 Candidate duplicates:
 $duplicate_candidates
+
+$bug_review_rubric
