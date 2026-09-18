@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 
 
@@ -79,15 +79,16 @@ class BugReview:
             return "not_assessed"
         return "needs_summary" if self.clarification is not None else "clear"
 
-    def validate_source(self, body: str) -> None:
+    def validate_source(self, body: str) -> BugReview:
         source = " ".join(body.split())
         if self.source_only_quote and self.source_only_quote not in source:
             raise ValueError("source_only_quote is absent from the report")
-        if self.clarification is None:
-            return
-        for step in self.clarification.reproduction_steps:
-            if step.source_quote not in source:
-                raise ValueError("reproduction step source_quote is absent from the report")
+        if self.clarification and any(
+            step.source_quote not in source for step in self.clarification.reproduction_steps
+        ):
+            # Omit the whole recipe rather than publish an incomplete sequence.
+            return replace(self, clarification=replace(self.clarification, reproduction_steps=()))
+        return self
 
     def as_dict(self) -> dict[str, object]:
         return {**asdict(self), "readability": self.readability}

@@ -132,6 +132,8 @@ job keep their existing assessment.
 One model call assesses the full report and author follow-ups. Closure requires
 an exact supporting quote and live content checks. Security/duplicate/pinned issues
 remain exempt. Reports over 100,000 characters are skipped for manual review.
+If a reproduction quote cannot be verified, omit the rewritten steps and keep
+the valid assessment and summary; closure quotes still require an exact match.
 Immediate closures remove `needs-info` and ask reporters to open a new issue if
 they observe the failure. Model assessment does not reproduce or verify the bug.
 

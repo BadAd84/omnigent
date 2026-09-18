@@ -9,7 +9,11 @@ import pytest
 
 from issue_prioritization.areas import AreaCatalog
 from issue_prioritization.bronze import BronzeIssue
-from issue_prioritization.classification import MAX_BUG_REVIEW_CHARACTERS, PromptClassifier
+from issue_prioritization.classification import (
+    MAX_BUG_REVIEW_CHARACTERS,
+    PromptClassifier,
+    _parse_json_object,
+)
 from issue_prioritization.comments import build_triage_comment, preserve_needs_info_deadline
 from issue_prioritization.config import ScoringConfig
 from issue_prioritization.event import prioritize_issue, write_event_artifacts
@@ -101,16 +105,74 @@ def test_observed_unreadable_bug_gets_a_grounded_summary(quote):
             "reproduction_steps": [{"text": "Reconnect Wi-Fi.", "source_quote": quote}],
         },
     )
-    if quote not in BODY:
-        with pytest.raises(ValueError, match="source_quote is absent"):
-            preview("actionable", value=value)
-        return
-    run, _, _, _ = preview("actionable", value=value)
+    run, classification, _, _ = preview("actionable", value=value)
     body = build_triage_comment(run.ranked[0], run.mutations[0], (), NOW)
     assert "Problem in plain English" in body
-    assert "1. Reconnect Wi-Fi." in body
-    assert "not been independently verified" in body
+    assert classification.bug_review.actionability == "actionable"
+    assert ("1. Reconnect Wi-Fi." in body) == (quote in BODY)
+    assert ("not been independently verified" in body) == (quote in BODY)
     assert not run.mutations[0].close_as_non_actionable
+
+
+def test_changed_quote_format_omits_whole_recipe_but_keeps_summary():
+    value = response()
+    value["reasoning"] = "A child exceeded its parent's spending limit."
+    summary = "A child spent $379 despite a $100 limit."
+    value["bug_review"].update(
+        readability="needs_summary",
+        clarification={
+            "summary": summary,
+            "reproduction_steps": [
+                {"text": "Configure a $100 limit.", "source_quote": "Configure a $100 limit."},
+                {"text": "Dispatch a child.", "source_quote": "Dispatch a child."},
+            ],
+        },
+    )
+    run, classification, _, _ = preview(
+        "actionable",
+        value=value,
+        report=issue("Configure a `$100` limit. Dispatch a child. The child spent $379."),
+    )
+    review = classification.bug_review
+    assert review.actionability == "actionable" and review.readability == "needs_summary"
+    assert review.clarification.summary == summary
+    assert review.clarification.reproduction_steps == ()
+    body = build_triage_comment(run.ranked[0], run.mutations[0], (), NOW)
+    assert summary in body and "Steps to reproduce" not in body
+    assert not run.mutations[0].close_as_non_actionable
+    assert not run.mutations[0].target.needs_info
+
+
+@pytest.mark.parametrize("wrapper", ["{}", "```json\n{}\n```", "```\n{}\n```"])
+def test_trailing_commas_preserve_the_complete_response_and_quoted_text(wrapper):
+    reasoning = 'Logs include ",}" and ",]", a \\ path, and ```json fences.'
+    raw = (
+        '{"bug_review":{"actionability":"actionable",},"type":"Bug",'
+        '"area_keys":["terminals",],"reasoning":' + json.dumps(reasoning) + ",}"
+    )
+    assert _parse_json_object(wrapper.format(raw)) == {
+        "bug_review": {"actionability": "actionable"},
+        "type": "Bug",
+        "area_keys": ["terminals"],
+        "reasoning": reasoning,
+    }
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        '{"bug_review":{"type":"Bug"},"type":',
+        '{"bug_review":{"type":"Bug"},"type":"Bug"',
+        '{"bug_review":{"type":"Bug"},"type":,}',
+        '{"bug_review":{"type":"Bug"},"area_keys":[,]}',
+        '[{"type":"Bug"}]',
+        '{"type":"Bug"} {"type":"Feature"}',
+        '```json\n{"type":"Bug"}',
+    ],
+)
+def test_malformed_response_never_falls_back_to_a_nested_object(raw):
+    with pytest.raises(ValueError, match="classifier.*JSON"):
+        _parse_json_object(raw)
 
 
 @pytest.mark.parametrize("kind,enabled", [("Feature", True), ("Docs", True), ("Bug", False)])

@@ -127,7 +127,7 @@ class PromptClassifier:
                 EvidenceKind.NONE,
             ):
                 raise ValueError("a non_actionable bug cannot claim observed failure evidence")
-            bug_review.validate_source(issue.body)
+            bug_review = bug_review.validate_source(issue.body)
             if non_actionable and bug_review.source_only_quote is None:
                 bug_review = replace(
                     bug_review,
@@ -223,17 +223,24 @@ def build_prompt(
 
 def _parse_json_object(value: str) -> Mapping[str, object]:
     cleaned = value.strip()
-    decoder = json.JSONDecoder()
-    for index, character in enumerate(cleaned):
-        if character != "{":
-            continue
+    if cleaned.startswith("```"):
+        lines = cleaned.splitlines()
+        if lines[0].strip() not in ("```", "```json") or lines[-1].strip() != "```":
+            raise ValueError("classifier returned an invalid JSON code fence")
+        cleaned = "\n".join(lines[1:-1])
+    while True:
         try:
-            parsed, _ = decoder.raw_decode(cleaned, index)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, Mapping):
-            return parsed
-    raise ValueError("classifier did not return a JSON object")
+            parsed = json.loads(cleaned)
+            break
+        except json.JSONDecodeError as error:
+            prefix = cleaned[: error.pos].rstrip()
+            if cleaned[error.pos : error.pos + 1] not in ("}", "]") or not prefix.endswith(","):
+                raise ValueError("classifier returned invalid JSON") from error
+            # Repair only the trailing comma identified by the decoder, outside strings.
+            cleaned = prefix[:-1] + cleaned[error.pos :]
+    if not isinstance(parsed, Mapping):
+        raise ValueError("classifier did not return a JSON object")
+    return parsed
 
 
 def _issue_type(value: object) -> IssueType:
