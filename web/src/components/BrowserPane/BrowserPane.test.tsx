@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { DesignModeSelection, DesignModeSubmit } from "@/lib/browserDesignMode";
 import { BrowserPane } from "./BrowserPane";
 
 // supportsBrowser gates the whole pane. Force it true so the pane renders; the
@@ -314,5 +315,415 @@ describe("BrowserPane toolbar navigation + URL bar", () => {
         { force: true },
       ),
     );
+  });
+});
+
+describe("BrowserPane shell-owned design instruction", () => {
+  interface DismissPayload {
+    conversationId: string;
+    selectionId?: string;
+    reason?: string;
+  }
+  const selection: DesignModeSelection = {
+    conversationId: "conv_design",
+    selectionId: "selection-period",
+    element: { tag: "input", id: "#scenario-period", label: "Period" },
+    screenshot: "data:image/png;base64,c2VsZWN0aW9u",
+  };
+
+  function deferred<T>() {
+    let resolve!: (value: T) => void;
+    const promise = new Promise<T>((done) => {
+      resolve = done;
+    });
+    return { promise, resolve };
+  }
+
+  beforeEach(() => {
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockReturnValue({
+      x: 0,
+      y: 120,
+      top: 120,
+      left: 0,
+      right: 800,
+      bottom: 600,
+      width: 800,
+      height: 480,
+      toJSON: () => ({}),
+    });
+  });
+
+  afterEach(() => vi.restoreAllMocks());
+
+  async function renderDesignPane(
+    overrides: Record<string, unknown> = {},
+    submit = vi.fn<(request: DesignModeSubmit) => Promise<void>>().mockResolvedValue(undefined),
+  ) {
+    const selectedListeners = new Set<(payload: DesignModeSelection) => void>();
+    const dismissListeners = new Set<(payload: DismissPayload) => void>();
+    const urlListeners = new Set<(payload: { conversationId: string; url: string }) => void>();
+    const closedListeners = new Set<
+      (payload: { conversationId: string; reason: string | null }) => void
+    >();
+    const native = {
+      browserHasView: vi.fn().mockResolvedValue({ exists: true, url: "https://capacity.test" }),
+      browserEnableDesignMode: vi.fn().mockResolvedValue({ ok: true, promptHost: "shell" }),
+      browserFocusDesignPrompt: vi.fn().mockResolvedValue({ ok: true }),
+      browserClearDesignSelection: vi.fn().mockResolvedValue({ ok: true }),
+      browserTakeDesignSelection: vi.fn().mockResolvedValue({
+        ok: true,
+        element: selection.element,
+        screenshot: selection.screenshot,
+      }),
+      onBrowserElementSelected: vi.fn((callback: (payload: DesignModeSelection) => void) => {
+        selectedListeners.add(callback);
+        return () => selectedListeners.delete(callback);
+      }),
+      onBrowserElementPromptDismiss: vi.fn((callback: (payload: DismissPayload) => void) => {
+        dismissListeners.add(callback);
+        return () => dismissListeners.delete(callback);
+      }),
+      onBrowserUrlChanged: vi.fn(
+        (callback: (payload: { conversationId: string; url: string }) => void) => {
+          urlListeners.add(callback);
+          return () => urlListeners.delete(callback);
+        },
+      ),
+      onBrowserViewClosed: vi.fn(
+        (callback: (payload: { conversationId: string; reason: string | null }) => void) => {
+          closedListeners.add(callback);
+          return () => closedListeners.delete(callback);
+        },
+      ),
+      ...overrides,
+    };
+    const bridge = Object.assign(installBridge(native), native);
+    const rendered = render(
+      <BrowserPane conversationId="conv_design" onDesignPromptSubmit={submit} />,
+    );
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Enter design mode" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Enter design mode" }));
+    await act(async () => {});
+    const emitSelection = (payload = selection) => {
+      act(() => {
+        for (const listener of selectedListeners) listener(payload);
+      });
+    };
+    const selectReady = async (payload = selection) => {
+      emitSelection(payload);
+      const input = screen.getByRole("textbox", { name: "Describe the change" });
+      await waitFor(() => expect(input).toBeEnabled());
+      return input;
+    };
+    return {
+      ...rendered,
+      bridge,
+      submit,
+      emitSelection,
+      selectReady,
+      emitDismiss: (payload: DismissPayload) => {
+        act(() => {
+          for (const listener of dismissListeners) listener(payload);
+        });
+      },
+      emitUrl: (url = "https://capacity.test/another") => {
+        act(() => {
+          for (const listener of urlListeners) listener({ conversationId: "conv_design", url });
+        });
+      },
+      emitClosed: () => {
+        act(() => {
+          for (const listener of closedListeners)
+            listener({ conversationId: "conv_design", reason: "closed" });
+        });
+      },
+    };
+  }
+
+  it("negotiates shell mode and renders an editable instruction above the native viewport", async () => {
+    const { bridge, container, selectReady } = await renderDesignPane();
+    expect(bridge.browserEnableDesignMode).toHaveBeenCalledWith("conv_design", {
+      promptHost: "shell",
+    });
+    const input = await selectReady();
+    expect(screen.getByText("Selected: Period")).toBeInTheDocument();
+    expect(input).toHaveFocus();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+    fireEvent.change(input, { target: { value: "asdf" } });
+    expect(input).toHaveValue("asdf");
+    const row = screen.getByRole("region", { name: "Design instruction" });
+    const viewport = container.querySelector("[data-browser-viewport]");
+    expect(viewport).not.toContainElement(input);
+    expect(row.compareDocumentPosition(viewport!)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(bridge.browserFocusDesignPrompt).toHaveBeenCalledWith("conv_design", "selection-period");
+  });
+
+  it("waits for native resize and native shell focus before focusing the instruction", async () => {
+    const resized = deferred<{ ok: boolean }>();
+    const focused = deferred<{ ok: boolean }>();
+    const { bridge, emitSelection } = await renderDesignPane();
+    bridge.browserResize.mockReturnValue(resized.promise);
+    bridge.browserFocusDesignPrompt.mockReturnValue(focused.promise);
+    emitSelection();
+    const input = screen.getByRole("textbox", { name: "Describe the change" });
+    expect(input).toBeDisabled();
+    expect(input).not.toHaveFocus();
+    expect(bridge.browserFocusDesignPrompt).not.toHaveBeenCalled();
+    await act(async () => resized.resolve({ ok: true }));
+    expect(bridge.browserFocusDesignPrompt).toHaveBeenCalledOnce();
+    expect(input).not.toHaveFocus();
+    await act(async () => focused.resolve({ ok: true }));
+    expect(input).toBeEnabled();
+    expect(input).toHaveFocus();
+  });
+
+  it("submits the claimed element and screenshot together, then reports success in the shell", async () => {
+    const { bridge, submit, selectReady } = await renderDesignPane();
+    const authoritativeElement = { tag: "input", id: "#period", label: "Period" };
+    bridge.browserTakeDesignSelection.mockResolvedValue({
+      ok: true,
+      element: authoritativeElement,
+      screenshot: "data:image/png;base64,c2FmZQ==",
+    });
+    const input = await selectReady();
+    fireEvent.change(input, { target: { value: "  Make this field wider  " } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    await waitFor(() =>
+      expect(submit).toHaveBeenCalledWith({
+        conversationId: "conv_design",
+        selectionId: "selection-period",
+        element: authoritativeElement,
+        screenshot: "data:image/png;base64,c2FmZQ==",
+        prompt: "Make this field wider",
+      }),
+    );
+    expect(bridge.browserTakeDesignSelection).toHaveBeenCalledWith(
+      "conv_design",
+      "selection-period",
+    );
+    expect(await screen.findByRole("status")).toHaveTextContent("Instruction sent to chat.");
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+  });
+
+  it.each(["resize", "focus"])(
+    "leaves instruction entry disabled when native %s is rejected",
+    async (operation) => {
+      const { bridge, emitSelection } = await renderDesignPane();
+      if (operation === "resize") bridge.browserResize.mockResolvedValue({ ok: false });
+      else
+        bridge.browserFocusDesignPrompt.mockResolvedValue({
+          ok: false,
+          error: "Selection expired.",
+        });
+      emitSelection();
+      expect(await screen.findByRole("alert")).toHaveTextContent(
+        "Select the element again to retry.",
+      );
+      const input = screen.getByRole("textbox", { name: "Describe the change" });
+      expect(input).toBeDisabled();
+      expect(input).not.toHaveFocus();
+      if (operation === "resize") expect(bridge.browserFocusDesignPrompt).not.toHaveBeenCalled();
+    },
+  );
+
+  it("ignores composing Enter and prevents duplicate submissions while a request is pending", async () => {
+    const sent = deferred<void>();
+    const submit = vi
+      .fn<(request: DesignModeSubmit) => Promise<void>>()
+      .mockReturnValue(sent.promise);
+    const { bridge, selectReady } = await renderDesignPane({}, submit);
+    const input = await selectReady();
+    fireEvent.change(input, { target: { value: "Use a longer period" } });
+    fireEvent.keyDown(input, { key: "Enter", isComposing: true });
+    fireEvent.keyDown(input, { key: "Enter", keyCode: 229 });
+    expect(bridge.browserTakeDesignSelection).not.toHaveBeenCalled();
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    expect(bridge.browserTakeDesignSelection).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Sending…" })).toBeDisabled();
+    await act(async () => sent.resolve());
+    expect(screen.getByRole("status")).toHaveTextContent("Instruction sent to chat.");
+  });
+
+  it.each(["Cancel", "Escape"])(
+    "clears the scoped selection using %s without sending",
+    async (action) => {
+      const { bridge, submit, selectReady, emitSelection } = await renderDesignPane();
+      const input = await selectReady();
+      fireEvent.change(input, { target: { value: "Do not send" } });
+      if (action === "Cancel") fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+      else fireEvent.keyDown(input, { key: "Escape" });
+      expect(bridge.browserClearDesignSelection).toHaveBeenCalledWith(
+        "conv_design",
+        "selection-period",
+      );
+      expect(submit).not.toHaveBeenCalled();
+      emitSelection();
+      expect(screen.queryByRole("textbox", { name: "Describe the change" })).toBeNull();
+    },
+  );
+
+  it("does not refocus a cancelled selection when its delayed resize completes", async () => {
+    const resized = deferred<{ ok: boolean }>();
+    const { bridge, emitSelection } = await renderDesignPane();
+    bridge.browserResize.mockReturnValue(resized.promise);
+    emitSelection();
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await act(async () => resized.resolve({ ok: true }));
+    expect(bridge.browserFocusDesignPrompt).not.toHaveBeenCalled();
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+  });
+
+  it("ignores selections and dismissals for another view", async () => {
+    const { emitSelection, emitDismiss, selectReady } = await renderDesignPane();
+    emitSelection({ ...selection, conversationId: "other_view" });
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+    await selectReady();
+    emitDismiss({
+      conversationId: "other_view",
+      selectionId: selection.selectionId,
+      reason: "navigation",
+    });
+    expect(screen.getByRole("region", { name: "Design instruction" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Exit design mode" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+  });
+
+  it("does not let a delayed dismissal of the previous selection clear the current draft", async () => {
+    const { selectReady, emitDismiss } = await renderDesignPane();
+    await selectReady();
+    const next = {
+      ...selection,
+      selectionId: "selection-name",
+      element: { tag: "input", label: "Scenario name" },
+    };
+    const input = await selectReady(next);
+    fireEvent.change(input, { target: { value: "Rename this label" } });
+    emitDismiss({
+      conversationId: "conv_design",
+      selectionId: selection.selectionId,
+      reason: "replaced",
+    });
+    expect(input).toHaveValue("Rename this label");
+    expect(screen.getByText("Selected: Scenario name")).toBeInTheDocument();
+  });
+
+  it("clears a selection on navigation and disables mode when its document is replaced", async () => {
+    const { bridge, selectReady, emitUrl, emitSelection, emitDismiss } = await renderDesignPane();
+    await selectReady();
+    emitUrl();
+    expect(bridge.browserClearDesignSelection).toHaveBeenCalledWith(
+      "conv_design",
+      selection.selectionId,
+    );
+    emitSelection();
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+    emitDismiss({ conversationId: "conv_design", reason: "navigation" });
+    expect(screen.getByRole("button", { name: "Enter design mode" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    emitSelection({ ...selection, selectionId: "late-navigation" });
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+  });
+
+  it("does not send an already-claimed selection after the view navigates", async () => {
+    const claimed = deferred<{ ok: boolean; element: DesignModeSelection["element"] }>();
+    const { bridge, submit, selectReady, emitUrl } = await renderDesignPane();
+    bridge.browserTakeDesignSelection.mockReturnValue(claimed.promise);
+    const input = await selectReady();
+    fireEvent.change(input, { target: { value: "Make this blue" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    emitUrl();
+    await act(async () => claimed.resolve({ ok: true, element: selection.element }));
+    expect(submit).not.toHaveBeenCalled();
+    expect(screen.queryByRole("status")).toBeNull();
+  });
+
+  it("clears the instruction when design mode is disabled or the native view closes", async () => {
+    const { selectReady, emitClosed, bridge } = await renderDesignPane();
+    await selectReady();
+    fireEvent.click(screen.getByRole("button", { name: "Exit design mode" }));
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+    expect(bridge.browserDisableDesignMode).toHaveBeenCalledWith("conv_design");
+    fireEvent.click(screen.getByRole("button", { name: "Enter design mode" }));
+    await act(async () => {});
+    await selectReady({ ...selection, selectionId: "after-toggle" });
+    emitClosed();
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Enter design mode" })).toBeDisabled();
+  });
+
+  it("unsubscribes and cannot focus or send after unmount", async () => {
+    const resized = deferred<{ ok: boolean }>();
+    const { bridge, emitSelection, unmount, submit } = await renderDesignPane();
+    bridge.browserResize.mockReturnValue(resized.promise);
+    emitSelection();
+    unmount();
+    await act(async () => resized.resolve({ ok: true }));
+    emitSelection({ ...selection, selectionId: "late-unmount" });
+    expect(bridge.browserFocusDesignPrompt).not.toHaveBeenCalled();
+    expect(bridge.browserDisableDesignMode).toHaveBeenCalledWith("conv_design");
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("drops the previous view's selection and pending focus when its view key changes", async () => {
+    const resized = deferred<{ ok: boolean }>();
+    const { bridge, emitSelection, rerender, submit } = await renderDesignPane();
+    bridge.browserResize.mockReturnValue(resized.promise);
+    emitSelection();
+    rerender(<BrowserPane conversationId="another_view" onDesignPromptSubmit={submit} />);
+    await act(async () => resized.resolve({ ok: true }));
+    emitSelection({ ...selection, selectionId: "late-previous-view" });
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
+    expect(bridge.browserFocusDesignPrompt).not.toHaveBeenCalled();
+    expect(bridge.browserDisableDesignMode).toHaveBeenCalledWith("conv_design");
+    expect(screen.getByRole("button", { name: "Enter design mode" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("keeps a failed draft visible and does not report it as sent", async () => {
+    const submit = vi
+      .fn<(request: DesignModeSubmit) => Promise<void>>()
+      .mockRejectedValue(new Error("Runner unavailable."));
+    const { selectReady } = await renderDesignPane({}, submit);
+    const input = await selectReady();
+    fireEvent.change(input, { target: { value: "Keep this instruction" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Runner unavailable. Select the element again to retry.",
+    );
+    expect(input).toHaveValue("Keep this instruction");
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+  });
+
+  it("refuses to send when main rejects the selection ticket", async () => {
+    const { bridge, submit, selectReady } = await renderDesignPane();
+    bridge.browserTakeDesignSelection.mockResolvedValue({ ok: false, error: "Selection expired." });
+    const input = await selectReady();
+    fireEvent.change(input, { target: { value: "Make this blue" } });
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("Selection expired.");
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("leaves legacy desktop prompts available when shell capabilities are absent", async () => {
+    const submit = vi.fn();
+    const bridge = installBridge({ browserHasView: vi.fn().mockResolvedValue({ exists: true }) });
+    render(<BrowserPane conversationId="legacy" onDesignPromptSubmit={submit} />);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Enter design mode" })).toBeEnabled(),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Enter design mode" }));
+    expect(bridge.browserEnableDesignMode).toHaveBeenCalledWith("legacy");
+    expect(screen.queryByRole("region", { name: "Design instruction" })).toBeNull();
   });
 });

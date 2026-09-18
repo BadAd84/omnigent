@@ -23,6 +23,7 @@ import {
   WrenchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
+import type { DesignModeSelection, DesignModeSubmit } from "@/lib/browserDesignMode";
 import { supportsBrowser } from "@/lib/nativeBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
@@ -64,8 +65,32 @@ interface BrowserPaneBridge {
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
-  browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  browserEnableDesignMode?: (
+    conversationId: string,
+    options?: { promptHost: "shell" },
+  ) => Promise<{ ok: boolean; promptHost?: string; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  browserFocusDesignPrompt?: (
+    conversationId: string,
+    selectionId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  browserClearDesignSelection?: (
+    conversationId: string,
+    selectionId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  browserTakeDesignSelection?: (
+    conversationId: string,
+    selectionId: string,
+  ) => Promise<{
+    ok: boolean;
+    element?: DesignModeSelection["element"];
+    screenshot?: string | null;
+    error?: string;
+  }>;
+  onBrowserElementSelected?: (callback: (payload: DesignModeSelection) => void) => () => void;
+  onBrowserElementPromptDismiss?: (
+    callback: (payload: { conversationId: string; selectionId?: string; reason?: string }) => void,
+  ) => () => void;
   onBrowserHostActiveChanged?: (
     callback: (payload: { conversationId: string | null }) => void,
   ) => () => void;
@@ -101,6 +126,7 @@ export interface BrowserPaneProps {
   /** Native view key: the session ID or a session-scoped browser tab ID. */
   conversationId: string;
   agentBrowser?: boolean;
+  onDesignPromptSubmit?: (request: DesignModeSubmit) => Promise<void>;
   /** Extra classes for the measuring placeholder wrapper. */
   className?: string;
 }
@@ -109,8 +135,15 @@ export interface BrowserPaneProps {
  * Keeps the agent relay alive for a conversation and, once a native browser
  * view is attached, keeps that view positioned over a measuring placeholder.
  */
-export function BrowserPane({ conversationId, className, agentBrowser = true }: BrowserPaneProps) {
+export function BrowserPane({
+  conversationId,
+  className,
+  agentBrowser = true,
+  onDesignPromptSubmit,
+}: BrowserPaneProps) {
   const containerRef = useRef<HTMLDivElement | null>(null);
+  const viewIdRef = useRef(conversationId);
+  viewIdRef.current = conversationId;
   const lastBoundsRef = useRef<Bounds | null>(null);
   const browserSupported = supportsBrowser();
   // Whether a native view is attached for THIS conversation — drives when the
@@ -131,6 +164,61 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
+  const shellPromptRef = useRef(false);
+  const designEpochRef = useRef(0);
+  const selectionRef = useRef<DesignModeSelection | null>(null);
+  const invalidSelectionsRef = useRef(new Set<string>());
+  const sendingRef = useRef(false);
+  const instructionRef = useRef<HTMLInputElement | null>(null);
+  const [selection, setSelection] = useState<DesignModeSelection | null>(null);
+  const [instruction, setInstruction] = useState("");
+  const [instructionReady, setInstructionReady] = useState(false);
+  const [instructionSending, setInstructionSending] = useState(false);
+  const [instructionError, setInstructionError] = useState<string | null>(null);
+  const [instructionSent, setInstructionSent] = useState(false);
+
+  const clearDesignSelection = useCallback((clearNative = true) => {
+    const previous = selectionRef.current;
+    if (previous) invalidSelectionsRef.current.add(previous.selectionId);
+    designEpochRef.current += 1;
+    selectionRef.current = null;
+    sendingRef.current = false;
+    setSelection(null);
+    setInstruction("");
+    setInstructionReady(false);
+    setInstructionSending(false);
+    setInstructionError(null);
+    setInstructionSent(false);
+    if (clearNative && previous) {
+      void getBridge()
+        ?.browserClearDesignSelection?.(previous.conversationId, previous.selectionId)
+        .catch(() => {});
+    }
+  }, []);
+
+  // Every async continuation is tied to this mounted view and selection epoch.
+  useEffect(() => {
+    clearDesignSelection();
+    invalidSelectionsRef.current.clear();
+    designModeRef.current = false;
+    shellPromptRef.current = false;
+    setDesignMode(false);
+    return () => {
+      designEpochRef.current += 1;
+      const previous = selectionRef.current;
+      selectionRef.current = null;
+      if (previous) {
+        void getBridge()
+          ?.browserClearDesignSelection?.(previous.conversationId, previous.selectionId)
+          .catch(() => {});
+      }
+      if (designModeRef.current) {
+        void getBridge()?.browserDisableDesignMode?.(conversationId);
+      }
+      designModeRef.current = false;
+      shellPromptRef.current = false;
+    };
+  }, [conversationId, clearDesignSelection]);
 
   // Feed `viewActive` from three signals so the placeholder mounts exactly when
   // a view exists: (1) browser-view-created — first navigate (often detached,
@@ -142,6 +230,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     const bridge = getBridge();
     if (!bridge) return;
     let cancelled = false;
+    setViewActive(false);
 
     // (2) Re-show an already-created view when the pane remounts.
     void bridge.browserHasView?.(conversationId).then((r) => {
@@ -161,7 +250,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     // detach (null), means this pane's view is no longer the visible one.
     const unsubActive = bridge.onBrowserHostActiveChanged?.((payload) => {
       if (payload.conversationId === conversationId) setViewActive(true);
-      else if (payload.conversationId === null) setViewActive(false);
+      else setViewActive(false);
     });
     const unsubClosed = bridge.onBrowserViewClosed?.((payload) => {
       if (payload.conversationId === conversationId) setViewActive(false);
@@ -183,6 +272,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     if (!bridge) return;
     const unsubUrl = bridge.onBrowserUrlChanged?.((payload) => {
       if (payload.conversationId !== conversationId) return;
+      clearDesignSelection();
       if (urlEditingRef.current) return;
       setCurrentUrl(payload.url);
     });
@@ -195,7 +285,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
       unsubUrl?.();
       unsubNav?.();
     };
-  }, [conversationId, browserSupported]);
+  }, [conversationId, browserSupported, clearDesignSelection]);
 
   // ── Toolbar handlers ─────────────────────────────────────────────────────
 
@@ -208,6 +298,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
     const raw = currentUrl.trim();
     if (!raw) return;
     const navUrl = normalizeTypedUrl(raw);
+    clearDesignSelection();
     setNavigationError(null);
     void bridge
       .browserOpenOrNavigate(conversationId, navUrl, undefined, { force: true })
@@ -216,32 +307,35 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         else setNavigationError(result.error ?? "Unable to open this page.");
       })
       .catch(() => setNavigationError("Unable to open this page."));
-  }, [conversationId, currentUrl]);
+  }, [conversationId, currentUrl, clearDesignSelection]);
 
   const handleBack = useCallback(() => {
     const bridge = getBridge();
+    clearDesignSelection();
     void bridge?.browserGoBack?.(conversationId).then((r) => {
       if (r?.ok) {
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
       }
     });
-  }, [conversationId]);
+  }, [conversationId, clearDesignSelection]);
 
   const handleForward = useCallback(() => {
     const bridge = getBridge();
+    clearDesignSelection();
     void bridge?.browserGoForward?.(conversationId).then((r) => {
       if (r?.ok) {
         setCanGoBack(!!r.canGoBack);
         setCanGoForward(!!r.canGoForward);
       }
     });
-  }, [conversationId]);
+  }, [conversationId, clearDesignSelection]);
 
   const handleReload = useCallback(() => {
     const bridge = getBridge();
+    clearDesignSelection();
     void bridge?.browserReload?.(conversationId);
-  }, [conversationId]);
+  }, [conversationId, clearDesignSelection]);
 
   const handleDevTools = useCallback(() => {
     const bridge = getBridge();
@@ -251,25 +345,100 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   const handleToggleDesignMode = useCallback(() => {
     const bridge = getBridge();
     if (!bridge) return;
-    if (designMode) {
+    if (designModeRef.current) {
       designModeRef.current = false;
+      shellPromptRef.current = false;
+      clearDesignSelection();
       void bridge.browserDisableDesignMode?.(conversationId);
       setDesignMode(false);
     } else {
+      clearDesignSelection();
+      const epoch = designEpochRef.current;
+      const useShellPrompt = !!(
+        onDesignPromptSubmit &&
+        bridge.browserFocusDesignPrompt &&
+        bridge.browserClearDesignSelection &&
+        bridge.browserTakeDesignSelection &&
+        bridge.onBrowserElementSelected
+      );
       designModeRef.current = true;
-      void bridge.browserEnableDesignMode?.(conversationId);
       setDesignMode(true);
+      const activation = useShellPrompt
+        ? bridge.browserEnableDesignMode?.(conversationId, { promptHost: "shell" })
+        : bridge.browserEnableDesignMode?.(conversationId);
+      void activation
+        ?.then((result) => {
+          if (designEpochRef.current !== epoch || !designModeRef.current) return;
+          shellPromptRef.current = useShellPrompt && result.ok && result.promptHost === "shell";
+          if (!result.ok) {
+            designModeRef.current = false;
+            setDesignMode(false);
+            setNavigationError(result.error ?? "Unable to start design mode.");
+          }
+        })
+        .catch(() => {
+          if (designEpochRef.current !== epoch || !designModeRef.current) return;
+          designModeRef.current = false;
+          setDesignMode(false);
+          setNavigationError("Unable to start design mode.");
+        });
     }
-  }, [conversationId, designMode]);
+  }, [conversationId, clearDesignSelection, onDesignPromptSubmit]);
 
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
   useEffect(() => {
     if (!viewActive && designMode) {
       designModeRef.current = false;
+      shellPromptRef.current = false;
+      clearDesignSelection();
       setDesignMode(false);
     }
-  }, [viewActive, designMode]);
+  }, [viewActive, designMode, clearDesignSelection]);
+
+  useEffect(() => {
+    const bridge = getBridge();
+    if (!bridge || !viewActive) return;
+    const unsubscribeSelection = bridge.onBrowserElementSelected?.((payload) => {
+      if (
+        payload.conversationId !== conversationId ||
+        payload.conversationId !== viewIdRef.current ||
+        !payload.selectionId ||
+        invalidSelectionsRef.current.has(payload.selectionId) ||
+        selectionRef.current?.selectionId === payload.selectionId ||
+        !payload.element ||
+        !designModeRef.current ||
+        !shellPromptRef.current
+      )
+        return;
+      clearDesignSelection(false);
+      selectionRef.current = payload;
+      setSelection(payload);
+    });
+    const unsubscribeDismiss = bridge.onBrowserElementPromptDismiss?.((payload) => {
+      if (
+        payload.conversationId !== conversationId ||
+        payload.conversationId !== viewIdRef.current ||
+        payload.reason === "taken" ||
+        (payload.selectionId &&
+          selectionRef.current &&
+          payload.selectionId !== selectionRef.current.selectionId)
+      )
+        return;
+      if (["navigation", "disabled", "closed"].includes(payload.reason ?? "")) {
+        designModeRef.current = false;
+        shellPromptRef.current = false;
+        setDesignMode(false);
+      }
+      if (!payload.selectionId || payload.selectionId === selectionRef.current?.selectionId) {
+        clearDesignSelection(false);
+      }
+    });
+    return () => {
+      unsubscribeSelection?.();
+      unsubscribeDismiss?.();
+    };
+  }, [conversationId, viewActive, clearDesignSelection]);
 
   // Measure the placeholder and push bounds to the main process. These are
   // renderer CSS pixels; the main process converts to WebContentsView DIPs
@@ -277,7 +446,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
   const syncBounds = useCallback(
     (force = false) => {
       const bridge = getBridge();
-      if (!containerRef.current || !bridge?.browserResize) return;
+      if (!containerRef.current || !bridge?.browserResize) return Promise.resolve(null);
       const rect = containerRef.current.getBoundingClientRect();
       const bounds: Bounds = {
         x: Math.round(rect.left),
@@ -286,7 +455,7 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         height: Math.round(rect.height),
         devicePixelRatio: window.devicePixelRatio,
       };
-      if (bounds.width <= 0 || bounds.height <= 0) return;
+      if (bounds.width <= 0 || bounds.height <= 0) return Promise.resolve(null);
       const last = lastBoundsRef.current;
       if (
         !force &&
@@ -297,13 +466,104 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
         last.height === bounds.height &&
         last.devicePixelRatio === bounds.devicePixelRatio
       ) {
-        return;
+        return Promise.resolve(null);
       }
       lastBoundsRef.current = bounds;
-      void bridge.browserResize(conversationId, bounds);
+      return bridge.browserResize(conversationId, bounds).catch(() => {
+        lastBoundsRef.current = null;
+        return { ok: false, error: "Unable to resize the browser preview." };
+      });
     },
     [conversationId],
   );
+
+  useEffect(() => {
+    if (!selection || !viewActive) return;
+    const epoch = designEpochRef.current;
+    let cancelled = false;
+    const isCurrent = () =>
+      !cancelled &&
+      viewIdRef.current === conversationId &&
+      epoch === designEpochRef.current &&
+      selectionRef.current === selection &&
+      designModeRef.current;
+    void (async () => {
+      try {
+        // Resize first: a native view paints over DOM regardless of z-index.
+        const resized = await syncBounds(true);
+        if (!isCurrent()) return;
+        if (!resized?.ok) throw new Error("Unable to make room for the instruction bar.");
+        const focused = await getBridge()?.browserFocusDesignPrompt?.(
+          conversationId,
+          selection.selectionId,
+        );
+        if (!isCurrent()) return;
+        if (!focused?.ok) throw new Error(focused?.error ?? "The selection is no longer active.");
+        setInstructionReady(true);
+      } catch (error) {
+        if (!isCurrent()) return;
+        setInstructionError(
+          `${error instanceof Error ? error.message : "Unable to focus the instruction bar."} Select the element again to retry.`,
+        );
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, selection, viewActive, syncBounds]);
+
+  useEffect(() => {
+    if (instructionReady && selectionRef.current === selection) instructionRef.current?.focus();
+  }, [instructionReady, selection]);
+
+  const submitDesignInstruction = useCallback(async () => {
+    const selected = selectionRef.current;
+    const prompt = instruction.trim();
+    const bridge = getBridge();
+    if (
+      !selected ||
+      !prompt ||
+      !instructionReady ||
+      sendingRef.current ||
+      !onDesignPromptSubmit ||
+      !bridge?.browserTakeDesignSelection
+    )
+      return;
+    const epoch = designEpochRef.current;
+    const isCurrent = () =>
+      designEpochRef.current === epoch &&
+      viewIdRef.current === conversationId &&
+      selectionRef.current === selected &&
+      designModeRef.current;
+    sendingRef.current = true;
+    setInstructionSending(true);
+    setInstructionError(null);
+    try {
+      const claimed = await bridge.browserTakeDesignSelection(conversationId, selected.selectionId);
+      if (!isCurrent()) return;
+      if (!claimed.ok || !claimed.element) {
+        throw new Error(claimed.error ?? "The selection is no longer active.");
+      }
+      await onDesignPromptSubmit({
+        conversationId,
+        selectionId: selected.selectionId,
+        element: claimed.element,
+        screenshot: claimed.screenshot ?? null,
+        prompt,
+      });
+      if (!isCurrent()) return;
+      clearDesignSelection(false);
+      setInstructionSent(true);
+    } catch (error) {
+      if (!isCurrent()) return;
+      sendingRef.current = false;
+      setInstructionSending(false);
+      setInstructionReady(false);
+      setInstructionError(
+        `${error instanceof Error ? error.message : "Unable to send this instruction."} Select the element again to retry.`,
+      );
+    }
+  }, [conversationId, instruction, instructionReady, onDesignPromptSubmit, clearDesignSelection]);
 
   // Attach this conversation's view to the host window when the placeholder is
   // present; DETACH (not destroy) on unmount so a background agent's page keeps
@@ -499,12 +759,81 @@ export function BrowserPane({ conversationId, className, agentBrowser = true }: 
           {navigationError}
         </div>
       )}
+      {selection && (
+        <section
+          aria-label="Design instruction"
+          className="shrink-0 border-border border-b bg-primary/5 px-2 py-2"
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <span className="max-w-36 shrink-0 truncate text-foreground text-xs">
+              Selected:{" "}
+              {(
+                selection.element.label ||
+                selection.element.ariaLabel ||
+                selection.element.text ||
+                selection.element.id ||
+                selection.element.tag ||
+                "element"
+              ).slice(0, 120)}
+            </span>
+            <input
+              ref={instructionRef}
+              type="text"
+              aria-label="Describe the change"
+              placeholder="Describe the change…"
+              value={instruction}
+              disabled={!instructionReady || instructionSending}
+              onChange={(event) => setInstruction(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                if (event.key === "Enter") {
+                  event.preventDefault();
+                  void submitDesignInstruction();
+                } else if (event.key === "Escape") {
+                  event.preventDefault();
+                  clearDesignSelection();
+                }
+              }}
+              className="h-8 min-w-0 flex-1 rounded-md border border-input bg-background px-2 text-foreground text-sm outline-none placeholder:text-muted-foreground focus-visible:border-ring disabled:opacity-60"
+            />
+            <button
+              type="button"
+              disabled={!instructionReady || !instruction.trim() || instructionSending}
+              onClick={() => void submitDesignInstruction()}
+              className="h-8 shrink-0 rounded-md bg-primary px-3 font-medium text-primary-foreground text-xs disabled:opacity-50"
+            >
+              {instructionSending ? "Sending…" : "Send"}
+            </button>
+            <button
+              type="button"
+              disabled={instructionSending}
+              onClick={() => clearDesignSelection()}
+              className="h-8 shrink-0 rounded-md px-2 text-foreground text-xs hover:bg-muted disabled:opacity-50"
+            >
+              Cancel
+            </button>
+          </div>
+          {instructionError && (
+            <p role="alert" className="mt-1 text-destructive text-xs">
+              {instructionError}
+            </p>
+          )}
+        </section>
+      )}
+      {instructionSent && (
+        <div
+          role="status"
+          className="shrink-0 border-border border-b px-2 py-1.5 text-muted-foreground text-xs"
+        >
+          Instruction sent to chat.
+        </div>
+      )}
       {viewActive ? (
         /* Measuring region — the native WebContentsView paints over this.
            flex-1 min-h-0 so it fills everything BELOW the toolbar; its rect
            is what syncBounds() pushes. Mounted only while viewActive so the
            effects never measure an empty div. */
-        <div ref={containerRef} className="min-h-0 min-w-0 flex-1" />
+        <div ref={containerRef} data-browser-viewport className="min-h-0 min-w-0 flex-1" />
       ) : (
         <div className="flex min-h-0 flex-1 items-center justify-center bg-card px-6 py-8 text-center text-muted-foreground text-ui">
           Enter a URL above to get started

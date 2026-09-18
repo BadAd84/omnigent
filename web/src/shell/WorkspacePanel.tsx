@@ -42,6 +42,7 @@ import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Spinner } from "@/components/ui/spinner";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { BrowserPane } from "@/components/BrowserPane/BrowserPane";
+import type { DesignModeSubmit } from "@/lib/browserDesignMode";
 import { useBrowserTabs } from "@/hooks/useBrowserTabs";
 import { useSideChats } from "@/hooks/useSideChats";
 import { SideChatPane } from "@/components/chat/SideChatPane";
@@ -615,6 +616,8 @@ interface WorkspacePanelProps {
   /** Whether the Browser tab is available — Electron shell only (hidden in a
    *  plain web build, which has no embedded WebContentsView). */
   showBrowserTab: boolean;
+  /** Send a selected browser element's instruction through the session chat. */
+  onDesignPromptSubmit?: (request: DesignModeSubmit) => Promise<void>;
   /** Count of changed files, shown as the Changes tab badge. */
   changedCount: number;
   /** How many child agents are actively working (Agents tab badge). */
@@ -714,6 +717,7 @@ function WorkspacePanelImpl({
   showFilesPanel,
   showGithubTab,
   showBrowserTab,
+  onDesignPromptSubmit,
   changedCount,
   subagentsWorking,
   agentCount,
@@ -1287,6 +1291,7 @@ function WorkspacePanelImpl({
             key={browsers.viewId}
             conversationId={browsers.viewId}
             agentBrowser={browsers.selected === null}
+            onDesignPromptSubmit={onDesignPromptSubmit}
             className="min-h-0 flex-1"
           />
         ) : rightRailTab === "github" && showGithubTab ? (

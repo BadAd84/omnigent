@@ -148,6 +148,8 @@ import { isNativeTerminalSession as isNativeTerminalSessionFn } from "@/lib/nati
 import type { StoredReplyDraft } from "@/lib/replyDraft";
 
 export interface SendOptions {
+  /** Let alternate composers show failures after the normal chat recovery runs. */
+  rejectOnError?: boolean;
   /** Client-only quote provenance, retained if the composer needs to retry. */
   replyDraft?: StoredReplyDraft;
   /**
@@ -2094,6 +2096,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    let denied = false;
 
     try {
       await waitForPrior();
@@ -2145,6 +2148,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // bubble. Settle local state from the POST response instead of
       // depending on the live stream being connected.
       if (postResult.denied) {
+        denied = true;
         // Target the session this send posted to: the user may have navigated
         // away while the POST was open, and settling the VISIBLE conversation
         // would clobber an unrelated chat's composer state.
@@ -2247,11 +2251,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // is still running.
         failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
       }
+      if (opts?.rejectOnError) throw err;
     } finally {
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
     }
+    if (denied && opts?.rejectOnError) throw new Error("The instruction was blocked by policy.");
   },
 
   sendSlashCommand: async (name, args, agentId, opts) => {

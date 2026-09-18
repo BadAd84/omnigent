@@ -2,6 +2,8 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
+import { BrowserPane, type BrowserPaneProps } from "@/components/BrowserPane/BrowserPane";
+import type { DesignModeSubmit } from "@/lib/browserDesignMode";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
@@ -31,9 +33,9 @@ vi.mock("./SubagentsPanel", () => ({
   SubagentsPanel: () => <div data-testid="subagents-stub" />,
 }));
 vi.mock("@/components/BrowserPane/BrowserPane", () => ({
-  BrowserPane: ({ conversationId }: { conversationId: string }) => (
+  BrowserPane: vi.fn(({ conversationId }: BrowserPaneProps) => (
     <div data-testid="browser-pane-stub">{conversationId}</div>
-  ),
+  )),
 }));
 // The rail terminal view mounts a real xterm/WebSocket; stub it to a marker
 // echoing the terminal id it was asked to attach so we can prove the right
@@ -87,6 +89,7 @@ function renderWorkspace(
     changedCount?: number;
     showGithubTab?: boolean;
     showBrowserTab?: boolean;
+    onDesignPromptSubmit?: (request: DesignModeSubmit) => Promise<void>;
     openTerminals?: string[];
     selectedTerminalKey?: string | null;
     maximized?: boolean;
@@ -117,6 +120,7 @@ function renderWorkspace(
         showFilesPanel
         showGithubTab={overrides.showGithubTab ?? false}
         showBrowserTab={overrides.showBrowserTab ?? false}
+        onDesignPromptSubmit={overrides.onDesignPromptSubmit}
         changedCount={overrides.changedCount ?? 0}
         subagentsWorking={0}
         agentCount={1}
@@ -774,6 +778,14 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
+  it("passes the session's design submit handler to the selected browser pane", () => {
+    const onDesignPromptSubmit = vi.fn().mockResolvedValue(undefined);
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser", onDesignPromptSubmit });
+    expect(vi.mocked(BrowserPane).mock.calls.at(-1)?.[0].onDesignPromptSubmit).toBe(
+      onDesignPromptSubmit,
+    );
+  });
+
   it("offers browsers without shell access and creates multiple closable tabs", async () => {
     renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
     const openBrowser = async () => {

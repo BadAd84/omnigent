@@ -13,6 +13,10 @@ const { buildDesignModeScript } = require("./designModeScript");
 // Max age of a real native input event for a design-mode submit marker to be
 // honored (see the gesture gate below). Covers click/Enter → console.log.
 const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
+const DESIGN_SELECTION_MAX_BYTES = 16_384;
+const CLEAR_DESIGN_SELECTION_JS =
+  "window.__omniClearDesignSelection && window.__omniClearDesignSelection()";
+const DISABLE_DESIGN_MODE_JS = "window.__omniDisableDesignMode && window.__omniDisableDesignMode()";
 
 /**
  * Detach design-mode listeners (console-message + input-event) off an entry and
@@ -20,8 +24,16 @@ const DESIGN_MODE_GESTURE_WINDOW_MS = 1500;
  *
  * @param {object} entry registry entry
  */
-function detachDesignModeListeners(entry) {
+function detachDesignModeListeners(entry, reason = "disabled", { notify = true } = {}) {
   if (!entry) return;
+  const activation = entry.designModeActivation;
+  if (activation) {
+    activation.invalidate(reason, { notify });
+    activation.removeLifecycleListeners();
+    entry.designModeActivation = null;
+  }
+  entry.invalidateDesignSelection = null;
+  entry.disposeDesignMode = null;
   const wc = entry.designModeWebContents;
   if (wc) {
     if (entry.designModeListener) {
@@ -42,6 +54,140 @@ function detachDesignModeListeners(entry) {
   entry.designModeListener = null;
   entry.designModeInputListener = null;
   entry.designModeWebContents = null;
+}
+
+function runPickerScript(webContents, script) {
+  try {
+    void webContents.executeJavaScript(script).catch(() => {});
+  } catch {
+    /* view navigated or closed */
+  }
+}
+
+function sanitizeDesignElement(info) {
+  if (!info || typeof info !== "object" || Array.isArray(info)) return null;
+  if (typeof info.tag !== "string" || !info.tag.trim()) return null;
+  const element = {};
+  for (const key of [
+    "tag",
+    "id",
+    "classes",
+    "text",
+    "testId",
+    "ariaLabel",
+    "label",
+    "role",
+    "component",
+  ]) {
+    if (typeof info[key] === "string") {
+      element[key] = info[key].replace(/\s+/g, " ").trim().slice(0, 200);
+    }
+  }
+  return element;
+}
+
+function designSelectionCrop(rect, view) {
+  if (!rect || ![rect.x, rect.y, rect.width, rect.height].every(Number.isFinite)) return null;
+  if (rect.width <= 0 || rect.height <= 0) return null;
+  const bounds = view.getBounds();
+  const zoom = view.webContents.getZoomFactor() || 1;
+  const width = Math.min(bounds.width, 8192);
+  const height = Math.min(bounds.height, 8192);
+  const x = Math.max(0, Math.floor(rect.x * zoom));
+  const y = Math.max(0, Math.floor(rect.y * zoom));
+  const right = Math.min(width, Math.ceil((rect.x + rect.width) * zoom));
+  const bottom = Math.min(height, Math.ceil((rect.y + rect.height) * zoom));
+  return right > x && bottom > y ? { x, y, width: right - x, height: bottom - y } : null;
+}
+
+function createDesignModeActivation(entry, registry, conversationId, owner, send, promptHost) {
+  const wc = entry.view.webContents;
+  const gestureState = { lastGestureAt: 0, lastMouseDownAt: 0 };
+  const state = {
+    promptHost,
+    owner,
+    selection: null,
+    gestureState,
+    isCurrent: () => entry.designModeActivation === state && !wc.isDestroyed(),
+    isActive: () => registry.activeConversationId() === conversationId && !registry.isSuppressed(),
+    invalidate(reason, { notify = true, clearHighlight = true } = {}) {
+      const selectionId = state.selection?.id;
+      state.selection = null;
+      gestureState.lastGestureAt = 0;
+      gestureState.lastMouseDownAt = 0;
+      if (notify && promptHost === "shell") {
+        send("browser-element-prompt-dismiss", { conversationId, selectionId, reason });
+      }
+      if (clearHighlight && promptHost === "shell") {
+        runPickerScript(wc, CLEAR_DESIGN_SELECTION_JS);
+      }
+    },
+    removeLifecycleListeners() {
+      wc.removeListener("did-start-navigation", onNavigation);
+      wc.removeListener("did-navigate-in-page", onInPageNavigation);
+      wc.removeListener("destroyed", onDestroyed);
+    },
+  };
+  function onNavigation(event, _url, isInPlace, isMainFrame) {
+    if ((event.isMainFrame ?? isMainFrame) === false) return;
+    if (event.isSameDocument ?? isInPlace) return;
+    detachDesignModeListeners(entry, "navigation");
+    runPickerScript(wc, DISABLE_DESIGN_MODE_JS);
+  }
+  function onInPageNavigation(_event, _url, isMainFrame) {
+    if (isMainFrame) state.invalidate("navigated-in-page");
+  }
+  function onDestroyed() {
+    detachDesignModeListeners(entry, "closed");
+  }
+  wc.on("did-start-navigation", onNavigation);
+  wc.on("did-navigate-in-page", onInPageNavigation);
+  wc.on("destroyed", onDestroyed);
+  entry.designModeActivation = state;
+  entry.invalidateDesignSelection = (reason) => state.invalidate(reason);
+  entry.disposeDesignMode = (reason) => detachDesignModeListeners(entry, reason);
+  return state;
+}
+
+async function selectForShell(conversationId, entry, send, activation, info) {
+  if (!activation.isCurrent() || !activation.isActive()) return;
+  const element = sanitizeDesignElement(info);
+  if (!element) return;
+  const clickedAt = activation.gestureState.lastMouseDownAt;
+  const age = Date.now() - clickedAt;
+  if (!clickedAt || age < 0 || age > DESIGN_MODE_GESTURE_WINDOW_MS) return;
+  activation.gestureState.lastMouseDownAt = 0;
+  if (activation.selection) activation.invalidate("replaced", { clearHighlight: false });
+  const selection = {
+    id: crypto.randomUUID(),
+    element,
+    screenshot: null,
+    ready: false,
+    focused: false,
+    clickedAt,
+  };
+  activation.selection = selection;
+  try {
+    const crop = designSelectionCrop(info.rect, entry.view);
+    if (crop) {
+      const image = await entry.view.webContents.capturePage(crop);
+      const png = image.toPNG();
+      if (png.length <= 8 * 1024 * 1024) {
+        selection.screenshot = "data:image/png;base64," + png.toString("base64");
+      }
+    }
+  } catch {
+    /* Selection remains usable without a screenshot. */
+  }
+  if (!activation.isCurrent() || !activation.isActive() || activation.selection !== selection)
+    return;
+  selection.ready = true;
+  send("browser-element-selected", {
+    conversationId,
+    selectionId: selection.id,
+    element,
+    screenshot: selection.screenshot,
+  });
 }
 
 /**
@@ -165,15 +311,40 @@ function attachNavListeners({ conversationId, webContents, send }) {
  * @param {{ lastGestureAt: number }} gestureState  updated by the input-event listener
  * @returns {(event: unknown, level: unknown, message: unknown) => void}
  */
-function makeDesignModeConsoleHandler(conversationId, entry, send, nonce, gestureState) {
+function makeDesignModeConsoleHandler(
+  conversationId,
+  entry,
+  send,
+  nonce,
+  gestureState,
+  activation = null,
+) {
   const SELECT = `__omni_${nonce}_element_select__`;
   const SUBMIT = `__omni_${nonce}_element_prompt_submit__`;
   const DISMISS = `__omni_${nonce}_element_dismiss__`;
-  return (_event, _level, message) => {
+  return (event, _level, legacyMessage) => {
     // The webContents may be destroyed mid-callback during teardown; bail
     // rather than fire against a dead object.
     if (!entry || !entry.view || entry.view.webContents.isDestroyed?.()) return;
+    if (activation && !activation.isCurrent()) return;
+    const message = event.message ?? legacyMessage;
     if (typeof message !== "string") return;
+    if (activation?.promptHost === "shell") {
+      if (event.frame !== entry.view.webContents.mainFrame) return;
+      if (!message.startsWith(SELECT) || message.length > DESIGN_SELECTION_MAX_BYTES) return;
+      try {
+        void selectForShell(
+          conversationId,
+          entry,
+          send,
+          activation,
+          JSON.parse(message.slice(SELECT.length)),
+        );
+      } catch {
+        /* Untrusted page metadata is not a shell command. */
+      }
+      return;
+    }
     // Nonce gate: any marker whose prefix doesn't carry THIS view's nonce is
     // ignored outright (stops cross-realm/iframe forgery).
     if (message.startsWith(SELECT)) {
@@ -192,8 +363,8 @@ function makeDesignModeConsoleHandler(conversationId, entry, send, nonce, gestur
             screenshotDataUrl = "data:image/png;base64," + image.toPNG().toString("base64");
           }
           send("browser-element-selected", {
-            conversationId,
             ...info,
+            conversationId,
             screenshot: screenshotDataUrl,
           });
         } catch (e) {
@@ -213,7 +384,7 @@ function makeDesignModeConsoleHandler(conversationId, entry, send, nonce, gestur
       }
       try {
         const payload = JSON.parse(message.slice(SUBMIT.length));
-        send("browser-element-prompt-submit", { conversationId, ...payload });
+        send("browser-element-prompt-submit", { ...payload, conversationId });
       } catch (e) {
         console.error("[design-mode]", e);
       }
@@ -240,6 +411,13 @@ function makeDesignModeInputHandler(gestureState) {
     // mouseDown = click-to-select; keyDown = Enter-to-submit; rawKeyDown = pre-IME.
     if (type === "mouseDown" || type === "keyDown" || type === "rawKeyDown") {
       gestureState.lastGestureAt = Date.now();
+    }
+    if (type === "mouseDown") {
+      gestureState.lastMouseDownAt = input.modifiers?.some(
+        (modifier) => modifier === "middlebuttondown" || modifier === "rightbuttondown",
+      )
+        ? 0
+        : Date.now();
     }
   };
 }
@@ -280,6 +458,63 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
       /* window torn down */
     }
   };
+
+  function currentDesignSelection(event, args) {
+    const gate = gateRegistry(event);
+    if (gate.error) return { error: gate.error };
+    const entry = gate.registry.get(args?.conversationId);
+    const activation = entry?.designModeActivation;
+    if (
+      !activation ||
+      activation.promptHost !== "shell" ||
+      activation.owner !== event.sender ||
+      !activation.isCurrent() ||
+      !activation.isActive()
+    ) {
+      return { error: "No active shell design picker" };
+    }
+    const selection = activation.selection;
+    if (
+      !selection?.ready ||
+      typeof args?.selectionId !== "string" ||
+      selection.id !== args.selectionId
+    ) {
+      return { error: "The selected element is no longer current" };
+    }
+    return { activation, selection };
+  }
+
+  ipcMain.handle("omnigent:browser-focus-design-prompt", (event, args) => {
+    const current = currentDesignSelection(event, args);
+    if (current.error) return { ok: false, error: current.error };
+    const { selection } = current;
+    if (selection.focused || Date.now() - selection.clickedAt > DESIGN_MODE_GESTURE_WINDOW_MS) {
+      return { ok: false, error: "The selection focus gesture has expired" };
+    }
+    selection.focused = true;
+    try {
+      event.sender.focus();
+      return { ok: true };
+    } catch {
+      return { ok: false, error: "The prompt window is unavailable" };
+    }
+  });
+
+  ipcMain.handle("omnigent:browser-clear-design-selection", (event, args) => {
+    const current = currentDesignSelection(event, args);
+    if (current.error) return { ok: false, error: current.error };
+    current.activation.invalidate("cleared");
+    return { ok: true };
+  });
+
+  ipcMain.handle("omnigent:browser-take-design-selection", (event, args) => {
+    const current = currentDesignSelection(event, args);
+    if (current.error) return { ok: false, error: current.error };
+    const { element, screenshot } = current.selection;
+    // The initiating shell owns pending/success UI; do not dismiss its row.
+    current.activation.invalidate("taken", { notify: false });
+    return { ok: true, element, screenshot };
+  });
 
   // Open (create-if-absent) or navigate a conversation's view, and measure it
   // into place. `force` reloads even on the same URL (agent "bring me back"
@@ -408,7 +643,7 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goBack(entry.view.webContents);
+    if (goBack(entry.view.webContents)) entry.invalidateDesignSelection?.("navigation");
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -417,7 +652,7 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
-    goForward(entry.view.webContents);
+    if (goForward(entry.view.webContents)) entry.invalidateDesignSelection?.("navigation");
     return { ok: true, ...readNavState(entry.view.webContents) };
   });
 
@@ -426,6 +661,7 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (g.error) return { ok: false, error: g.error };
     const entry = g.registry.get(args?.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    entry.invalidateDesignSelection?.("navigation");
     try {
       entry.view.webContents.reload();
     } catch {
@@ -463,24 +699,40 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
   ipcMain.handle("omnigent:browser-enable-design-mode", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
-    const { conversationId } = args ?? {};
+    const { conversationId, opts } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    const promptHost = opts?.promptHost ?? "page";
+    if (promptHost !== "page" && promptHost !== "shell") {
+      return { ok: false, error: "Unsupported design prompt host" };
+    }
+    if (
+      promptHost === "shell" &&
+      (g.registry.activeConversationId() !== conversationId || g.registry.isSuppressed())
+    ) {
+      return { ok: false, error: "The browser view is not active" };
+    }
+    let activation;
     try {
-      // Fresh per-enable nonce baked into the injected script's marker prefixes.
+      // Replacing an activation must not disable the shell's new picker state.
+      detachDesignModeListeners(entry, "disabled", { notify: false });
+      activation = createDesignModeActivation(
+        entry,
+        g.registry,
+        conversationId,
+        event.sender,
+        senderFor(event),
+        promptHost,
+      );
       const nonce = crypto.randomBytes(16).toString("hex");
-      await entry.view.webContents.executeJavaScript(buildDesignModeScript(nonce));
-      // Detach prior handlers so toggling on/off doesn't stack listeners.
-      detachDesignModeListeners(entry);
-      // Shared gesture state: input-event listener stamps the last native press;
-      // the console handler requires a recent stamp before honoring a submit.
-      const gestureState = { lastGestureAt: 0 };
+      const gestureState = activation.gestureState;
       const consoleHandler = makeDesignModeConsoleHandler(
         conversationId,
         entry,
         senderFor(event),
         nonce,
         gestureState,
+        activation,
       );
       const inputHandler = makeDesignModeInputHandler(gestureState);
       entry.designModeListener = consoleHandler;
@@ -488,8 +740,13 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
       entry.designModeWebContents = entry.view.webContents;
       entry.designModeWebContents.on("console-message", consoleHandler);
       entry.designModeWebContents.on("input-event", inputHandler);
-      return { ok: true };
+      await entry.view.webContents.executeJavaScript(
+        `${DISABLE_DESIGN_MODE_JS};\n${buildDesignModeScript(nonce, { promptHost })}`,
+      );
+      if (!activation.isCurrent()) return { ok: false, error: "Design mode was interrupted" };
+      return { ok: true, promptHost };
     } catch (e) {
+      if (entry.designModeActivation === activation) detachDesignModeListeners(entry);
       const msg = e && e.message ? e.message : String(e);
       if (msg.includes("Object has been destroyed")) return { ok: false, error: "browser closed" };
       return { ok: false, error: msg };
@@ -504,9 +761,7 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (!entry) return { ok: false };
     detachDesignModeListeners(entry);
     try {
-      await entry.view.webContents.executeJavaScript(
-        "window.__omniDisableDesignMode && window.__omniDisableDesignMode()",
-      );
+      await entry.view.webContents.executeJavaScript(DISABLE_DESIGN_MODE_JS);
     } catch {
       /* destroyed */
     }
@@ -522,6 +777,9 @@ function registerBrowserIpc({ ipcMain, isPinnedOriginSender, getRegistryForEvent
     if (!payload || typeof payload !== "object") return { ok: false, error: "bad payload" };
     const entry = g.registry.get(payload.conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
+    if (entry.designModeActivation?.promptHost === "shell") {
+      return { ok: false, error: "Design prompt feedback belongs to the shell" };
+    }
     const safe = {
       id: typeof payload.id === "number" ? payload.id : 0,
       ok: !!payload.ok,

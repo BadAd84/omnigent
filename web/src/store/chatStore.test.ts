@@ -2347,6 +2347,41 @@ describe("chatStore — send (first-send ordering)", () => {
     });
   });
 
+  it("optionally rejects an alternate composer's send after preserving failure recovery", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      pendingUserMessages: [],
+      blocks: [],
+      status: "idle",
+    });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse(
+          { error: { code: "internal_error", message: "send failed" } },
+          { ok: false, status: 500 },
+        );
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(
+      useChatStore.getState().send("design instruction", "agent_xyz", undefined, {
+        rejectOnError: true,
+        pinnedConversationId: "conv_existing",
+      }),
+    ).rejects.toThrow("send failed");
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().status).toBe("idle");
+    expect(useChatStore.getState().failedSendDraft).toMatchObject({
+      conversationId: "conv_existing",
+      text: "design instruction",
+    });
+    expect(useChatStore.getState().blocks).toContainEqual(
+      expect.objectContaining({ type: "error", message: "send failed" }),
+    );
+  });
+
   it("carries a non-runner send failure's own message into the error block", async () => {
     // A generic failure (not runner_unavailable) must still become visible,
     // using the server-provided message and code so it isn't swallowed.
@@ -2453,6 +2488,37 @@ describe("chatStore — send (first-send ordering)", () => {
     ]);
     expect(state.status).toBe("streaming");
     expect(state.sessionStatus).toBe("running");
+  });
+
+  it("reports policy denial to alternate composers without replacing a running response", async () => {
+    const activeResponse = { responseId: "response-1", state: "streaming" as const, error: null };
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      status: "streaming",
+      sessionStatus: "running",
+      activeResponse,
+      failedSendDraft: null,
+      blocks: [],
+    });
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        return mockResponse({ queued: false, denied: true });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await expect(
+      useChatStore.getState().send("blocked by policy", "agent_xyz", undefined, {
+        rejectOnError: true,
+        pinnedConversationId: "conv_existing",
+      }),
+    ).rejects.toThrow("blocked by policy");
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(useChatStore.getState().activeResponse).toEqual(activeResponse);
+    expect(useChatStore.getState().status).toBe("streaming");
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(useChatStore.getState().blocks).toEqual([]);
   });
 
   it("duplicate-bind: navigation-triggered switchTo after first send is a no-op", async () => {

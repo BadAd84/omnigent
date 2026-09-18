@@ -81,6 +81,36 @@ point the handoff at the one that shows the failure — don't assume the largest
 As with every lane, recordings are workspace artifacts — leave them
 uncommitted; CI's artifact bundle collects them.
 
+## Design instructions over modal forms
+
+`desktop_design_prompt.e2e.js` runs the real SPA, local server, runner, and mock
+model against a native-dialog form. It verifies ordinary form editing, native
+focus transfer to the shell-owned instruction bar, typing without changing the
+page's Period field, cancellation, normal chat submission with a screenshot, and
+re-enabling Design mode after reloading the shell.
+
+Run on an interactive desktop and keep the test app foregrounded for the native
+focus assertions.
+
+```bash
+# From the repository root, after installing frontend and Python dependencies:
+pnpm --filter web run build
+OMNIGENT_PYTHON="$PWD/.venv/bin/python" \
+  node --test web/electron/e2e/desktop_design_prompt.e2e.js
+```
+
+Set `OMNIGENT_DESKTOP_EXECUTABLE` to a packaged desktop binary to test that build.
+For a Radix-dialog reproduction, set `OMNIGENT_DESKTOP_FORM_URL` to a local fixture
+with a labeled `#scenario-period` field initially containing `W41`.
+
+On macOS, `OMNIGENT_DESKTOP_COMPOSITED_VIDEO=1` records the entire native window
+using `screencapture` (requires Screen Recording permission). Set
+`OMNIGENT_DESKTOP_RECORD_DIR` to an artifact directory outside the checkout.
+The resulting `design-prompt-native.mov` includes both the instruction bar and
+embedded form; Playwright's separate renderer videos do **not** show their
+native composition. The test uses targeted Chromium input and explicitly checks
+native webContents focus before typing; it does not set form values via JavaScript.
+
 ## Authoring a desktop reproduction
 
 1. Copy `desktop_connect.e2e.js` to `e2e/desktop_<slug>.e2e.js`.

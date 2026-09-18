@@ -365,10 +365,20 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   /**
    * Inject the design-mode picker into the conversation's view.
    * @param {string} conversationId
-   * @returns {Promise<{ ok: boolean, error?: string }>}
+   * @param {{promptHost?: "shell" | "page"}} [opts]
+   * @returns {Promise<{ ok: boolean, promptHost?: "shell" | "page", error?: string }>}
    */
-  browserEnableDesignMode: (conversationId) =>
-    ipcRenderer.invoke("omnigent:browser-enable-design-mode", { conversationId }),
+  browserEnableDesignMode: (conversationId, opts) =>
+    ipcRenderer.invoke("omnigent:browser-enable-design-mode", { conversationId, opts }),
+  /** Transfer keyboard focus for one native selection to the owning shell. */
+  browserFocusDesignPrompt: (conversationId, selectionId) =>
+    ipcRenderer.invoke("omnigent:browser-focus-design-prompt", { conversationId, selectionId }),
+  /** Cancel the current selection without disabling the page's picker. */
+  browserClearDesignSelection: (conversationId, selectionId) =>
+    ipcRenderer.invoke("omnigent:browser-clear-design-selection", { conversationId, selectionId }),
+  /** Consume a selection's paired metadata/screenshot before the shell sends. */
+  browserTakeDesignSelection: (conversationId, selectionId) =>
+    ipcRenderer.invoke("omnigent:browser-take-design-selection", { conversationId, selectionId }),
   /**
    * Tear the design-mode picker back down.
    * @param {string} conversationId

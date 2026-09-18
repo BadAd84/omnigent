@@ -12,6 +12,7 @@ export interface DesignModeElement {
   text?: string;
   testId?: string;
   ariaLabel?: string;
+  label?: string;
   role?: string;
   component?: string | null;
 }
@@ -64,6 +65,7 @@ function selectorFor(el: DesignModeElement): string {
 export function buildDesignModePrompt(element: DesignModeElement, prompt: string): string {
   const text = sanitizeField(element.text);
   const ariaLabel = sanitizeField(element.ariaLabel);
+  const label = sanitizeField(element.label);
   const role = sanitizeField(element.role);
   const ctx = [
     `[Design Mode — modify this element in the browser preview]`,
@@ -71,6 +73,7 @@ export function buildDesignModePrompt(element: DesignModeElement, prompt: string
     `CSS selector: ${selectorFor(element)}`,
     text ? `Text: "${text}"` : "",
     ariaLabel ? `Aria-label: "${ariaLabel}"` : "",
+    label ? `Label: "${label}"` : "",
     role ? `Role: ${role}` : "",
   ]
     .filter(Boolean)

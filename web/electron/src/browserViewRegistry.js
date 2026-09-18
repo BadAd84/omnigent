@@ -91,6 +91,9 @@ function createBrowserViewRegistry({
   }
 
   function setSuppressed(suppressed) {
+    if (suppressed && !overlaySuppressed) {
+      entries.get(activeConversationId)?.invalidateDesignSelection?.("suppressed");
+    }
     overlaySuppressed = !!suppressed;
     applyActiveVisibility();
     return { ok: true };
@@ -131,6 +134,9 @@ function createBrowserViewRegistry({
       designModeListener: null,
       designModeInputListener: null,
       designModeWebContents: null,
+      designModeActivation: null,
+      invalidateDesignSelection: null,
+      disposeDesignMode: null,
     };
     return entry;
   }
@@ -316,6 +322,7 @@ function createBrowserViewRegistry({
       // (agent "bring me back"). Comparing lastRequestedUrl — not getURL(), which
       // drifts with in-page nav — stops a re-mount from refreshing to the initial URL.
       if (created || force || entry.lastRequestedUrl !== url) {
+        entry.invalidateDesignSelection?.("navigation");
         entry.lastRequestedUrl = url;
         try {
           entry.view.webContents.loadURL(url);
@@ -334,6 +341,7 @@ function createBrowserViewRegistry({
       if (activeConversationId !== null) {
         const prev = entries.get(activeConversationId);
         if (prev) {
+          prev.invalidateDesignSelection?.("inactive");
           try {
             detachFromHost(prev.view);
           } catch {
@@ -352,6 +360,7 @@ function createBrowserViewRegistry({
       if (activeConversationId !== null) {
         const prev = entries.get(activeConversationId);
         if (prev) {
+          prev.invalidateDesignSelection?.("inactive");
           try {
             detachFromHost(prev.view);
           } catch {
@@ -371,6 +380,7 @@ function createBrowserViewRegistry({
     if (activeConversationId !== null) {
       const prev = entries.get(activeConversationId);
       if (prev) {
+        prev.invalidateDesignSelection?.("inactive");
         try {
           detachFromHost(prev.view);
         } catch {
@@ -394,6 +404,7 @@ function createBrowserViewRegistry({
   function close(conversationId, reason) {
     const entry = entries.get(conversationId);
     if (!entry) return { ok: true, removed: false };
+    entry.disposeDesignMode?.("closed");
     if (activeConversationId === conversationId) {
       try {
         detachFromHost(entry.view);
