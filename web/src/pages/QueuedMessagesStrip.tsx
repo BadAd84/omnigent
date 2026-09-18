@@ -9,8 +9,17 @@ import {
   useSensor,
   useSensors,
 } from "@dnd-kit/core";
-import { ArrowUpIcon, ClockIcon, GripVerticalIcon, PencilIcon, Trash2Icon } from "lucide-react";
+import {
+  ArrowUpIcon,
+  ClockIcon,
+  GripVerticalIcon,
+  ImageIcon,
+  PaperclipIcon,
+  PencilIcon,
+  Trash2Icon,
+} from "lucide-react";
 
+import { Badge } from "@/components/ui/badge";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import type { QueuedMessage } from "@/store/chatStore";
 import { cn } from "@/lib/utils";
@@ -75,6 +84,12 @@ function QueuedRow({
     id: message.queueId,
     disabled: !reorderable,
   });
+  const hasText = message.text.trim().length > 0;
+  const files = message.files ?? [];
+  const attachmentNames = files.map((file) => file.name || "Attachment");
+  const AttachmentIcon = files.every((file) => file.type.startsWith("image/"))
+    ? ImageIcon
+    : PaperclipIcon;
 
   return (
     <div
@@ -102,7 +117,41 @@ function QueuedRow({
       ) : (
         <ClockIcon className={cn(ACTION_ICON_CLASS, "shrink-0")} aria-hidden="true" />
       )}
-      <span className="min-w-0 flex-1 truncate">{message.text}</span>
+      <div className="flex min-w-0 flex-1 items-center gap-2 max-md:flex-col max-md:items-start max-md:gap-0.5">
+        {hasText && (
+          <span className="min-w-0 max-w-full truncate" title={message.text}>
+            {message.text}
+          </span>
+        )}
+        {attachmentNames.length > 0 && (
+          <Badge
+            variant="outline"
+            data-testid="queued-message-attachments"
+            title={attachmentNames.join("\n")}
+            className={cn(
+              "min-w-0 max-w-[min(16rem,100%)] gap-1.5 rounded-md border-border/60 bg-background/50 px-1.5 font-normal text-muted-foreground transition-none max-sm:gap-1 max-sm:px-1",
+              hasText && "md:max-w-[min(14rem,55%)]",
+            )}
+          >
+            <AttachmentIcon
+              className={cn("shrink-0", attachmentNames.length > 1 && "max-sm:hidden")}
+              aria-hidden="true"
+            />
+            <span className="truncate">{attachmentNames[0]}</span>
+            {attachmentNames.length > 1 && (
+              <>
+                <span
+                  className="shrink-0 border-l border-border/60 pl-1.5 tabular-nums max-sm:border-0 max-sm:pl-0"
+                  aria-hidden="true"
+                >
+                  +{attachmentNames.length - 1}
+                </span>
+                <span className="sr-only">, {attachmentNames.slice(1).join(", ")}</span>
+              </>
+            )}
+          </Badge>
+        )}
+      </div>
       {/* Always visible (not hover-gated) so the actions are discoverable;
           they brighten on hover/focus. */}
       {onSteer ? (
@@ -200,7 +249,7 @@ export function QueuedMessagesStrip({
       )}
     >
       {/* Cap the list height and scroll when the queue is long, so a big
-          backlog never pushes the composer off-screen. ~5 rows tall. */}
+          backlog never pushes the composer off-screen. */}
       <div className="flex max-h-32 flex-col gap-1 overflow-y-auto">
         {onReorder === undefined ? (
           rows
