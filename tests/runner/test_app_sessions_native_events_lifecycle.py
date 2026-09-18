@@ -23,10 +23,11 @@ from omnigent.harnesses.cursor_native import main as cursor_native
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
 from omnigent.harnesses.kiro_native import main as kiro_native
 from omnigent.runner import create_runner_app
+from omnigent.runner.app import _WEB_PICKER_LIVE_MODEL_HARNESSES
 from omnigent.runner.resource_registry import (
     KIRO_NATIVE_TERMINAL_ROLE,
 )
-from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.spec.types import AgentSpec, ApiKeyAuth, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
 from tests.runner.conftest import (
     _drain_session_event_queue,
@@ -35,6 +36,23 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient
+
+
+def test_live_model_change_dispatch_covers_every_web_picker_harness() -> None:
+    """The reset dispatch exactly matches native harnesses with live Web pickers."""
+    from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
+    from omnigent.server.routes._sessions.common import _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER
+
+    fetched_picker_harnesses = {
+        agent.harness
+        for wrapper in _MODEL_OPTIONS_ENDPOINT_BY_WRAPPER
+        if (agent := native_coding_agent_for_wrapper_label(wrapper)) is not None
+    }
+    # Pi pushes its resident registry to the server instead of exposing a
+    # model-options route, but otherwise has the same Web-picker/live-switch
+    # contract. Equality keeps unrelated ACP/AGY/Goose/Qwen/Kimi/Hermes
+    # harnesses out while preventing a picker-backed harness from being missed.
+    assert fetched_picker_harnesses | {"pi-native"} == _WEB_PICKER_LIVE_MODEL_HARNESSES
 
 
 class _EventRecordingServerClient(NullServerClient):
@@ -114,38 +132,76 @@ class _RecordingCodexAppServerClient:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "event_payload,expected_params",
+    "event_payload,expected_requests,model_list_response",
     [
         (
             {"type": "model_change", "model": "gpt-5.4"},
-            {"threadId": "thread_codex", "model": "gpt-5.4"},
+            [
+                (
+                    "thread/settings/update",
+                    {"threadId": "thread_codex", "model": "gpt-5.4"},
+                )
+            ],
+            None,
+        ),
+        (
+            {"type": "model_change", "model": "default"},
+            [
+                ("model/list", {"includeHidden": False}),
+                (
+                    "thread/settings/update",
+                    {"threadId": "thread_codex", "model": "gpt-5.6-sol"},
+                ),
+            ],
+            {
+                "result": {
+                    "data": [
+                        {"id": "gpt-6-astra", "isDefault": True},
+                        {"id": "gpt-5.6-sol"},
+                    ],
+                    "nextCursor": None,
+                }
+            },
         ),
         (
             {"type": "effort_change", "effort": "xhigh"},
-            {"threadId": "thread_codex", "effort": "xhigh"},
+            [
+                (
+                    "thread/settings/update",
+                    {"threadId": "thread_codex", "effort": "xhigh"},
+                )
+            ],
+            None,
         ),
         (
             {"type": "plan_mode_change", "enabled": True},
-            {
-                "threadId": "thread_codex",
-                "collaborationMode": {
-                    "mode": "plan",
-                    "settings": {
-                        "model": "gpt-5.4",
-                        "reasoning_effort": None,
-                        "developer_instructions": None,
+            [
+                (
+                    "thread/settings/update",
+                    {
+                        "threadId": "thread_codex",
+                        "collaborationMode": {
+                            "mode": "plan",
+                            "settings": {
+                                "model": "gpt-5.4",
+                                "reasoning_effort": None,
+                                "developer_instructions": None,
+                            },
+                        },
                     },
-                },
-            },
+                )
+            ],
+            None,
         ),
     ],
-    ids=["model_change", "effort_change", "plan_mode_change"],
+    ids=["model_change", "reset_model_change", "effort_change", "plan_mode_change"],
 )
 async def test_events_codex_native_settings_change_uses_thread_settings_update(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     event_payload: dict[str, Any],
-    expected_params: dict[str, Any],
+    expected_requests: list[tuple[str, dict[str, Any]]],
+    model_list_response: dict[str, Any] | None,
 ) -> None:
     """
     Codex-native model / effort updates call ``thread/settings/update``.
@@ -162,14 +218,22 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     conv_id = "524fe55f9d5a7f66fec5c5401a930b84"
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
+    codex_home = tmp_path / "codex-home"
+    if model_list_response is not None:
+        codex_home.mkdir()
+        # A turn or in-TUI /model switch mutates config.toml after launch.
+        # Explicit reset must still restore the immutable launch model (Sol),
+        # not this current model (Astra).
+        (codex_home / "config.toml").write_text('model = "gpt-6-astra"\n')
     codex_native_bridge.write_bridge_state(
         bridge_dir,
         codex_native_bridge.CodexNativeBridgeState(
             session_id=conv_id,
             socket_path="ws://127.0.0.1:43210",
             thread_id="thread_codex",
-            codex_home=str(tmp_path / "codex-home"),
+            codex_home=str(codex_home),
             active_turn_id=None,
+            launch_model="gpt-5.6-sol" if model_list_response is not None else None,
         ),
     )
 
@@ -177,6 +241,8 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
         transport="ws://127.0.0.1:43210",
         client_name="omnigent-codex-native-runner",
     )
+    if model_list_response is not None:
+        fake_client.model_list_responses.append(model_list_response)
 
     def _fake_client_for_transport(
         transport: str,
@@ -241,9 +307,7 @@ async def test_events_codex_native_settings_change_uses_thread_settings_update(
     )
     assert fake_client.connected
     assert fake_client.closed
-    assert fake_client.requests == [
-        ("thread/settings/update", expected_params),
-    ], (
+    assert fake_client.requests == expected_requests, (
         f"codex-native {event_payload['type']} must call thread/settings/update "
         f"with next-turn settings; got {fake_client.requests!r}."
     )
@@ -442,15 +506,23 @@ async def test_events_codex_native_plan_mode_change_503s_when_config_unreadable(
 
 
 @pytest.mark.asyncio
-async def test_events_codex_native_model_change_without_bridge_fails_loud(
+@pytest.mark.parametrize(
+    ("model", "expected_status"),
+    [("gpt-5.6-terra", 503), (None, 204)],
+    ids=["concrete-fails", "null-noop"],
+)
+async def test_events_codex_native_model_change_without_bridge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    model: str | None,
+    expected_status: int,
 ) -> None:
-    """A model ask with no loaded Codex bridge answers 503, never 204.
+    """A concrete model needs a bridge, while a null event remains a no-op.
 
     Nothing applied the settings, so a silent success would let the row
     claim a switch the app-server never saw — the server surfaces the 503
-    as the visible not-applied error instead.
+    as the visible not-applied error instead. Null carries no reset intent;
+    the server uses the explicit ``default`` sentinel for that operation.
     """
     from omnigent.spec.types import ExecutorSpec
 
@@ -485,11 +557,12 @@ async def test_events_codex_native_model_change_without_bridge_fails_loud(
         assert create_resp.status_code == 201, create_resp.text
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "model_change", "model": "gpt-5.6-terra"},
+            json={"type": "model_change", "model": model},
         )
 
-    assert resp.status_code == 503, resp.text
-    assert resp.json()["error"] == "codex_native_settings_update_failed"
+    assert resp.status_code == expected_status, resp.text
+    if expected_status == 503:
+        assert resp.json()["error"] == "codex_native_settings_update_failed"
 
 
 @pytest.mark.asyncio
@@ -747,6 +820,51 @@ async def test_opencode_native_model_options_uses_cli_catalog(
 
 
 @pytest.mark.asyncio
+async def test_events_default_model_change_on_opencode_clears_bridge_override(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OpenCode consumes the Default command as an absent per-prompt override."""
+    from omnigent.harnesses.opencode_native import bridge as opencode_native_bridge
+
+    captured: list[str | None] = []
+
+    def _fake_update(_bridge_dir: Path, model_override: str | None) -> bool:
+        captured.append(model_override)
+        return True
+
+    monkeypatch.setattr(opencode_native_bridge, "update_model_override", _fake_update)
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "opencode-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = "conv_opencode_default_model"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "default"},
+        )
+
+    assert response.status_code == 200, response.text
+    assert captured == [None]
+
+
+@pytest.mark.asyncio
 async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -826,15 +944,21 @@ async def test_codex_native_model_options_returns_503_until_bridge_state_exists(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("config_model", "expected_default"),
+    ("launch_model", "config_model", "expected_default"),
     [
-        pytest.param(None, "gpt-5.5", id="unset-keeps-codex-default"),
-        pytest.param("gpt-5.4-mini", "gpt-5.4-mini", id="launch-model-wins"),
+        pytest.param(None, None, "gpt-5.5", id="unset-keeps-codex-default"),
+        pytest.param(
+            "gpt-5.4-mini",
+            "gpt-5.5",
+            "gpt-5.4-mini",
+            id="launch-model-wins-over-current-config",
+        ),
     ],
 )
 async def test_codex_native_model_options_query_model_list(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    launch_model: str | None,
     config_model: str | None,
     expected_default: str,
 ) -> None:
@@ -846,13 +970,14 @@ async def test_codex_native_model_options_query_model_list(
     this endpoint should ask Codex for models and return those model objects
     for the AP snapshot, changing only which one is marked default. Codex's
     own ``isDefault`` is its built-in preference and says nothing about this
-    session, so the model named by the session's ``config.toml`` — the one
-    the pane launched on — wins when the list offers it.
+    session, so the immutable launch model wins when the list offers it.
+    ``config.toml`` is current state and may already name a later live switch.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.spec.types import ExecutorSpec
 
     conv_id = "68ba0a62ebe928d26adf37c8974ce1eb"
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     bridge_dir = codex_native_bridge.bridge_dir_for_bridge_id(conv_id)
     codex_home = tmp_path / "codex-home"
@@ -896,6 +1021,7 @@ async def test_codex_native_model_options_query_model_list(
             thread_id="thread_codex",
             codex_home=str(codex_home),
             active_turn_id=None,
+            launch_model=launch_model,
         ),
     )
 
@@ -968,7 +1094,11 @@ async def test_codex_native_model_options_query_model_list(
     codex_native_spec = AgentSpec(
         spec_version=1,
         name="t",
-        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        executor=ExecutorSpec(
+            type="omnigent",
+            config={"harness": "codex-native"},
+            auth=ApiKeyAuth(api_key="test-key"),
+        ),
     )
 
     async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
@@ -1115,6 +1245,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
                     socket_path="ws://codex.test",
                     thread_id="test-thread",
                     codex_home=str(codex_home),
+                    launch_model="second-picker",
                 ),
             )
             init = RunnerSessionInitEnvelope(
@@ -1186,6 +1317,7 @@ async def test_codex_model_catalog_writeback_uses_session_provider(
 @pytest.mark.asyncio
 async def test_claude_native_model_options_use_session_launch_catalog(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """The session listing is the launch catalog from one cached Claude config.
 
@@ -1199,6 +1331,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
     conv_id = "6a416804870ed618cc8908f5cebab937"
     claude_spec = AgentSpec(
         spec_version=1,
@@ -1316,6 +1449,7 @@ async def test_claude_native_model_options_use_session_launch_catalog(
 @pytest.mark.asyncio
 async def test_claude_native_model_options_serves_probe_rows_after_pending(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """A slow probe answers 503-pending, then the probed rows, then the cache.
 
@@ -1332,6 +1466,7 @@ async def test_claude_native_model_options_serves_probe_rows_after_pending(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main.claude_launch_catalog", REAL_CLAUDE_LAUNCH_CATALOG
     )
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "omnigent-config"))
 
     conv_id = "9c527915981fe729dd9a19a6dfcbca49"
     claude_spec = AgentSpec(
@@ -2532,9 +2667,15 @@ async def test_events_interrupt_and_stop_on_pi_native_enqueue_bridge_interrupt(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_model",
+    ["databricks-claude-opus-4-1", "default"],
+    ids=["concrete", "default"],
+)
 async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    requested_model: str,
 ) -> None:
     """
     POST ``/events`` ``model_change`` on a pi-native session queues a
@@ -2589,7 +2730,7 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
 
         resp = await client.post(
             f"/v1/sessions/{conv_id}/events",
-            json={"type": "model_change", "model": "databricks-claude-opus-4-1"},
+            json={"type": "model_change", "model": requested_model},
         )
 
     assert resp.status_code == 204, (
@@ -2605,7 +2746,7 @@ async def test_events_model_change_on_pi_native_enqueues_bridge_model_change(
     assert len(model_changes) == 1, (
         f"pi-native model_change must enqueue exactly one payload; got {payloads!r}."
     )
-    assert model_changes[0]["model"] == "databricks-claude-opus-4-1"
+    assert model_changes[0]["model"] == requested_model
     assert model_changes[0]["id"].startswith("model_change_")
 
 

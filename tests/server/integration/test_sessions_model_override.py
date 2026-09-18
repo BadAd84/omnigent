@@ -107,6 +107,44 @@ async def test_patch_model_override_clear_alias_resets(
         )
 
 
+async def test_patch_model_override_null_is_noop(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON null does not clear a PATCH field without an explicit reset alias."""
+    forwarded: list[dict[str, Any]] = []
+
+    async def _record_forward(
+        _session_id: str,
+        _runner_router: Any,
+        event: dict[str, Any],
+        **_kwargs: Any,
+    ) -> None:
+        forwarded.append(event)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions._forward_session_change_to_runner",
+        _record_forward,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sid = session["id"]
+
+    await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": "claude-sonnet-4-6"},
+    )
+    forwarded.clear()
+    response = await client.patch(
+        f"/v1/sessions/{sid}",
+        json={"model_override": None},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["model_override"] == "claude-sonnet-4-6"
+    assert forwarded == []
+
+
 async def test_patch_model_override_rejects_empty_string(
     client: httpx.AsyncClient,
 ) -> None:

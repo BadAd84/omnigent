@@ -140,6 +140,8 @@ class CodexNativeBridgeState:
         ``"0196..."``.
     :param codex_home: Private per-session ``CODEX_HOME`` path, e.g.
         ``"/home/user/.omnigent/codex-native/x/codex-home"``.
+    :param launch_model: Model the native Codex process launched on. Unlike
+        ``config.toml``, this does not change after live model switches.
     :param cwd: Native Codex thread working directory, e.g.
         ``"/home/user/project"``.
     :param active_turn_id: Current Codex turn id, if one is running,
@@ -152,6 +154,7 @@ class CodexNativeBridgeState:
     codex_home: str
     active_turn_id: str | None = None
     cwd: str | None = None
+    launch_model: str | None = None
 
 
 def bridge_dir_for_bridge_id(bridge_id: str) -> Path:
@@ -859,6 +862,7 @@ def _write_bridge_state_unlocked(bridge_dir: Path, state: CodexNativeBridgeState
                     "codex_home": state.codex_home,
                     "active_turn_id": state.active_turn_id,
                     "cwd": state.cwd,
+                    "launch_model": state.launch_model,
                 },
                 handle,
                 sort_keys=True,
@@ -1208,6 +1212,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
     codex_home = raw.get("codex_home")
     active_turn_id = raw.get("active_turn_id")
     cwd = raw.get("cwd")
+    launch_model = raw.get("launch_model")
     if (
         not isinstance(session_id, str)
         or not session_id
@@ -1229,6 +1234,7 @@ def read_bridge_state(bridge_dir: Path) -> CodexNativeBridgeState | None:
         codex_home=codex_home,
         active_turn_id=parsed_active_turn_id,
         cwd=cwd if isinstance(cwd, str) and cwd else None,
+        launch_model=(launch_model if isinstance(launch_model, str) and launch_model else None),
     )
 
 
@@ -1254,6 +1260,7 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
                 codex_home=state.codex_home,
                 active_turn_id=active_turn_id,
                 cwd=state.cwd,
+                launch_model=state.launch_model,
             ),
         )
 
@@ -1284,6 +1291,7 @@ def update_thread_id(bridge_dir: Path, thread_id: str, active_turn_id: str | Non
                 codex_home=state.codex_home,
                 active_turn_id=active_turn_id,
                 cwd=state.cwd,
+                launch_model=state.launch_model,
             ),
         )
 
@@ -1331,6 +1339,7 @@ def clear_active_turn_id_if_matches(bridge_dir: Path, completed_turn_id: str | N
                 codex_home=state.codex_home,
                 active_turn_id=None,
                 cwd=state.cwd,
+                launch_model=state.launch_model,
             ),
         )
         return True

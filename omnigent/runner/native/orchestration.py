@@ -2422,14 +2422,6 @@ async def _auto_create_pi_terminal(
             session_id,
             exc_info=True,
         )
-    _extension, config = write_extension_files(
-        bridge_dir,
-        session_id=session_id,
-        server_url=launch_config.server_url,
-        conversation_url=conversation_url(launch_config.server_url, session_id),
-        auth_headers=auth_headers,
-        tools=pi_tools,
-    )
     pi_command = resolve_pi_executable()
     # Rebuild the local Pi session JSONL from committed Omnigent items so a
     # cold-resume or fork opens with prior conversation context (parity with
@@ -2452,7 +2444,6 @@ async def _auto_create_pi_terminal(
         approve=pi_supports_approve(pi_command),
     )
     pi_env = {
-        PI_NATIVE_CONFIG_ENV_VAR: str(config),
         "OMNIGENT_PI_NATIVE_BRIDGE_DIR": str(bridge_dir),
     }
     # Route the runner-owned Pi process through the provider configured by
@@ -2464,18 +2455,35 @@ async def _auto_create_pi_terminal(
     # through as ``--model``. Writes a managed per-session Pi config dir,
     # never touching the user's global ``~/.pi/agent``.
     credential_warning: str | None = None
-    if not _pi_args_have_provider(launch_config.terminal_launch_args or []):
+    # ``None`` lets the extension use the startup model when no session
+    # override changed it. An empty value means an override exists but its
+    # underlying default could not be resolved; do not mistake that override
+    # for the Default row's target.
+    managed_provider_launch = not _pi_args_have_provider(launch_config.terminal_launch_args or [])
+    default_model: str | None = (
+        "" if launch_config.model_override and managed_provider_launch else None
+    )
+    if managed_provider_launch:
         from omnigent.harnesses.pi_native.credentials import (
             pi_native_provider_launch,
+            pi_own_login_default_model_reference,
             pi_own_login_model_arg,
             resolve_pi_native_provider,
         )
 
         # Provider-qualified picker values select one of the models rendered
         # from the provider configured through ``omni setup``.
-        spec_model = launch_config.model_override or _pi_native_model_from_spec(agent_spec)
+        agent_default_model = _pi_native_model_from_spec(agent_spec)
+        spec_model = launch_config.model_override or agent_default_model
         provider = resolve_pi_native_provider(model=spec_model)
         if provider is not None:
+            if launch_config.model_override:
+                default_provider = resolve_pi_native_provider(model=agent_default_model)
+                if default_provider is not None:
+                    provider = provider.with_registered_models_from(default_provider)
+                    default_model = (
+                        _pi_provider_model_reference(provider, default_provider.model) or ""
+                    )
             launch = pi_native_provider_launch(
                 bridge_dir / "pi-agent",
                 provider,
@@ -2502,6 +2510,22 @@ async def _auto_create_pi_terminal(
             own_login_model = pi_own_login_model_arg(spec_model)
             if own_login_model is not None:
                 pi_args.extend(["--model", own_login_model])
+            if launch_config.model_override and agent_default_model:
+                default_model = pi_own_login_model_arg(agent_default_model) or ""
+            elif launch_config.model_override:
+                default_model = (
+                    pi_own_login_default_model_reference(project_dir=launch_config.workspace) or ""
+                )
+    _extension, config = write_extension_files(
+        bridge_dir,
+        session_id=session_id,
+        server_url=launch_config.server_url,
+        conversation_url=conversation_url(launch_config.server_url, session_id),
+        auth_headers=auth_headers,
+        tools=pi_tools,
+        default_model=default_model,
+    )
+    pi_env[PI_NATIVE_CONFIG_ENV_VAR] = str(config)
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -4373,6 +4397,7 @@ async def _auto_create_codex_terminal(
         clear_bridge_state,
         codex_home_for_bridge_dir,
         prepare_bridge_dir,
+        read_codex_home_config_model,
         socket_path_for_bridge_dir,
         write_bridge_state,
     )
@@ -4862,6 +4887,9 @@ async def _auto_create_codex_terminal(
     )
     app_server.listen_url = codex_ws_url
     await app_server.start()
+    launch_model = _codex_launch.model
+    if launch_model is None:
+        launch_model = await asyncio.to_thread(read_codex_home_config_model, codex_home)
     _AUTO_CODEX_APP_SERVERS[session_id] = app_server
 
     event_client = CodexAppServerClient(
@@ -4957,6 +4985,7 @@ async def _auto_create_codex_terminal(
                     # The session workspace: without it the executor falls back
                     # to the runner process's own cwd when starting turns.
                     cwd=workspace,
+                    launch_model=launch_model,
                 ),
             )
             if launch_config.reasoning_effort:
@@ -5157,6 +5186,7 @@ async def _auto_create_codex_terminal(
                 workspace=workspace,
                 event_client=event_client,
                 routing_summary=_codex_launch.summary,
+                launch_model=launch_model,
                 login_required=_codex_launch.login_required,
                 thread_start_timeout_seconds=thread_start_timeout_seconds,
                 subagent_router=_codex_router,
@@ -5217,6 +5247,7 @@ async def _codex_discover_thread_and_forward(
     workspace: str,
     event_client: CodexAppServerClient,
     routing_summary: str,
+    launch_model: str | None = None,
     login_required: bool = False,
     thread_start_timeout_seconds: float | None = None,
     subagent_router: SubagentRouter | None = None,
@@ -5248,6 +5279,8 @@ async def _codex_discover_thread_and_forward(
         routing (provider / profile / model, or the login-fallback state),
         threaded into the startup-timeout error so hosted users can diagnose
         without runner-log access (see #2745).
+    :param launch_model: Model the native Codex process launched on. Preserved
+        separately because live model changes mutate ``config.toml``.
     :param login_required: ``True`` when the resolved launch defers to
         Codex's own login with no usable stored credential — the TUI parks
         on the sign-in screen and cannot start a thread on its own. Chat
@@ -5358,6 +5391,7 @@ async def _codex_discover_thread_and_forward(
                 # The session workspace: without it the executor falls back
                 # to the runner process's own cwd when starting turns.
                 cwd=workspace,
+                launch_model=launch_model,
             ),
         )
 
@@ -6435,6 +6469,15 @@ def _pi_native_model_from_spec(agent_spec: AgentSpec | ResolvedSpec | None) -> s
         return None
     model = spec.executor.model
     return model if isinstance(model, str) and model else None
+
+
+def _pi_provider_model_reference(provider: Any, model_id: str | None = None) -> str | None:
+    """Return Pi's provider-qualified reference for a resolved provider model."""
+    selected_model = model_id or provider.model
+    for provider_id, payload in provider.to_models_config().get("providers", {}).items():
+        if any(model.get("id") == selected_model for model in payload.get("models", [])):
+            return f"{provider_id}/{selected_model}"
+    return None
 
 
 def _cursor_native_resume_args(chat_id: str | None, existing_args: list[str]) -> list[str]:

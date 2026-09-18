@@ -12,12 +12,17 @@ import httpx
 import pytest
 
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
+from omnigent.harnesses.claude_native import main as claude_native_main
 from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     bridge_dir_for_conversation_id,
 )
 from omnigent.harnesses.cursor_native import bridge as cursor_native_bridge
+from omnigent.harnesses.cursor_native import main as cursor_native_main
+from omnigent.harnesses.devin_native import bridge as devin_native_bridge
+from omnigent.harnesses.devin_native import main as devin_native_main
 from omnigent.harnesses.kiro_native import bridge as kiro_native_bridge
+from omnigent.harnesses.kiro_native import main as kiro_native_main
 from omnigent.harnesses.qwen_native import bridge as qwen_native_bridge
 from omnigent.runner import create_runner_app
 from omnigent.spec.types import AgentSpec, ExecutorSpec
@@ -2051,8 +2056,14 @@ async def test_events_native_dispatch_resolves_bridge_id_via_label_lookup(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "requested_model",
+    ["claude-opus-4-7", "default"],
+    ids=["concrete", "default"],
+)
 async def test_events_model_change_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
+    requested_model: str,
 ) -> None:
     """
     POST ``/events`` with ``{"type":"model_change","model":"claude-opus-4-7"}``
@@ -2079,6 +2090,16 @@ async def test_events_model_change_on_native_session_types_slash_command(
         captured.append((bridge_dir, command, timeout_s, confirm_hint))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(
+        claude_native_main,
+        "resolve_native_claude_config",
+        lambda *, spec=None: None,
+    )
+
+    async def _fake_catalog(_config: Any) -> list[dict[str, object]]:
+        return [{"id": "claude-opus-4-7", "isDefault": True}]
+
+    monkeypatch.setattr(claude_native_main, "claude_launch_catalog", _fake_catalog)
     # The pane's own picker vocabulary: this id occupies the custom slot, so
     # ``/model`` takes it exactly rather than stepping down to ``opus``.
     monkeypatch.setattr(
@@ -2123,7 +2144,7 @@ async def test_events_model_change_on_native_session_types_slash_command(
 
         resp = await client.post(
             "/v1/sessions/57c7c1acc5eeec3978c5e62043da51a4/events",
-            json={"type": "model_change", "model": "claude-opus-4-7"},
+            json={"type": "model_change", "model": requested_model},
         )
 
         # Drain the event queue before delete clears it. model_change
@@ -2505,8 +2526,18 @@ async def test_events_model_change_rejects_a_model_the_picker_cannot_spell(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_model", "expected_model"),
+    [
+        ("claude-haiku-4.5", "claude-haiku-4.5"),
+        ("default", "claude-sonnet-4.6"),
+    ],
+    ids=["concrete", "default"],
+)
 async def test_events_model_change_on_kiro_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
+    requested_model: str,
+    expected_model: str,
 ) -> None:
     """
     POST ``/events`` ``{"type":"model_change","model":"claude-haiku-4.5"}`` on a
@@ -2526,6 +2557,14 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
         captured.append((bridge_dir, model, timeout_s))
 
     monkeypatch.setattr(kiro_native_bridge, "inject_model_command", _fake_inject)
+    monkeypatch.setattr(
+        kiro_native_main,
+        "list_kiro_cli_model_options",
+        lambda: [
+            {"id": "claude-haiku-4.5", "isDefault": False},
+            {"id": "claude-sonnet-4.6", "isDefault": True},
+        ],
+    )
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -2561,7 +2600,7 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
 
         resp = await client.post(
             "/v1/sessions/b07013b8f257ae8e087e343a0d7008a3/events",
-            json={"type": "model_change", "model": "claude-haiku-4.5"},
+            json={"type": "model_change", "model": requested_model},
         )
 
     assert resp.status_code == 204, (
@@ -2571,7 +2610,58 @@ async def test_events_model_change_on_kiro_session_types_slash_command(
         f"Expected one inject_model_command call from kiro model_change, got {len(captured)}."
     )
     _bridge_dir, model, timeout_s = captured[0]
-    assert model == "claude-haiku-4.5"
+    assert model == expected_model
+    assert timeout_s == 1.0
+
+
+@pytest.mark.asyncio
+async def test_events_default_model_change_on_devin_session_resolves_concrete_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Devin's explicit Default command reaches its live picker as a family id."""
+    captured: list[tuple[Any, str, float]] = []
+
+    def _fake_inject(bridge_dir: Any, *, model: str, timeout_s: float) -> None:
+        captured.append((bridge_dir, model, timeout_s))
+
+    monkeypatch.setattr(devin_native_bridge, "inject_model_command", _fake_inject)
+    monkeypatch.setattr(
+        devin_native_main,
+        "list_devin_cli_model_options",
+        lambda: [{"id": "claude-sonnet-4-6", "isDefault": True}],
+    )
+
+    native_spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "devin-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return native_spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    conv_id = "conv_devin_default_model"
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "ag_1"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        response = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "model_change", "model": "default"},
+        )
+
+    assert response.status_code == 204, response.text
+    assert len(captured) == 1
+    _bridge_dir, model, timeout_s = captured[0]
+    assert model == "claude-sonnet-4-6"
     assert timeout_s == 1.0
 
 
@@ -2797,8 +2887,15 @@ async def test_events_model_change_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("requested_model", "expected_model"),
+    [("gpt-5.2", "gpt-5.2"), ("default", "gpt-5.3")],
+    ids=["concrete", "default"],
+)
 async def test_events_model_change_on_cursor_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
+    requested_model: str,
+    expected_model: str,
 ) -> None:
     """
     POST ``/events`` with ``model_change`` on a cursor-native session
@@ -2824,6 +2921,18 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
         captured.append((bridge_dir, model, expected_display_name, timeout_s))
 
     monkeypatch.setattr(cursor_native_bridge, "inject_model_command", _fake_inject)
+    monkeypatch.setattr(
+        cursor_native_main,
+        "list_cursor_cli_model_options",
+        lambda: [
+            {
+                "id": "gpt-5.3",
+                "displayName": "GPT-5.3",
+                "isDefault": True,
+                "isCurrent": False,
+            }
+        ],
+    )
 
     native_spec = AgentSpec(
         spec_version=1,
@@ -2855,7 +2964,7 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
 
         resp = await client.post(
             "/v1/sessions/c42dbcb16fd3a87ee8f5d1fe4cabfdf8/events",
-            json={"type": "model_change", "model": "gpt-5.2"},
+            json={"type": "model_change", "model": requested_model},
         )
 
     assert resp.status_code == 204, (
@@ -2864,8 +2973,8 @@ async def test_events_model_change_on_cursor_native_session_types_slash_command(
     )
     assert len(captured) == 1, f"Expected one inject_model_command call, got {len(captured)}."
     _bridge_dir, model, expected_display_name, timeout_s = captured[0]
-    assert model == "gpt-5.2", f"Expected the model id passed through, got {model!r}."
-    assert expected_display_name is None
+    assert model == expected_model, f"Expected {expected_model!r}, got {model!r}."
+    assert expected_display_name == ("GPT-5.3" if requested_model == "default" else None)
     assert timeout_s == 1.0
 
 

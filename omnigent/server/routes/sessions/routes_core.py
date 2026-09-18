@@ -226,6 +226,8 @@ from omnigent.util.session_lifecycle import (
 )
 from omnigent.version import VERSION
 
+_MODEL_DEFAULT_RESET = "default"
+
 
 async def _reset_runner_and_clear_todos_after_switch(
     session_id: str, conversation_store: ConversationStore
@@ -2410,18 +2412,14 @@ def register_core_routes(
                 runner_router,
                 getattr(request.app.state, "host_registry", None),
             )
-        # Notify the runner of effort / model changes so harnesses
-        # that can't re-read these from store at turn boundaries
-        # (today: claude-native, whose ``claude`` binary has
-        # ``--effort`` / ``--model`` baked in at spawn) get a chance
-        # to propagate them live. Best-effort — persisted values
-        # remain the authoritative fallback. Skip both when
-        # ``silent`` so bind-time auto-apply doesn't inject visible
-        # ``/model X`` items into a fresh pane.
-        # Effort and model both go through the unified ``/events``
-        # dispatch — Omnigent server stays harness-agnostic; the runner
-        # dispatches by harness (claude-native injects the slash
-        # command into tmux, other harnesses 204 no-op). See
+        # Notify the runner of effort / model changes so a resident native
+        # TUI can apply them immediately. Best-effort — persisted values
+        # remain the authoritative fallback for a later launch. Skip both
+        # when ``silent`` so bind-time auto-apply doesn't inject a visible
+        # model command into a fresh pane.
+        # Effort and model both go through the unified ``/events`` dispatch;
+        # the server stays harness-agnostic and the runner owns each live
+        # harness's switch mechanism. See
         # ``_forward_session_change_to_runner`` for the shared
         # runner-client fallback + non-2xx logging.
         live_forward = not body.silent
@@ -2436,12 +2434,16 @@ def register_core_routes(
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
         if live_forward and (model_override is not None or clear_model):
+            # Keep the explicit reset command after persistence normalizes the
+            # stored override to null; null itself remains a PATCH no-op.
             _model_forward = await _forward_session_change_to_runner(
                 session_id,
                 runner_router,
-                {"type": "model_change", "model": updated.model_override},
-                # The runner answers this by typing ``/model`` into the pane and
-                # confirming the dialog, which outlasts the default budget.
+                {
+                    "type": "model_change",
+                    "model": _MODEL_DEFAULT_RESET if clear_model else updated.model_override,
+                },
+                # Interactive switch paths can outlast the default budget.
                 timeout_s=_TUI_INJECT_FORWARD_TIMEOUT_S,
             )
             # Append a durable [System: model changed to X] note for sessions

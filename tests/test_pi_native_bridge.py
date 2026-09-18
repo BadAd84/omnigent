@@ -224,6 +224,7 @@ def test_write_extension_files_embeds_tools(tmp_path: Path) -> None:
         conversation_url="http://omnigent.test/c/conv_abc",
         auth_headers={"Authorization": "Bearer t"},
         tools=tools,
+        default_model="omnigent/claude-sonnet-4-6",
     )
 
     payload = json.loads(cfg.read_text(encoding="utf-8"))
@@ -231,6 +232,7 @@ def test_write_extension_files_embeds_tools(tmp_path: Path) -> None:
     # serverUrl trailing slash is stripped so the extension can append paths.
     assert payload["serverUrl"] == "http://omnigent.test"
     assert payload["tools"] == tools
+    assert payload["defaultModel"] == "omnigent/claude-sonnet-4-6"
 
 
 def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
@@ -246,6 +248,7 @@ def test_write_extension_files_defaults_tools_to_empty(tmp_path: Path) -> None:
 
     payload = json.loads(cfg.read_text(encoding="utf-8"))
     assert payload["tools"] == []
+    assert "defaultModel" not in payload
 
 
 def test_refresh_config_auth_headers_replaces_only_auth(tmp_path: Path) -> None:

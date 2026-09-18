@@ -2453,6 +2453,7 @@ async def _create_thread_replacement_session(
             # Carry the workspace across the rotation, or the executor
             # falls back to the harness process's own cwd for new turns.
             cwd=state.cwd if state is not None else None,
+            launch_model=state.launch_model if state is not None else None,
         ),
     )
 

@@ -2907,7 +2907,12 @@ const inboxDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-model-inbox-"));
 const configPath = path.join(inboxDir, "config.json");
 fs.writeFileSync(
   configPath,
-  JSON.stringify({ serverUrl: "http://omnigent.test", sessionId: "session-1", inboxDir }),
+  JSON.stringify({
+    serverUrl: "http://omnigent.test",
+    sessionId: "session-1",
+    inboxDir,
+    defaultModel: "omnigent/databricks-claude-sonnet-4-6",
+  }),
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
@@ -2941,11 +2946,10 @@ const handlers = pi.__handlers;
 const ctx = {
   isIdle: () => true,
   ui: { setTitle() {}, setStatus() {}, notify() {} },
-  // ``model`` is the model Pi launched with (used for the startup
-  // external_model_change). ``getAvailable`` returns only auth-configured
-  // models (what the picker should show); ``getAll`` is Pi's full built-in
-  // catalog (the fallback for older Pi).
-  model: { provider: "omnigent", id: "databricks-claude-sonnet-4-6", name: "Sonnet" },
+  // The session launched on an override, while config.defaultModel names the
+  // model it would have launched without that override. ``getAvailable``
+  // returns only auth-configured models (what the picker should show).
+  model: { provider: "omnigent", id: "databricks-claude-opus-4-1", name: "Opus" },
   modelRegistry: {
     getAll: () => catalog,
     getAvailable: () => catalog.filter((m) => m.hasKey),
@@ -3019,6 +3023,33 @@ def test_inbox_model_change_applies_via_set_model(tmp_path: Path) -> None:
     _run_extension_script(node, _extension_path(), script)
 
 
+def test_inbox_default_model_change_restores_configured_default(tmp_path: Path) -> None:
+    """Default switches away from a non-default launch override."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  await handlers.session_start({}, ctx);
+  await deliverModelChange("default");
+
+  assert.equal(setModelCalls.length, 1, JSON.stringify(setModelCalls));
+  assert.equal(setModelCalls[0].id, "databricks-claude-sonnet-4-6");
+  assert.equal(errorItems().length, 0, JSON.stringify(posted));
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
 def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
     """An unresolvable model id posts a visible error item and never calls setModel."""
     node = shutil.which("node")
@@ -3069,7 +3100,7 @@ def test_model_select_mirrors_to_external_model_change(tmp_path: Path) -> None:
   // resolves from the start; ignore that when checking the user switch.
   const startupChanges = posted.filter((e) => e.type === "external_model_change");
   assert.equal(startupChanges.length, 1, JSON.stringify(posted));
-  assert.equal(startupChanges[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+  assert.equal(startupChanges[0].data.model, "omnigent/databricks-claude-opus-4-1");
 
   // A genuine user switch mirrors back.
   await handlers.model_select(
@@ -3133,11 +3164,12 @@ def test_session_start_posts_model_options_from_registry(tmp_path: Path) -> None
   );
   // Display name falls back to the model's ``name``.
   assert.equal(models[0].displayName, "Sonnet");
+  assert.deepEqual(models.map((m) => m.isDefault), [true, false]);
 
   // The launch model is mirrored so the pill/active-row resolve immediately.
   const changes = posted.filter((e) => e.type === "external_model_change");
   assert.equal(changes.length, 1, JSON.stringify(posted));
-  assert.equal(changes[0].data.model, "omnigent/databricks-claude-sonnet-4-6");
+  assert.equal(changes[0].data.model, "omnigent/databricks-claude-opus-4-1");
   finish();
 })().catch((error) => {
   finish();

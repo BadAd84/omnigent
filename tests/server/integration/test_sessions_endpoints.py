@@ -8618,17 +8618,24 @@ async def test_patch_model_override_clear_records_reset_note(
 ) -> None:
     """Clearing the override (``default``) records a reset note, not a model name."""
     published: list[tuple[str, dict[str, Any]]] = []
+    forwarded: list[dict[str, Any]] = []
     monkeypatch.setattr(
         "omnigent.server.routes.sessions.session_stream.publish",
         lambda sid, ev: published.append((sid, ev)),
     )
 
-    async def _noop_forward(*_args: Any, **_kwargs: Any) -> None:
-        """Isolate the note logic from the live runner forward."""
+    async def _record_forward(
+        _session_id: str,
+        _runner_router: Any,
+        event: dict[str, Any],
+        **_kwargs: Any,
+    ) -> None:
+        """Record the reset command forwarded to the runner."""
+        forwarded.append(event)
 
     monkeypatch.setattr(
         "omnigent.server.routes.sessions._forward_session_change_to_runner",
-        _noop_forward,
+        _record_forward,
     )
     agent = await create_test_agent(client)
     session = await _create_session(client, agent["id"])
@@ -8639,6 +8646,7 @@ async def test_patch_model_override_clear_records_reset_note(
     )
     assert patch.status_code == 200, patch.text
     assert _model_change_notes(published) == ["[System: model reset to the agent default]"]
+    assert forwarded == [{"type": "model_change", "model": "default"}]
 
 
 async def test_patch_model_override_skips_note_for_native_session(

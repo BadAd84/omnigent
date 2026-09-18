@@ -192,6 +192,19 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
+_MODEL_DEFAULT_RESET = "default"
+_WEB_PICKER_LIVE_MODEL_HARNESSES = frozenset(
+    {
+        "claude-native",
+        "codex-native",
+        "cursor-native",
+        "devin-native",
+        "kiro-native",
+        "opencode-native",
+        "pi-native",
+    }
+)
+
 # Allow process termination and forwarder cleanup to finish before DELETE proceeds.
 _SESSION_INIT_CANCEL_TIMEOUT_S = 20.0
 
@@ -218,6 +231,18 @@ _CLAUDE_MODEL_CONFIRM_POLL_S = 0.25
 # cheap (one tmux capture per poll) and never types blind.
 _CLAUDE_MODEL_LATE_DIALOG_BUDGET_S = 1200.0
 _CLAUDE_MODEL_LATE_DIALOG_POLL_S = 2.0
+
+
+def _default_model_id(rows: Sequence[Mapping[str, object]]) -> str | None:
+    """Return the concrete id of the row marked as the launch default."""
+    for row in rows:
+        if row.get("isDefault") is not True:
+            continue
+        candidate = row.get("id") or row.get("model")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    return None
+
 
 # After a stale-pane recreate the TUI reboots with ``--resume``. Poll until
 # the input box is usable before typing into it. Only a recreate waits: a live
@@ -5508,7 +5533,11 @@ def create_runner_app(
         conv_id: str,
         settings: _JsonObject,
     ) -> Response:
-        from omnigent.harnesses.codex_native.app_server import client_for_transport
+        from omnigent.harnesses.codex_native.app_server import (
+            client_for_transport,
+            list_codex_model_options,
+            mark_launch_default,
+        )
 
         if not settings:
             return Response(status_code=204)
@@ -5531,11 +5560,18 @@ def create_runner_app(
         )
         try:
             await codex_client.connect()
+            applied_settings = settings
+            if settings.get("model") == _MODEL_DEFAULT_RESET:
+                rows = await list_codex_model_options(codex_client)
+                default_model = _default_model_id(mark_launch_default(rows, state.launch_model))
+                if default_model is None:
+                    raise RuntimeError("Codex model list has no default model")
+                applied_settings = {**settings, "model": default_model}
             await codex_client.request(
                 "thread/settings/update",
                 {
                     "threadId": state.thread_id,
-                    **settings,
+                    **applied_settings,
                 },
             )
         except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
@@ -5740,7 +5776,6 @@ def create_runner_app(
             list_codex_model_options,
             mark_launch_default,
         )
-        from omnigent.harnesses.codex_native.bridge import read_codex_home_config_model
 
         state = await _codex_native_bridge_state_for_session(
             conv_id,
@@ -5760,11 +5795,7 @@ def create_runner_app(
         finally:
             with contextlib.suppress(Exception):
                 await codex_client.close()
-        active_model = await asyncio.to_thread(
-            read_codex_home_config_model,
-            Path(state.codex_home),
-        )
-        marked = mark_launch_default(rows, active_model)
+        marked = mark_launch_default(rows, state.launch_model)
         # Write the live account rows back to the shared catalog store so the
         # pre-launch picker converges to account truth after the first
         # session — keeping the SHAPE's stored default (a session's own pin
@@ -5805,6 +5836,29 @@ def create_runner_app(
                 exc_info=True,
                 extra={"session_id": session_id},
             )
+
+    def _default_model_resolution_error(
+        harness: str,
+        conv_id: str,
+        exc: Exception,
+    ) -> JSONResponse:
+        """Return the common retryable response for harness-owned discovery."""
+        _logger.warning(
+            "%s default-model resolution failed for session=%s",
+            harness,
+            conv_id,
+            exc_info=(type(exc), exc, exc.__traceback__),
+            extra={"session_id": conv_id},
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": f"{harness.replace('-', '_')}_model_failed",
+                "detail": _client_safe_error_detail(
+                    exc, context=f"{harness} default model resolution"
+                ),
+            },
+        )
 
     async def _handle_pi_native_effort_change(
         conv_id: str,
@@ -6142,6 +6196,7 @@ def create_runner_app(
             read_model_env,
         )
         from omnigent.harnesses.claude_native.main import (
+            claude_launch_catalog,
             resolve_claude_native_model_selection,
         )
         from omnigent.models.claude_model_vocabulary import claude_model_command_arg
@@ -6155,7 +6210,22 @@ def create_runner_app(
         bridge_dir = bridge_dir_for_bridge_id(bridge_id)
         await _prepare_claude_native_pane_for_injection(conv_id, bridge_dir)
         selected_model = model.strip()
-        claude_config = await _resolve_session_claude_launch_config(conv_id)
+        claude_config = None
+        if selected_model == _MODEL_DEFAULT_RESET:
+            try:
+                cached = _claude_model_options_rows.get(conv_id)
+                if cached is not None:
+                    rows = cached[1]
+                else:
+                    claude_config = await _resolve_session_claude_launch_config(conv_id)
+                    rows = await claude_launch_catalog(claude_config)
+                selected_model = _default_model_id(rows or []) or ""
+                if not selected_model:
+                    raise RuntimeError("claude-native model list has no default model")
+            except Exception as exc:  # noqa: BLE001 - discovery failures are retryable.
+                return _default_model_resolution_error("claude-native", conv_id, exc)
+        if claude_config is None:
+            claude_config = await _resolve_session_claude_launch_config(conv_id)
         resolved_model = (
             resolve_claude_native_model_selection(selected_model, claude_config) or selected_model
         )
@@ -6292,11 +6362,25 @@ def create_runner_app(
             bridge_dir_for_session_id,
             inject_model_command,
         )
+        from omnigent.harnesses.cursor_native.main import list_cursor_cli_model_options
 
         if model is None or not model.strip():
             return Response(status_code=204)
         bridge_dir = bridge_dir_for_session_id(conv_id)
         selected_model = model.strip()
+        if selected_model == _MODEL_DEFAULT_RESET:
+            try:
+                rows = await asyncio.to_thread(list_cursor_cli_model_options)
+                _session_cursor_model_names[conv_id] = {
+                    str(row["id"]): str(row["displayName"])
+                    for row in rows
+                    if row.get("id") and row.get("displayName")
+                }
+                selected_model = _default_model_id(rows) or ""
+                if not selected_model:
+                    raise RuntimeError("cursor-native model list has no default model")
+            except Exception as exc:  # noqa: BLE001 - discovery failures are retryable.
+                return _default_model_resolution_error("cursor-native", conv_id, exc)
         expected_display_name = _session_cursor_model_names.get(conv_id, {}).get(selected_model)
         try:
             await asyncio.to_thread(
@@ -6324,15 +6408,25 @@ def create_runner_app(
             bridge_dir_for_session_id,
             inject_model_command,
         )
+        from omnigent.harnesses.kiro_native.main import list_kiro_cli_model_options
 
         if model is None or not model.strip():
             return Response(status_code=204)
         bridge_dir = bridge_dir_for_session_id(conv_id)
+        selected_model = model.strip()
+        if selected_model == _MODEL_DEFAULT_RESET:
+            try:
+                rows = await asyncio.to_thread(list_kiro_cli_model_options)
+                selected_model = _default_model_id(rows) or ""
+                if not selected_model:
+                    raise RuntimeError("kiro-native model list has no default model")
+            except Exception as exc:  # noqa: BLE001 - discovery failures are retryable.
+                return _default_model_resolution_error("kiro-native", conv_id, exc)
         try:
             await asyncio.to_thread(
                 inject_model_command,
                 bridge_dir,
-                model=model.strip(),
+                model=selected_model,
                 timeout_s=1.0,
             )
         except (RuntimeError, ValueError) as exc:
@@ -6353,17 +6447,29 @@ def create_runner_app(
             bridge_dir_for_session_id,
             inject_model_command,
         )
-        from omnigent.harnesses.devin_native.main import resolve_devin_launch_model
+        from omnigent.harnesses.devin_native.main import (
+            list_devin_cli_model_options,
+            resolve_devin_launch_model,
+        )
 
         if model is None or not model.strip():
             return Response(status_code=204)
+        selected_model = model.strip()
+        if selected_model == _MODEL_DEFAULT_RESET:
+            try:
+                rows = await asyncio.to_thread(list_devin_cli_model_options)
+                selected_model = _default_model_id(rows) or ""
+                if not selected_model:
+                    raise RuntimeError("devin-native model list has no default model")
+            except Exception as exc:  # noqa: BLE001 - discovery failures are retryable.
+                return _default_model_resolution_error("devin-native", conv_id, exc)
         # Devin has no separate effort flag — effort is a suffix on the model id.
         # Compose the picked family with the session's remembered effort so a
         # New-Chat (model, effort) pick lands on the same variant the launch path
         # composes (compose is idempotent for an already-composed id).
         composed = await asyncio.to_thread(
             resolve_devin_launch_model,
-            model.strip(),
+            selected_model,
             _session_reasoning_effort.get(conv_id),
         )
         if not composed:
@@ -6627,8 +6733,13 @@ def create_runner_app(
             update_model_override,
         )
 
+        if model is None or not model.strip():
+            return Response(status_code=204)
+        selected_model = model.strip()
         updated = await asyncio.to_thread(
-            update_model_override, bridge_dir_for_bridge_id(conv_id), model
+            update_model_override,
+            bridge_dir_for_bridge_id(conv_id),
+            None if selected_model == _MODEL_DEFAULT_RESET else selected_model,
         )
         return Response(status_code=200 if updated else 204)
 
@@ -9670,15 +9781,7 @@ def create_runner_app(
 
         if body_type == "model_change":
             harness = _session_harness_name(conversation_id)
-            if harness in (
-                "claude-native",
-                "codex-native",
-                "cursor-native",
-                "opencode-native",
-                "kiro-native",
-                "devin-native",
-                "pi-native",
-            ):
+            if harness is not None and harness in _WEB_PICKER_LIVE_MODEL_HARNESSES:
                 model = body.get("model") if isinstance(body, dict) else None
                 if model is not None and not isinstance(model, str):
                     return JSONResponse(
@@ -9688,12 +9791,13 @@ def create_runner_app(
                             "detail": "Body 'model' must be a string or null",
                         },
                     )
+                if model is None or not model.strip():
+                    return Response(status_code=204)
+                model = model.strip()
                 if harness == "codex-native":
-                    if model is None or not model.strip():
-                        return Response(status_code=204)
                     return await _handle_codex_native_settings_update(
                         conversation_id,
-                        {"model": model.strip()},
+                        {"model": model},
                     )
                 if harness == "cursor-native":
                     return await _handle_cursor_native_model_change(

@@ -1583,6 +1583,7 @@ async def test_auto_create_codex_terminal_uses_worktree_workspace_not_bundle_dir
     )
     assert observed_timeout is None
     assert discover_kwargs["thread_start_timeout_seconds"] is None
+    assert discover_kwargs["launch_model"] == "gpt-5-default"
 
     # The Codex app-server cwd must be the worktree (resolved — the launch
     # config normalizes with expanduser().resolve()). A failure here means
@@ -1817,6 +1818,7 @@ async def test_auto_create_codex_terminal_starts_relay_at_session_creation(
     )
     assert relay_calls[0]["await_notify"] is False
     assert len(discover_calls) == 1
+    assert discover_calls[0]["launch_model"] == "gpt-5-default"
     # A failed marker write falls the forwarder back to the legacy timeout
     # too, keeping it aligned with the executor's unextended legacy wait.
     expected_timeout = None if marker_write_fails or login_required else 120.0
@@ -3488,6 +3490,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
             workspace=str(workspace),
             event_client=_Client(),  # type: ignore[arg-type]
             routing_summary="provider 'test' (model=gpt-test)",
+            launch_model="gpt-test",
             thread_start_timeout_seconds=120.0,
         )
     finally:
@@ -3497,6 +3500,7 @@ async def test_codex_discover_thread_and_forward_persists_workspace_as_bridge_cw
     assert state is not None
     assert state.thread_id == thread_id
     assert state.cwd == str(workspace)
+    assert state.launch_model == "gpt-test"
     assert wait_calls == [{"timeout": 120.0}]
     assert codex_native_bridge.read_bridge_startup_timeout(tmp_path) == 120.0
 

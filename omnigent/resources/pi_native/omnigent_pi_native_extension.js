@@ -1056,7 +1056,7 @@ function modelReference(model) {
  * (older Pi). Best-effort and fire-and-forget: an empty or unavailable
  * registry posts nothing, leaving the picker hidden.
  */
-async function postModelOptions(config, ctx) {
+async function postModelOptions(config, ctx, defaultModelReference) {
   const registry = ctx ? ctx.modelRegistry : undefined;
   if (!registry) return;
   let models;
@@ -1081,7 +1081,12 @@ async function postModelOptions(config, ctx) {
     seen.add(id);
     const name =
       model && typeof model.name === "string" && model.name ? model.name : modelId;
-    options.push({ id, model: id, displayName: name });
+    options.push({
+      id,
+      model: id,
+      displayName: name,
+      isDefault: id === defaultModelReference,
+    });
   }
   if (options.length === 0) return;
   await postEvent(config, {
@@ -1279,6 +1284,10 @@ module.exports = function (pi) {
   // loop is genuinely running — agentRunning arms it correctly. See F18.
   let agentRunning = false;
   let latestContext = null;
+  let defaultModelReference =
+    config && typeof config.defaultModel === "string"
+      ? config.defaultModel.trim()
+      : null;
   let pendingInterruptUntil = 0;
   const postedToolCalls = new Set();
   const postedToolResults = new Set();
@@ -1829,6 +1838,8 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    const startupModel = modelReference(ctx ? ctx.model : undefined);
+    if (defaultModelReference === null) defaultModelReference = startupModel;
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
@@ -1839,7 +1850,17 @@ module.exports = function (pi) {
       () => requestInterrupt(latestContext),
       (customInstructions) =>
         triggerCompaction(config, latestContext, customInstructions),
-      (model) => applyModelChange(pi, config, latestContext, model),
+      async (model) => {
+        const requestedModel = model === "default" ? defaultModelReference : model;
+        if (!requestedModel) {
+          await postModelChangeError(
+            config,
+            "Omnigent: this Pi session could not resolve its default model.",
+          );
+          return false;
+        }
+        return applyModelChange(pi, config, latestContext, requestedModel);
+      },
       (level) => pi.setThinkingLevel(level),
       () => {
         // Prefer the SDK's live idle signal; fall back to the agent loop
@@ -1856,13 +1877,12 @@ module.exports = function (pi) {
     await patchExternalSessionId(config, nativeSessionId);
     // Publish Pi's live model catalog so the Web UI picker populates from what
     // Pi actually loaded, independent of how it authenticated.
-    await postModelOptions(config, ctx);
+    await postModelOptions(config, ctx, defaultModelReference);
     // Report the model Pi launched with so the composer pill and the picker's
     // active row reflect the current model from the start. Without this, a
     // ``/login`` session (no Omnigent ``model_override``, no ``llm_model``)
     // shows no active model until the user switches. Mirrors the
     // ``model_select`` handler, but for the startup value ``ctx.model``.
-    const startupModel = modelReference(ctx ? ctx.model : undefined);
     if (startupModel) {
       await postEvent(config, {
         type: "external_model_change",

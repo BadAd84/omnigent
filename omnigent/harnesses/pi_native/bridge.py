@@ -323,6 +323,7 @@ def write_extension_files(
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
+    default_model: str | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -340,6 +341,8 @@ def write_extension_files(
         runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
         centralized server-side policy enforcement. ``None``/empty registers no
         tools (Pi falls back to its own built-in tool surface only).
+    :param default_model: Provider-qualified model Pi would launch without a
+        session override. Omitted when the launch itself can report it.
     :returns: ``(extension_path, config_path)``.
     """
     bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -352,6 +355,8 @@ def write_extension_files(
         "authHeaders": auth_headers or {},
         "tools": tools or [],
     }
+    if default_model is not None:
+        payload["defaultModel"] = default_model
     _atomic_json(config_path(bridge_dir), payload)
     _atomic_text(extension_path(bridge_dir), _extension_source())
     return extension_path(bridge_dir), config_path(bridge_dir)

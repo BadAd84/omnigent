@@ -378,6 +378,46 @@ class PiProviderConfig:
         providers.update(additional)
         return {"providers": providers}
 
+    def with_registered_models_from(self, other: PiProviderConfig) -> PiProviderConfig:
+        """Include models registered by another resolution of this provider."""
+
+        def same_transport(left: _PiProviderPayload, right: _PiProviderPayload) -> bool:
+            return all(
+                left.get(key) == right.get(key)
+                for key in ("baseUrl", "api", "apiKey", "authHeader", "compat")
+            )
+
+        def copy_provider(payload: _PiProviderPayload) -> _PiProviderPayload:
+            return {**payload, "models": list(payload["models"])}
+
+        rendered = self.to_models_config()["providers"]
+        primary_models = list(self.extra_models)
+        additional: dict[str, _PiProviderPayload] = {
+            provider_id: copy_provider(payload)
+            for provider_id, payload in self.additional_providers.items()
+        }
+        primary_ids = {self.model, *(model.get("id") for model in primary_models)}
+        for provider_id, payload in other.to_models_config()["providers"].items():
+            if provider_id == self.provider_id:
+                if not same_transport(rendered[self.provider_id], payload):
+                    continue
+                for model in payload["models"]:
+                    if model.get("id") not in primary_ids:
+                        primary_models.append(model)
+                        primary_ids.add(model.get("id"))
+                continue
+            existing = additional.get(provider_id)
+            if existing is None:
+                additional[provider_id] = copy_provider(payload)
+                continue
+            if not same_transport(existing, payload):
+                continue
+            existing_ids = {model.get("id") for model in existing["models"]}
+            existing["models"].extend(
+                model for model in payload["models"] if model.get("id") not in existing_ids
+            )
+        return replace(self, extra_models=primary_models, additional_providers=additional)
+
     def _register_on_surface(
         self, additional: dict[str, _PiProviderPayload], surface: DatabricksPiSurface
     ) -> None:
@@ -465,6 +505,25 @@ def pi_own_login_model_options(agent_dir: Path | None = None) -> list[dict[str, 
                 "displayName": name if isinstance(name, str) and name else model_id,
             }
     return [options[model_id] for model_id in sorted(options)]
+
+
+def pi_own_login_default_model_reference(
+    *,
+    agent_dir: Path | None = None,
+    project_dir: Path | None = None,
+) -> str | None:
+    """Return Pi's saved own-login default when it is currently available."""
+    root = agent_dir if agent_dir is not None else _global_pi_agent_dir()
+    settings = _read_json_object(root / "settings.json")
+    if project_dir is not None:
+        settings.update(_read_json_object(project_dir / ".pi" / "settings.json"))
+    provider = settings.get("defaultProvider")
+    model = settings.get("defaultModel")
+    if not isinstance(provider, str) or not provider or not isinstance(model, str) or not model:
+        return None
+    reference = f"{provider}/{model}"
+    available = {option["id"] for option in pi_own_login_model_options(root)}
+    return reference if reference in available else None
 
 
 def pi_own_login_model_arg(selection: str) -> str | None:

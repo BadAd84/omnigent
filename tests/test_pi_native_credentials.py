@@ -2748,6 +2748,31 @@ def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
 
 
+def test_pi_own_login_default_model_reference_reads_available_saved_default(
+    tmp_path: Path,
+) -> None:
+    """The live reset target comes from Pi's own settings, not the launch override."""
+    _seed_pi_own_login(tmp_path)
+    (tmp_path / "settings.json").write_text(
+        json.dumps(
+            {
+                "defaultProvider": "anthropic",
+                "defaultModel": "claude-sonnet-4-5",
+            }
+        )
+    )
+
+    assert (
+        creds.pi_own_login_default_model_reference(agent_dir=tmp_path)
+        == "anthropic/claude-sonnet-4-5"
+    )
+
+    (tmp_path / "settings.json").write_text(
+        json.dumps({"defaultProvider": "anthropic", "defaultModel": "retired-model"})
+    )
+    assert creds.pi_own_login_default_model_reference(agent_dir=tmp_path) is None
+
+
 def test_pi_own_login_options_tolerate_malformed_files(tmp_path: Path) -> None:
     """Malformed auth/models-store files degrade to an empty catalog, never raise."""
     (tmp_path / "auth.json").write_text("{not json")

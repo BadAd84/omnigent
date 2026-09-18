@@ -65,6 +65,7 @@ from omnigent.harnesses.codex_native.bridge import (
     codex_home_for_bridge_dir,
     prepare_bridge_dir,
     read_bridge_state,
+    read_codex_home_config_model,
     socket_path_for_bridge_dir,
     write_bridge_state,
 )
@@ -390,6 +391,7 @@ class PreparedCodexTerminal:
         observes the TUI-created ``thread/started`` event; resumed sessions
         retain the preload subscription until forwarder teardown.
     :param reattached: ``True`` when an existing terminal was reused.
+    :param launch_model: Model this native Codex process launched on.
     """
 
     session_id: str
@@ -402,6 +404,7 @@ class PreparedCodexTerminal:
     app_server: CodexNativeAppServer | None
     event_client: CodexAppServerClient | None
     reattached: bool
+    launch_model: str | None = None
 
 
 def _require_codex_app_server_url(prepared: PreparedCodexTerminal) -> str:
@@ -1219,6 +1222,9 @@ async def _prepare_codex_terminal(
                     app_server=None,
                     event_client=None,
                     reattached=True,
+                    launch_model=(
+                        reattach_state.launch_model if reattach_state is not None else None
+                    ),
                 )
             if thread_id is None:
                 raise click.ClickException(
@@ -1274,6 +1280,7 @@ async def _prepare_codex_terminal(
         launched_terminal: LaunchedCodexTerminal | None = None
         try:
             await app_server.start()
+            launch_model = _codex_launch.model or read_codex_home_config_model(codex_home)
             if thread_id is None:
                 event_client = client_for_transport(
                     codex_ws_url,
@@ -1297,6 +1304,7 @@ async def _prepare_codex_terminal(
                         thread_id=thread_id,
                         codex_home=str(codex_home),
                         cwd=str(Path.cwd()),
+                        launch_model=launch_model,
                     ),
                 )
             if runner_id is not None:
@@ -1347,6 +1355,7 @@ async def _prepare_codex_terminal(
         app_server=app_server,
         event_client=event_client,
         reattached=False,
+        launch_model=launch_model,
     )
 
 
@@ -1529,6 +1538,7 @@ async def _initialize_fresh_terminal_thread(
             thread_id=thread_id,
             codex_home=str(codex_home_for_bridge_dir(prepared.bridge_dir)),
             cwd=str(Path.cwd()),
+            launch_model=prepared.launch_model,
         ),
     )
     return thread_id

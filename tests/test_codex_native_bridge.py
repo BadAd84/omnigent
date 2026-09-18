@@ -33,6 +33,7 @@ from omnigent.harnesses.codex_native.bridge import (
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
+    update_thread_id,
     write_bridge_startup_error,
     write_bridge_startup_timeout,
     write_bridge_state,
@@ -105,6 +106,7 @@ def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
             codex_home=str(bridge_dir / "codex-home"),
             active_turn_id=active_turn_id,
             cwd=str(bridge_dir),
+            launch_model="gpt-5.6-sol",
         ),
     )
 
@@ -116,12 +118,48 @@ def test_bridge_state_preserves_native_working_directory(tmp_path: Path) -> None
     state = read_bridge_state(tmp_path)
     assert state is not None
     assert state.cwd == str(tmp_path)
+    assert state.launch_model == "gpt-5.6-sol"
 
     clear_active_turn_id_if_matches(tmp_path, "turn_1")
 
     updated = read_bridge_state(tmp_path)
     assert updated is not None
     assert updated.cwd == str(tmp_path)
+    assert updated.launch_model == "gpt-5.6-sol"
+
+
+def test_bridge_state_preserves_launch_model_across_live_updates(tmp_path: Path) -> None:
+    """Turn and thread updates cannot replace the immutable launch model."""
+    _seed_active_turn(tmp_path, None)
+
+    update_active_turn_id(tmp_path, "turn_1")
+    update_thread_id(tmp_path, "thread_2", active_turn_id="turn_2")
+    clear_active_turn_id_if_matches(tmp_path, "turn_2")
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.thread_id == "thread_2"
+    assert state.active_turn_id is None
+    assert state.launch_model == "gpt-5.6-sol"
+
+
+def test_bridge_state_without_launch_model_remains_readable(tmp_path: Path) -> None:
+    """Bridge files written by older Omnigent versions remain valid."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state.json").write_text(
+        json.dumps(
+            {
+                "session_id": "conv_old",
+                "socket_path": "ws://127.0.0.1:1234",
+                "thread_id": "thread_old",
+                "codex_home": str(tmp_path / "codex-home"),
+            }
+        )
+    )
+
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.launch_model is None
 
 
 @pytest.fixture

@@ -83,22 +83,38 @@ def _key_provider_config() -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("session_override", "expected_active", "expected_resolutions"),
+    [
+        (None, "claude-opus-4-7", ["claude-opus-4-7"]),
+        (
+            "claude-haiku-4-5",
+            "claude-haiku-4-5",
+            ["claude-haiku-4-5", "claude-opus-4-7"],
+        ),
+    ],
+    ids=["agent-default", "session-override"],
+)
 async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    session_override: str | None,
+    expected_active: str,
+    expected_resolutions: list[str],
 ) -> None:
-    """End-to-end: the spec's ``executor.model`` reaches the generated models.json.
+    """The session override wins without erasing Pi's agent default identity.
 
     Drives ``_auto_create_pi_terminal`` with a spec pinning
     ``claude-opus-4-7`` and a key-kind provider whose family default is
-    ``claude-sonnet-4-6``. The threaded override must win: the generated
-    ``models.json`` selects ``claude-opus-4-7`` and the appended Pi
-    ``--model`` arg reflects it. This is the runner-side seam the feature
-    adds — without threading the spec model, the models.json would carry
-    the family default instead.
+    ``claude-sonnet-4-6``. With a per-session override, the generated config
+    launches that override while the extension config retains the spec model
+    as the Web picker's Default target.
 
     :param tmp_path: Temp dir backing the pi-native bridge root.
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param session_override: Optional per-session model selection.
+    :param expected_active: Model Pi should launch on.
+    :param expected_resolutions: Provider-resolution calls expected at launch.
     :returns: None.
     """
     import omnigent.harnesses.pi_native.bridge as pi_bridge
@@ -122,10 +138,10 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     # time, so inject the test config by patching the module symbol the runner
     # imports locally — recording the ``model`` kwarg it is called with.
     real_resolve = creds.resolve_pi_native_provider
-    captured: dict[str, Any] = {}
+    captured: dict[str, Any] = {"models": []}
 
     def _resolve_with_test_config(*, model: str | None = None, config_loader: Any = None):
-        captured["model"] = model
+        captured["models"].append(model)
         return real_resolve(model=model, config_loader=_key_provider_config)
 
     monkeypatch.setattr(creds, "resolve_pi_native_provider", _resolve_with_test_config)
@@ -141,6 +157,7 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
                     "workspace": str(workspace),
                     "terminal_launch_args": None,
                     "external_session_id": None,
+                    "model_override": session_override,
                 },
                 request=httpx.Request("GET", f"/v1/sessions/{session_id}"),
             )
@@ -191,20 +208,29 @@ async def test_auto_create_pi_terminal_threads_spec_model_into_models_json(
     )
 
     # The runner threaded the spec model into resolve_pi_native_provider.
-    assert captured["model"] == "claude-opus-4-7"
+    assert [model for model in captured["models"] if model is not None] == expected_resolutions
 
     # The appended Pi args select the override, not the family default.
     args = launched["args"]
     assert "--model" in args
-    assert args[args.index("--model") + 1] == "claude-opus-4-7"
+    assert args[args.index("--model") + 1] == expected_active
     assert "--provider" in args
 
     # The managed config dir env was set and its models.json selects the override.
     agent_dir = Path(launched["env"]["PI_CODING_AGENT_DIR"])
     models = json.loads((agent_dir / "models.json").read_text(encoding="utf-8"))
-    entry = models["providers"]["omnigent"]["models"][0]
-    assert entry["id"] == "claude-opus-4-7"
+    entries = models["providers"]["omnigent"]["models"]
+    entry = next(item for item in entries if item["id"] == expected_active)
     assert entry.get("reasoning") is True
+
+    extension_config = json.loads(
+        Path(launched["env"][pi_bridge.PI_NATIVE_CONFIG_ENV_VAR]).read_text(encoding="utf-8")
+    )
+    if session_override is None:
+        assert "defaultModel" not in extension_config
+    else:
+        assert extension_config["defaultModel"] == "omnigent/claude-opus-4-7"
+        assert any(item["id"] == "claude-opus-4-7" for item in entries)
 
 
 @pytest.mark.asyncio
