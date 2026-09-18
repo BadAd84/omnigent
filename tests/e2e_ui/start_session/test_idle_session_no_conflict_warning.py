@@ -40,6 +40,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -85,6 +86,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from tests.e2e_ui.conftest import configure_mock_llm
+from tests.e2e_ui.start_session.helpers import (
+    commit_landing_workspace_picker,
+    open_landing_workspace_picker,
+)
 
 _HOST_NAME = "idle-occupancy-host"
 _REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -437,9 +442,14 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
             await page.get_by_test_id("new-chat-landing-host-chip").click()
             await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
 
-            # Directory: browse home → project in the picker.
-            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible(timeout=10_000)
+            # Directory: browse home → project in the picker. Let the chip
+            # settle on the resolved host home first — opening the popover
+            # mid-resolution detaches its "Open folder" row.
+            workspace_chip = page.get_by_test_id("new-chat-landing-workspace-chip")
+            await expect(workspace_chip).to_contain_text(home.name, timeout=15_000)
+            await expect(workspace_chip).to_be_enabled()
+            await expect(page.locator("[data-radix-popper-content-wrapper]")).to_have_count(0)
+            await open_landing_workspace_picker(page)
             path_input = page.get_by_test_id("workspace-picker-path-input")
             await expect(path_input).to_have_value(str(home), timeout=10_000)
             await path_input.fill(str(project))
@@ -447,15 +457,18 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
             await expect(page.get_by_test_id("workspace-picker-entry-README.md")).to_be_visible(
                 timeout=10_000
             )
-            await page.keyboard.press("Escape")
+            await commit_landing_workspace_picker(page)
 
             # Send the first prompt — the server launches a real runner
             # through the host and runs the turn against the mock LLM.
             await page.get_by_test_id("new-chat-landing-input").fill(prompt)
             await page.get_by_test_id("new-chat-landing-submit").click()
             await page.wait_for_url("**/c/**", timeout=60_000)
-            session_id = page.url.rstrip("/").split("/c/")[-1].split("?")[0]
             await expect(page.get_by_text(reply)).to_be_visible(timeout=180_000)
+            # The SPA navigates to an optimistic temp:* URL first; the real
+            # session id replaces it once the server acknowledges the create.
+            await page.wait_for_url(re.compile(r"/c/(?!temp)"), timeout=30_000)
+            session_id = page.url.rstrip("/").split("/c/")[-1].split("?")[0]
             await _wait_session_idle(base_url, session_id)
 
             # Precondition (keeps the final assertion pinned to THIS bug):
@@ -485,8 +498,11 @@ async def _drive(base_url: str, mock_llm_url: str, tmp_path: Path) -> None:
             await page.get_by_test_id(f"new-chat-landing-host-{host_id}").click()
 
             # Directory selector at the same (default) directory.
-            await page.get_by_test_id("new-chat-landing-workspace-chip").click()
-            await expect(page.get_by_test_id("workspace-picker")).to_be_visible(timeout=10_000)
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_be_enabled(
+                timeout=15_000
+            )
+            await expect(page.locator("[data-radix-popper-content-wrapper]")).to_have_count(0)
+            await open_landing_workspace_picker(page)
             path_input2 = page.get_by_test_id("workspace-picker-path-input")
             if await path_input2.input_value() != str(project):
                 await path_input2.fill(str(project))
