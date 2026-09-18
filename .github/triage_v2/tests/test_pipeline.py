@@ -128,7 +128,7 @@ def test_pipeline_reuses_persisted_classification_and_includes_maintainers() -> 
 
 @pytest.mark.parametrize("enabled", [False, True])
 @pytest.mark.parametrize("cached_review", [False, True])
-@pytest.mark.parametrize("cached_version", [1, 2])
+@pytest.mark.parametrize("cached_version", [1, 2, 3])
 def test_bug_review_switch_refreshes_incompatible_cached_classifications(
     enabled, cached_review, cached_version
 ):
@@ -160,11 +160,11 @@ def test_bug_review_switch_refreshes_incompatible_cached_classifications(
     run = pipeline.run("switch-preview")
 
     assert classifier.calls == int(
-        enabled != cached_review or (enabled and cached_review and cached_version != 2)
+        enabled != cached_review or (enabled and cached_review and cached_version != 3)
     )
     assert (run.ranked[0].issue.bug_review is not None) == enabled
     if enabled:
-        assert run.ranked[0].issue.bug_review.rubric_version == 2
+        assert run.ranked[0].issue.bug_review.rubric_version == 3
 
 
 def test_pipeline_reclassifies_changed_content() -> None:

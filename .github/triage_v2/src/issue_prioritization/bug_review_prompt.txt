@@ -5,7 +5,8 @@ Also return bug_review with this shape:
   "actionability": "actionable | needs_info | non_actionable",
   "reason": "One plain-English sentence, at most 500 characters",
   "readability": "clear | needs_summary | not_assessed",
-  "clarification": null
+  "clarification": null,
+  "source_only_quote": null
 }
 For Feature and Docs, return bug_review=null and keep their existing assessment.
 
@@ -20,8 +21,20 @@ user workflow. CLI/API failures, data loss, reliability, performance, and
 accessibility count; "user-facing" is not limited to the UI. A concrete
 intermittent observation, real diagnostics, or an executed test of a user
 workflow can establish this. Do not require a deterministic reproduction or a
-large affected population. Code analysis may explain an observed failure, but
-cannot replace one.
+large affected population. A plain description of experienced behavior counts;
+first-person wording, logs, and the phrase "I reproduced it" are not required.
+Code analysis may explain an observed failure, but cannot replace one.
+
+Distinguish unclear observation from a clearly speculative finding. A concrete
+failure report may omit whether its symptom was experienced or inferred. Do not
+infer that nobody encountered it just because it says "can fail", lacks logs,
+or proposes synthetic tests in a validation section. If the report leaves this
+unclear, choose needs_info and ask whether the described failure actually occurred
+or was inferred from source. Do not turn uncertainty into immediate closure.
+An explanation of the internal cause is not a statement that the symptom was
+discovered only by reading code. Proposed regression tests are not evidence that
+the original failure was hypothetical. Treat that combination as needs_info when
+the report does not establish either an observation or a source-only origin.
 
 Use evidence_kind=code_analysis when the report only infers a defect from code.
 Use direct_steps or controlled_test only when the report says the workflow was
@@ -35,18 +48,48 @@ observed.
 
 - actionable: enough evidence of an observed user-facing failure. Set
   information_status=sufficient and missing_information=[].
-- needs_info: the author reports experiencing a failure, but the details needed
-  to investigate it are missing (for example, "my session stopped working").
-  Set information_status=needs_info and list the missing categories. These
-  reports retain the existing seven-day reply window.
-- non_actionable: no observed user-facing failure is reported; the alleged bug
-  rests on source analysis, a hypothetical execution, or a predicted consequence.
-  This includes fully explained reachable code paths and proposed reproduction
-  recipes that nobody ran. Set information_status=needs_info, identify the
+- needs_info: a reported failure lacks details needed to investigate, or a
+  concrete symptom is described but it is unclear whether it actually occurred.
+  Set information_status=needs_info and list the missing categories. If observation
+  is unclear, include observed_behavior and ask in reason whether the failure was
+  encountered and what happened. Use evidence_kind=none, or code_analysis when
+  the available supporting evidence is source reasoning. These reports retain
+  the existing seven-day reply window.
+- non_actionable: the report clearly presents a source-only finding, hypothetical
+  execution, or predicted consequence, without an accompanying observation.
+  The report must establish that speculative basis: for example, it attributes
+  the finding to a source audit, explicitly labels an outcome hypothetical, or
+  says nobody executed the scenario or there is no failure to report.
+  Technical root-cause details and suggested
+  future validation alone do not establish a source-only origin. Even a detailed user-visible
+  consequence does not rescue a report whose stated basis is only source analysis.
+  In reason, identify what establishes that speculative basis instead of merely
+  listing missing logs, versions, or proof. Set information_status=needs_info, identify the
   missing observed_behavior and/or user_impact, and set evidence_kind to
   code_analysis or none. Use low impact because user impact is unconfirmed.
   The automation will post an explanation and close as not planned immediately,
   without a seven-day wait. Explain the missing observation in ordinary language.
+
+For non_actionable, source_only_quote must be an exact, continuous excerpt from
+the report (at most 2000 characters) establishing its source-only or hypothetical
+basis. A quote of technical root-cause details or suggested regression tests is
+not sufficient: those can accompany a real failure. Statements such as "no live
+runner needs to be removed" describe how future tests could work; they do NOT
+say no live runner was used or no failure was observed. Never change future or
+conditional wording into a claim about what happened. If you cannot find a
+qualifying quote, choose needs_info instead. For actionable and needs_info,
+source_only_quote must be null. Only whitespace may change in the quote.
+
+Examples of the distinction:
+- "Recreating a terminal can fail with FileNotFoundError after its working
+  directory is deleted. The cwd fallback explains this. Synthetic unit tests can
+  cover it." -> needs_info: the report leaves observation unclear. Ask whether
+  recreation actually failed. Do not close it for suggesting synthetic tests.
+- The same report plus "I found this only by reading the source; nobody ran the
+  sequence" -> non_actionable, even though a user-visible consequence is named.
+- The same report plus "After removing my worktree, recreation failed with that
+  error; restarting the runner restored it" -> actionable when enough context
+  is supplied, regardless of whether regression tests are merely proposed.
 
 Keep hypothetical failure claims classified as Bug so this review can close
 them. A genuine request for a new capability or refactoring remains Feature;

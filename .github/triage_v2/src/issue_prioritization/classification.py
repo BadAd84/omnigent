@@ -110,6 +110,7 @@ class PromptClassifier:
             issue_type, value
         )
         bug_review = None
+        reasoning = str(value.get("reasoning", ""))
         if self.review_bugs and issue_type == IssueType.BUG:
             bug_review = replace(
                 BugReview.from_mapping(value.get("bug_review")), rubric_version=BUG_REVIEW_VERSION
@@ -120,21 +121,45 @@ class PromptClassifier:
             if actionable and missing_information:
                 raise ValueError("an actionable bug cannot require missing information")
             non_actionable = bug_review.actionability == BugActionability.NON_ACTIONABLE
-            if evidence_kind == EvidenceKind.CODE_ANALYSIS and not non_actionable:
-                raise ValueError("code-only evidence requires a non_actionable bug review")
+            if evidence_kind == EvidenceKind.CODE_ANALYSIS and actionable:
+                raise ValueError("code-only evidence cannot establish an actionable bug")
             if non_actionable and evidence_kind not in (
                 EvidenceKind.CODE_ANALYSIS,
                 EvidenceKind.NONE,
             ):
                 raise ValueError("a non_actionable bug cannot claim observed failure evidence")
             bug_review.validate_source(issue.body[:12000])
+            closure_confirmed = False
+            if non_actionable and bug_review.source_only_quote is not None:
+                confirmation_prompt = Template(
+                    files("issue_prioritization").joinpath("bug_closure_prompt.txt").read_text()
+                ).substitute(
+                    source_only_quote=bug_review.source_only_quote, body=issue.body[:12000]
+                )
+                confirmation = _parse_json_object(self.query(confirmation_prompt))
+                closure_confirmed = confirmation.get("source_only") is True
+            if non_actionable and not closure_confirmed:
+                bug_review = replace(
+                    bug_review,
+                    actionability=BugActionability.NEEDS_INFO,
+                    reason="Did the described failure actually occur, or was it inferred from "
+                    "source code? Please describe what you did and what happened.",
+                    source_only_quote=None,
+                )
+                reasoning = (
+                    "The report needs clarification about the observed behavior "
+                    "before its impact can be assessed."
+                )
+                missing_information = tuple(
+                    dict.fromkeys((*missing_information, MissingInformation.OBSERVED_BEHAVIOR))
+                )
         return Classification(
             issue_number=issue.number,
             issue_type=issue_type,
             impact=Impact.parse(value.get("impact", value.get("severity"))),
             area_keys=area_keys,
             component_labels=component_labels,
-            reasoning=str(value.get("reasoning", "")),
+            reasoning=reasoning,
             content_hash=issue.content_hash,
             reported_type=reported_issue_type(issue.labels),
             evidence_kind=evidence_kind,
@@ -170,8 +195,10 @@ def build_prompt(
         body=issue.body[:12000],
         code_analysis_guidance=(
             "Code analysis alone is not usable evidence of an observed user-facing failure. "
-            "Apply the bug review below: close source-only concerns as non_actionable, even "
-            "when they explain a reachable path and predict a concrete consequence."
+            "Apply the bug review below: close clearly source-only concerns as non_actionable, "
+            "even when they predict a concrete consequence. If a concrete failure report "
+            "leaves it unclear whether the symptom was observed, use needs_info; missing "
+            "logs or a reproduction statement alone do not establish speculation."
             if review_bugs
             else "Code analysis naming a reachable path and its concrete incorrect impact "
             "can also be sufficient. A defensive code-path report can be sufficient when "

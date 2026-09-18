@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
-BUG_REVIEW_VERSION = 2
+BUG_REVIEW_VERSION = 3
 
 
 class BugActionability(StrEnum):
@@ -31,6 +31,7 @@ class BugReview:
     reason: str
     clarification: BugClarification | None = None
     rubric_version: int = BUG_REVIEW_VERSION
+    source_only_quote: str | None = None
 
     @classmethod
     def from_mapping(cls, value: object) -> BugReview:
@@ -59,8 +60,20 @@ class BugReview:
             clarification = BugClarification(
                 _text(raw.get("summary"), "summary", 600), tuple(parsed_steps)
             )
-        review = cls(actionability, reason, clarification, int(value.get("rubric_version", 1)))
-        if value.get("readability") != review.readability:
+        quote = value.get("source_only_quote")
+        review = cls(
+            actionability,
+            reason,
+            clarification,
+            int(value.get("rubric_version", 1)),
+            _text(quote, "source_only_quote", 2000) if quote is not None else None,
+        )
+        if review.source_only_quote and actionability != BugActionability.NON_ACTIONABLE:
+            raise ValueError("only a non_actionable bug can have a source_only_quote")
+        if (
+            actionability == BugActionability.ACTIONABLE
+            and value.get("readability") != review.readability
+        ):
             raise ValueError("bug readability disagrees with actionability or clarification")
         return review
 
@@ -71,9 +84,11 @@ class BugReview:
         return "needs_summary" if self.clarification is not None else "clear"
 
     def validate_source(self, body: str) -> None:
+        source = " ".join(body.split())
+        if self.source_only_quote and self.source_only_quote not in source:
+            raise ValueError("source_only_quote is absent from the report")
         if self.clarification is None:
             return
-        source = " ".join(body.split())
         for step in self.clarification.reproduction_steps:
             if step.source_quote not in source:
                 raise ValueError("reproduction step source_quote is absent from the report")

@@ -58,10 +58,18 @@ def main() -> None:
                 args.model_endpoint, areas, workspace, review_bugs=True
             )
             query = classifier.query
+            query_count = 0
 
             def record_response(prompt):
+                nonlocal query_count
+                query_count += 1
                 response = query(prompt)
-                (destination / "model_response.txt").write_text(response)
+                name = (
+                    "model_response.txt"
+                    if query_count == 1
+                    else f"model_response_{query_count}.txt"
+                )
+                (destination / name).write_text(response)
                 return response
 
             classifier.query = record_response

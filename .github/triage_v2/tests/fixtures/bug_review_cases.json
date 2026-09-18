@@ -168,5 +168,109 @@
     ],
     "expected_clarification": false,
     "expected_close": true
+  },
+  {
+    "name": "unclear_observation_issue_7609",
+    "title": "[Bug] Native Claude recreation depends on a removed process cwd",
+    "body": "## Problem\n\nRecreating a native Claude terminal can fail with `FileNotFoundError` when the runner remains alive but its process working directory was removed. An explicit, valid session workspace does not reliably avoid the failure: the environment fallback eagerly evaluates `Path.cwd()`, and project-config loading separately reads the implicit cwd.\n\n## Expected behavior\n\n- Resolve the explicit session workspace, then runner workspace, before consulting process cwd.\n- Load project configuration from the selected workspace without changing process cwd.\n- If the selected workspace is gone, report an actionable `workspace_missing` error; never silently start in home or another directory.\n- Preserve existing resume transcripts and project-config merge semantics.\n\n## Validation\n\nSynthetic unit tests can make cwd lookup raise while using a valid temporary workspace, exercise both initialization-envelope and legacy terminal setup, and reject a missing explicit workspace before launch. No live runner or real worktree needs to be removed.\n\nRelated to #3971 and #5030.",
+    "labels": [
+      "Bug",
+      "validated:reproduced"
+    ],
+    "expected_type": "Bug",
+    "expected_actionability": [
+      "needs_info"
+    ],
+    "expected_clarification": false,
+    "expected_close": false
+  },
+  {
+    "name": "terminal_recreation_with_observed_failure",
+    "title": "[Bug] Native Claude recreation depends on a removed process cwd",
+    "body": "## Problem\n\nRecreating a native Claude terminal can fail with `FileNotFoundError` when the runner remains alive but its process working directory was removed. An explicit, valid session workspace does not reliably avoid the failure: the environment fallback eagerly evaluates `Path.cwd()`, and project-config loading separately reads the implicit cwd.\n\n## Expected behavior\n\n- Resolve the explicit session workspace, then runner workspace, before consulting process cwd.\n- Load project configuration from the selected workspace without changing process cwd.\n- If the selected workspace is gone, report an actionable `workspace_missing` error; never silently start in home or another directory.\n- Preserve existing resume transcripts and project-config merge semantics.\n\n## Validation\n\nSynthetic unit tests can make cwd lookup raise while using a valid temporary workspace, exercise both initialization-envelope and legacy terminal setup, and reject a missing explicit workspace before launch. No live runner or real worktree needs to be removed.\n\nRelated to #3971 and #5030.\n\nAuthor follow-up: This happened on Omnigent 0.14.0 on macOS. I started a Claude-native session from a temporary worktree, removed that worktree while the runner stayed alive, and recreated the terminal using an existing session workspace. Recreation failed with FileNotFoundError instead of opening the terminal. Restarting the runner from the session workspace worked. The suggested tests above are regression coverage for that failure.",
+    "labels": [
+      "Bug",
+      "validated:reproduced"
+    ],
+    "expected_type": "Bug",
+    "expected_actionability": [
+      "actionable"
+    ],
+    "expected_clarification": false,
+    "expected_close": false
+  },
+  {
+    "name": "terminal_recreation_explicitly_source_only",
+    "title": "[Bug] Native Claude recreation depends on a removed process cwd",
+    "body": "## Problem\n\nRecreating a native Claude terminal can fail with `FileNotFoundError` when the runner remains alive but its process working directory was removed. An explicit, valid session workspace does not reliably avoid the failure: the environment fallback eagerly evaluates `Path.cwd()`, and project-config loading separately reads the implicit cwd.\n\n## Expected behavior\n\n- Resolve the explicit session workspace, then runner workspace, before consulting process cwd.\n- Load project configuration from the selected workspace without changing process cwd.\n- If the selected workspace is gone, report an actionable `workspace_missing` error; never silently start in home or another directory.\n- Preserve existing resume transcripts and project-config merge semantics.\n\n## Validation\n\nSynthetic unit tests can make cwd lookup raise while using a valid temporary workspace, exercise both initialization-envelope and legacy terminal setup, and reject a missing explicit workspace before launch. No live runner or real worktree needs to be removed.\n\nRelated to #3971 and #5030.\n\nAuthor follow-up: I found this by reading the fallback code. Nobody has encountered this failure and I have not executed a reproduction or a test. The symptom above is a prediction from the code, not something that happened.",
+    "labels": [
+      "Bug",
+      "validated:reproduced"
+    ],
+    "expected_type": "Bug",
+    "expected_actionability": [
+      "non_actionable"
+    ],
+    "expected_clarification": false,
+    "expected_close": true
+  },
+  {
+    "name": "reported_failure_without_first_person",
+    "title": "Reconnecting leaves the transcript blank",
+    "body": "Omnigent 0.14.0 on macOS, Chrome. After Wi-Fi reconnects during a Claude-native response, the Chat transcript stays blank while Terminal still shows the reply. Refreshing Chat restores the messages. Expected: Chat continues showing the conversation after reconnect.",
+    "labels": [
+      "Bug",
+      "validated:reproduced"
+    ],
+    "expected_type": "Bug",
+    "expected_actionability": [
+      "actionable"
+    ],
+    "expected_clarification": false,
+    "expected_close": false
+  },
+  {
+    "name": "source_audit_without_explicit_disclaimer",
+    "title": "An older resolver can replace newer tool definitions",
+    "body": "A source audit found that the resolver writes its result after an await, without comparing the cache version. The inferred race is: start resolving v1, edit the agent to v2, then let the old resolution finish. A later request could receive stale tool definitions. Proposed reproduction: insert a test barrier around the await, change the agent, and release the barrier. Add a version comparison before publishing the result.",
+    "labels": [
+      "Bug",
+      "validated:reproduced"
+    ],
+    "expected_type": "Bug",
+    "expected_actionability": [
+      "non_actionable"
+    ],
+    "expected_clarification": false,
+    "expected_close": true
+  },
+  {
+    "name": "unexecuted_session_reset_issue_3949",
+    "title": "Session reset does not fence in-flight terminal publication",
+    "body": "Pinned to [`1c6dfedc`](<https://github.com/omnigent-ai/omnigent/blob/1c6dfedce7cb88186775d427f77203870b30483f/omnigent/runner/app.py>). All functions are in `omnigent/runner/app.py` unless stated.\n\n**Problem.** A session reset removes the agent-derived caches. It also closes the terminals that exist at that time. It does not stop a terminal creator that is already in operation. That creator continues. It then registers a terminal that it configured from the previous agent's spec. The session keeps a terminal that belongs to an agent it no longer runs.\n\n**Rule that the code breaks.** After a reset is complete, no terminal and no related resource from an earlier spec resolution must stay registered.\n\n**Cause.** `reset_session_state` does four steps. It removes the per-session lock entries. It calls `_teardown_session_terminals`. It runs the registry cleanup. It clears the caches with `_clear_session_agent_caches`. It does not cancel a creation task that is already in operation.\n\nRemoving a lock entry does not stop the holder. A coroutine that already holds the lock object keeps it. A later creator receives a new lock object, so the two creators no longer exclude each other.\n\n`_teardown_session_terminals` closes only the terminals that `list_for_conversation` returns at that moment. A terminal that is not yet registered is outside that list.\n\nTwo functions in `omnigent/runner/native/orchestration.py` publish a terminal. `_initialize_session` uses `_launch_native_terminal`. The terminal endpoint uses `_ensure_native_terminal`. Both resolve the configuration, then wait for the provider adapter. Neither compares the agent after the wait. Below them, `TerminalRegistry.launch` starts the terminal outside the registry lock and takes the slot only when the start is complete.\n\n**Sequence.**\n\n1. The creator resolves the spec of agent A. It starts the terminal.\n2. The reset runs. The slot is empty at that time, so the reset sees nothing to close.\n3. The creator completes. It takes the slot and registers the terminal.\n\n**Codex sessions lose more than a terminal.** Codex creation stores an app-server in the session slot before it registers the terminal. It creates the forwarder after registration. A reset that lands between these steps sees no terminal, and it does not remove the app-server. `reset_session_state` does not call `teardown_codex_native_app_server`. That helper runs on terminal exit, on idle reap, and on runner shutdown.\n\n**Related creators.** These paths also resolve a configuration, wait, and then register. Examine all of them, not only the two orchestration functions.\n\n* the OpenCode turn cold boot;\n* the direct launch in the terminal endpoint;\n* the attach-time REPL reconstruction;\n* the attach-time Qwen reconstruction;\n* `SysTerminalLaunchTool` from a tool call.\n\n**Why cleanup by key is not sufficient.** The registry does not record an agent or a spec. It registers under the session key. After a reset, a newer terminal for the current agent can hold that key. A close by key can therefore destroy the correct terminal.\n\n**Requirements for a correction.**\n\n* After a reset is complete, no terminal, forwarder or app-server from an earlier spec resolution stays registered.\n* Cleanup for a superseded creator does not remove a resource that a different path installed.\n\nDifferent designs satisfy these requirements. This report does not select one.\n\n**Test.** Put a latch in the terminal start procedure. Resolve the spec of agent A. Stop at the latch. Call `/reset-state` and wait for it to complete. Release the latch. Then make sure that no terminal, no forwarder and no app-server from that creator stays registered. Also make sure that each `session.resource.created` event has a related deletion event. A correction that permits the creation to complete and then removes the resources is satisfactory.\n\nFor a Codex session, set the latch after the app-server is stored and before the terminal registration is complete.\n\n**Reproduction.** This sequence comes from an examination of the code. Nobody executed it. A test adapter or a registry stub is necessary, because the timing is not stable with a real terminal.\n\n**Conditions.** The server refuses an agent change while a turn is in operation, thus the session must be idle. The runner reset is asynchronous and does not synchronize with the creation tasks. A session MCP-server edit calls `/agent-cache/reset`, which clears caches but does not close terminals.\n\n**Existing tests.** `tests/runner/test_session_resources.py` examines a reset that closes terminals that are already registered, and two concurrent creators that share one lock. No test stops a publication across a reset.\n\n**Related.**\n\n* omnigent-ai/omnigent#3728 — session deletion does not remove the runner state, and session IDs can occur again. This makes the interval longer.\n* omnigent-ai/omnigent#3950 — same area, and no timing interval is necessary.\n* omnigent-ai/omnigent#3951 — same shape, but a cache defect.\n* omnigent-ai/omnigent#3952 — the opposite direction of the same ownership problem.\n\n**Scope.** This defect is present at `1c6dfedc`.",
+    "labels": [
+      "Bug",
+      "validated:reproduced"
+    ],
+    "expected_type": "Bug",
+    "expected_actionability": [
+      "non_actionable"
+    ],
+    "expected_clarification": false,
+    "expected_close": true
+  },
+  {
+    "name": "unclear_export_failure_with_proposed_tests",
+    "title": "Transcript export can download an empty file",
+    "body": "Exporting a long session transcript can download an empty file while the session is still responding. The export handler reads a transcript snapshot before the pending messages are included. Expected: export the messages already displayed in Chat. Suggested validation: a unit test can simulate a pending snapshot and check that the downloaded file contains the visible messages.",
+    "labels": [
+      "Bug"
+    ],
+    "expected_type": "Bug",
+    "expected_actionability": [
+      "needs_info"
+    ],
+    "expected_clarification": false,
+    "expected_close": false
   }
 ]
