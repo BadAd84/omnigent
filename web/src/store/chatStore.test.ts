@@ -2165,12 +2165,12 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
   });
 
-  it("tears the old pump down before rebinding after a failed snapshot", async () => {
+  it("keeps the live pump and posts when only the history load failed", async () => {
     // A snapshot failure leaves `conversationLoadError` set while the pump it
-    // opened is STILL RUNNING — `bindStream` catches the error without aborting
-    // its controller. Rebinding blind then replaced the stored controller and
-    // left two subscribers on one entry, so any delta with no item id to dedupe
-    // on (live claude-native text) applied twice.
+    // opened is still running. History is retried on its own (Retry, reconnect),
+    // so a send must not tear that pump down: the message posts into the live
+    // stream, no second subscriber is opened, and the failure keeps surfacing as
+    // the history notice until a snapshot succeeds.
     seedSession("conv_two_subs", []);
     let failSnapshot = true;
     const openedStreams: AbortSignal[] = [];
@@ -2198,14 +2198,17 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(openedStreams).toHaveLength(1);
     expect(openedStreams[0]!.aborted).toBe(false);
 
-    // Sending rebinds, because the entry is not stream-current.
     await useChatStore.getState().send("after a failed load", "agent_xyz");
 
-    // The first pump was aborted rather than orphaned — one live subscriber.
-    expect(openedStreams).toHaveLength(2);
-    expect(openedStreams[0]!.aborted).toBe(true);
-    expect(openedStreams[1]!.aborted).toBe(false);
-    expect(entry.getState().conversationLoadError).toBeNull();
+    // Posted through the live pump: still one subscriber, never aborted.
+    const eventPosts = fetchMock.mock.calls.filter(
+      ([u, init]) =>
+        String(u).endsWith("/events") && (init as RequestInit | undefined)?.method === "POST",
+    );
+    expect(eventPosts).toHaveLength(1);
+    expect(openedStreams).toHaveLength(1);
+    expect(openedStreams[0]!.aborted).toBe(false);
+    expect(entry.getState().conversationLoadError).not.toBeNull();
   });
 
   it("degrades gracefully when stream rebind fails — message still posts", async () => {
@@ -2400,7 +2403,7 @@ describe("chatStore — send (first-send ordering)", () => {
       conversationId: "conv_existing",
       abortController: new AbortController(),
       pendingUserMessages: [],
-      pendingRetryStableId: "rec_slash",
+      pendingRetry: { stableId: "rec_slash", text: "/review" },
     });
     const records = (): Record<string, unknown> =>
       JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}");
@@ -2412,7 +2415,7 @@ describe("chatStore — send (first-send ordering)", () => {
     await useChatStore.getState().sendSlashCommand("review", "", "agent_xyz");
 
     expect(records()).toEqual({});
-    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(useChatStore.getState().pendingRetry).toBeNull();
   });
 
   it("records every send once its session id is known, not only the one that created the session", async () => {
@@ -3009,13 +3012,13 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     seedSession("conv_visible");
     await useChatStore.getState().switchTo("conv_target");
     await useChatStore.getState().switchTo("conv_visible");
-    useChatStore.setState({ pendingRetryStableId: "retry_visible" });
+    useChatStore.setState({ pendingRetry: { stableId: "retry_visible", text: "visible draft" } });
 
     await useChatStore.getState().send("background first message", "agent_xyz", undefined, {
       pinnedConversationId: "conv_target",
     });
 
-    expect(useChatStore.getState().pendingRetryStableId).toBe("retry_visible");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("retry_visible");
     const post = fetchMock.mock.calls.find(
       ([url, init]) =>
         String(url) === "/v1/sessions/conv_target/events" &&
@@ -12579,6 +12582,28 @@ describe("chatStore — client-side message queue", () => {
     useChatStore.setState({ conversationId: null });
     useChatStore.getState().enqueueMessage("orphan", undefined);
     expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("enqueueMessage carries a pending retry identity into the queue, once", () => {
+    // A recovered or restored message submitted mid-turn must keep its send
+    // identity, so the flush dedupes on the server and its acknowledgment clears
+    // the same durable record instead of leaving it to be recovered again.
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_abc",
+      boundAgentId: "agent_xyz",
+      status: "streaming",
+      sessionStatus: "running",
+      send: sendSpy,
+      pendingRetry: { stableId: "sid_recovered", text: "resend me" },
+    });
+    useChatStore.getState().enqueueMessage("resend me", undefined);
+    useChatStore.getState().enqueueMessage("a fresh follow-up", undefined);
+
+    const [recovered, fresh] = useChatStore.getState().queuedMessages;
+    expect(recovered!.stableId).toBe("sid_recovered");
+    expect(fresh!.stableId).not.toBe("sid_recovered");
+    expect(useChatStore.getState().pendingRetry).toBeNull();
   });
 
   it.each(["steer", "idle", "bulk"])("carries quote provenance from enqueue through %s", (mode) => {

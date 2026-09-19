@@ -783,11 +783,15 @@ export interface ConversationState {
     replyDraft?: StoredReplyDraft;
   } | null;
   /**
-   * Stable id set by the failedSendDraft restore path so the next send()
-   * call can reuse it instead of generating a fresh UUID, preventing a
-   * duplicate dispatch on retry.
+   * The message the composer carries for resend after a failed send or a
+   * recovery from a previous page: the send identity the server dedupes on,
+   * with the exact text that may reuse it. Kept together and conversation-
+   * scoped, so a composer remounted by a switch away and back still knows
+   * which text the identity belongs to. Consumed by the next `send`,
+   * `sendSlashCommand` or `enqueueMessage`; the composer drops it at submit
+   * when the outgoing text differs.
    */
-  pendingRetryStableId: string | null;
+  pendingRetry: { stableId: string; text: string } | null;
   /**
    * When a send last latched THIS conversation's `status` to "streaming", or
    * `null`. Conversation-scoped, not a module global, because `status` is now
@@ -1735,7 +1739,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   streamBudgetExceeded: false,
   streamBudgetBannerDismissed: false,
   failedSendDraft: null,
-  pendingRetryStableId: null,
+  pendingRetry: null,
   sendLatchedAt: null,
   llmModel: null,
   pendingModelChange: null,
@@ -1761,11 +1765,15 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   historyGeneration: 0,
 
   enqueueMessage: (text, files, replyDraft) => {
-    const { conversationId, boundAgentId } = get();
+    const { conversationId, boundAgentId, pendingRetry } = get();
     if (conversationId === null) return;
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
-    const stableId = randomUUID().replace(/-/g, "");
+    // A restored or recovered message keeps its identity through the queue
+    // (the composer already dropped it if the text changed), so the eventual
+    // POST dedupes and its acknowledgment clears the same durable record.
+    if (pendingRetry !== null) setActive({ pendingRetry: null });
+    const stableId = pendingRetry?.stableId ?? randomUUID().replace(/-/g, "");
     setActive((s) => ({
       queuedMessages: [
         ...s.queuedMessages,
@@ -2033,9 +2041,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const pinnedSetter: typeof setActive = pinnedId === null ? setActive : setterFor(pinnedId);
     const retryId =
       pinnedId === null
-        ? get().pendingRetryStableId
-        : (setterForState(pinnedId)?.pendingRetryStableId ?? null);
-    if (retryId !== null) pinnedSetter({ pendingRetryStableId: null });
+        ? (get().pendingRetry?.stableId ?? null)
+        : (setterForState(pinnedId)?.pendingRetry?.stableId ?? null);
+    if (retryId !== null) pinnedSetter({ pendingRetry: null });
     const stableId = opts?.stableId ?? retryId ?? randomUUID().replace(/-/g, "");
     // Sending while a response is already streaming is allowed — the
     // session API queues item-typed events and the server delivers them
@@ -2408,9 +2416,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // acknowledgment clears that record rather than leaving it to reappear.
     const retryRecordId =
       pinnedId === null
-        ? get().pendingRetryStableId
-        : (setterForState(pinnedId)?.pendingRetryStableId ?? null);
-    if (retryRecordId !== null) pinnedSetter({ pendingRetryStableId: null });
+        ? (get().pendingRetry?.stableId ?? null)
+        : (setterForState(pinnedId)?.pendingRetry?.stableId ?? null);
+    if (retryRecordId !== null) pinnedSetter({ pendingRetry: null });
     const unsentRecordId = retryRecordId ?? randomUUID().replace(/-/g, "");
     let unsentRecorded = false;
     const recordUnsent = (sessionId: string): void => {
@@ -2548,9 +2556,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   switchTo: async (conversationId) => {
     if (get().conversationId === conversationId) return;
 
-    // Whether this conversation is already live AND current decides everything
+    // Whether this conversation's stream is still live decides everything
     // below, so read it before anything can create the entry. A retained entry
-    // whose stream died (terminal status, failed bind) is deliberately NOT
+    // whose stream died (terminal status, idle disconnect) is deliberately NOT
     // treated as live: it must cold-bind again or it stays stale forever.
     const wasLive = conversationId !== null && isConversationStreamCurrent(conversationId);
 
@@ -3235,32 +3243,32 @@ function isConversationDisposed(id: string): boolean {
 }
 
 /**
- * Whether a live entry is actually still current — stream open, snapshot loaded.
+ * Whether a retained entry's stream is still open.
  *
- * Registry membership alone does NOT mean "up to date". `startStreamPump` clears
- * `abortController` when it stops for good (a terminal 401/403/404, or `[DONE]`),
- * and a failed `bindStream` leaves `conversationLoadError` set; neither releases
- * the entry. Treating those as live means returning to the conversation paints
- * whatever it held when the stream died and never reopens it — stale until the
- * next send. `switchTo` rebinds when this is false; `ensureBoundSession` makes
- * the same check before POSTing.
+ * Registry membership alone does NOT mean live: `startStreamPump` clears
+ * `abortController` when it stops for good (a terminal 401/403/404, or `[DONE]`)
+ * without releasing the entry. Treating that as live means returning to the
+ * conversation paints whatever it held when the stream died and never reopens
+ * it — stale until the next send. `switchTo` rebinds when this is false;
+ * `ensureBoundSession` makes the same check before POSTing. A history-load
+ * error is deliberately not a reason: hydration runs alongside the pump and is
+ * retried on its own, so a live pump with missing history keeps delivering
+ * events and must not be torn down for it.
  */
 function isConversationStreamCurrent(id: string): boolean {
   const entry = conversationRegistry.peek(id);
   if (entry === undefined || entry.disposed) return false;
-  const state = entry.getState();
-  return state.abortController !== null && state.conversationLoadError === null;
+  return entry.getState().abortController !== null;
 }
 
 /**
  * Tear down an entry's stream, keeping the entry itself alive.
  *
- * Needed before re-binding a live entry: a failed snapshot leaves
- * `conversationLoadError` set while its pump is still running (`bindStream`
- * catches the error without aborting), so binding again would strand the old
- * pump — two subscribers on one entry, double-applying any delta that carries no
- * item id to dedupe on. Aborting ends the reconnect loop and cancels the
- * in-flight fetch; `bindStream` installs the replacement controller.
+ * Needed before re-binding an entry that may still hold a controller: binding
+ * blind would strand the old pump — two subscribers on one entry,
+ * double-applying any delta that carries no item id to dedupe on. Aborting ends
+ * the reconnect loop and cancels the in-flight fetch; `bindStream` installs the
+ * replacement controller.
  */
 function abortConversationStream(entry: ConversationEntry): void {
   const { abortController } = entry.getState();
@@ -3396,7 +3404,7 @@ export async function ensureConversationStreamed(id: string): Promise<void> {
     // be dead — reusing it would strand a remounted pane on stale state. This
     // mirrors switchTo's `isConversationStreamCurrent` liveness gate.
     if (existing.getState().loadingConversation || isConversationStreamCurrent(id)) return;
-    // Dead or failed: drop the entry so the acquire below rebinds.
+    // Dead: drop the entry so the acquire below rebinds.
     conversationRegistry.release(id);
   }
   const entry = conversationRegistry.acquire(id);
@@ -3607,21 +3615,14 @@ async function ensureBoundSession(
     const streamCurrent = isConversationStreamCurrent(sessionId);
     const entry = conversationRegistry.acquire(sessionId);
     if (!streamCurrent) {
-      // The SSE pump is gone or the last bind failed — most commonly an HTTP
-      // intermediary closed the connection on idle, or this conversation was
-      // evicted and re-acquired. POSTing without a live pump would queue the
-      // message, run the turn, and publish events into an empty subscriber set;
-      // the user would never see the response. Rebind first. History hydration
-      // runs alongside: POST needs no snapshot, and a failed one must not drop
-      // the message — it surfaces as a history notice on the page instead.
-      //
-      // Tear the old pump down first. A snapshot failure leaves
-      // `conversationLoadError` set while its pump is STILL OPEN (`bindStream`
-      // catches the snapshot error without aborting the controller), so
-      // rebinding blind would replace the stored controller and leave two
-      // subscribers on one entry — and deltas with no item id, which nothing can
-      // dedupe, would then apply twice.
-      abortConversationStream(entry);
+      // The SSE pump is gone — most commonly an HTTP intermediary closed the
+      // connection on idle, or this conversation was evicted and re-acquired.
+      // POSTing without a live pump would queue the message, run the turn, and
+      // publish events into an empty subscriber set; the user would never see
+      // the response. Rebind first. History hydration runs alongside: POST
+      // needs no snapshot, and a failed one must not drop the message — it
+      // surfaces as a history notice on the page instead. A live pump whose
+      // history failed to load is left alone: it still delivers events.
       entry.setState({ conversationLoadError: null });
       const handle = await openConversationStream(
         sessionId,

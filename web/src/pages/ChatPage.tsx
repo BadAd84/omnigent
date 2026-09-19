@@ -3008,22 +3008,18 @@ function ComposerImpl(
   // are re-validated on the way in: when the upload itself was what failed
   // (a 415 on an unsupported type), re-arming the same file would only fail
   // again, so it's dropped with the same inline reason a fresh attach gives.
-  // The text whose send identity (`pendingRetryStableId`) the composer carries
-  // after a restore or recovery. Only that exact message may reuse the identity.
-  const retryTextRef = useRef<string | null>(null);
   // Decided at submit on the exact wire text — so history recall, quotes,
   // attachments and whitespace-only edits (indentation in a code prompt) are
   // all covered without enumerating every input path. Only a byte-identical
   // resend keeps the identity (the server dedupes it); anything else is a new
   // message and posts under a fresh stable_id, leaving the original's durable
-  // record in place.
+  // record in place. The identity and its text live together in the
+  // conversation's store state, so a composer remounted by a switch away and
+  // back still judges an edit against the recovered text.
   const settleRetryIdentity = (outgoingText: string, hasFiles: boolean): void => {
-    const carried = retryTextRef.current;
-    retryTextRef.current = null;
-    if (carried === null) return;
-    if (hasFiles || outgoingText !== carried) {
-      useChatStore.setState({ pendingRetryStableId: null });
-    }
+    const pending = useChatStore.getState().pendingRetry;
+    if (pending === null) return;
+    if (hasFiles || outgoingText !== pending.text) useChatStore.setState({ pendingRetry: null });
   };
   useEffect(() => {
     // Wait for the draft-restore effect to settle this conversation's text
@@ -3046,8 +3042,7 @@ function ComposerImpl(
         valueRef.current.trim() === unsent.text.trim() && filesRef.current.length === 0;
       if (!sameText && (valueRef.current.trim() !== "" || filesRef.current.length > 0)) return;
       markUnsentRecovered(unsent.recordId);
-      retryTextRef.current = unsent.text;
-      useChatStore.setState({ pendingRetryStableId: unsent.recordId });
+      useChatStore.setState({ pendingRetry: { stableId: unsent.recordId, text: unsent.text } });
       if (sameText) return;
       replaceText(unsent.text, unsent.replyDraft);
       textareaRef.current = tailTextareaRef.current;
@@ -3058,17 +3053,19 @@ function ComposerImpl(
     if (failedSendDraft.conversationId !== conversationId) return;
     useChatStore.setState({
       failedSendDraft: null,
-      pendingRetryStableId: failedSendDraft.stableId ?? null,
+      pendingRetry:
+        failedSendDraft.stableId === undefined
+          ? null
+          : { stableId: failedSendDraft.stableId, text: failedSendDraft.text },
     });
     // The user started something new while the send was in flight — their
     // in-progress text wins over a clobbering restore. The durable copy stays
     // either way: only the server's acknowledgment clears it, so a reload can
     // still recover the message with its identity.
     if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      useChatStore.setState({ pendingRetryStableId: null });
+      useChatStore.setState({ pendingRetry: null });
       return;
     }
-    retryTextRef.current = failedSendDraft.text;
     replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;

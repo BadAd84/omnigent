@@ -101,8 +101,8 @@ def test_send_works_and_history_notice_retries_when_snapshot_fails(
     _wait_for(page, lambda: [p.get("type") for p in posted] == ["message"])
     expect(composer).to_have_value("")
 
-    # The send rebound the stream and retried history in the background; with
-    # the route still failing, the notice is back once those retries run out.
+    # Sending leaves the live stream and its history state alone: no rebind, no
+    # silent retry, so the notice is still up until the user asks for one.
     expect(notice).to_be_visible(timeout=20_000)
     page.screenshot(path=tmp_path / "history-unavailable-notice.png")
 

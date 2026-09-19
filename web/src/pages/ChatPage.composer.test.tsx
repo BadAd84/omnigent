@@ -3223,7 +3223,7 @@ describe("Composer reply quotes", () => {
   });
 
   it("recovers a previous page's unacknowledged send into an empty composer with its identity", () => {
-    useChatStore.setState({ pendingRetryStableId: null });
+    useChatStore.setState({ pendingRetry: null });
     sessionStorage.setItem(
       "omnigent.unsentMessages",
       JSON.stringify({
@@ -3236,7 +3236,7 @@ describe("Composer reply quotes", () => {
     );
     render(<Composer {...composerProps()} />);
     expect(textarea()).toHaveValue("typed before the reload");
-    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_reload");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_reload");
     // Recovery is not acknowledgment: the record stays until the POST is accepted.
     expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
       "sid_reload",
@@ -3244,7 +3244,7 @@ describe("Composer reply quotes", () => {
   });
 
   it("keeps a recovered send's identity for an unchanged resend", () => {
-    useChatStore.setState({ pendingRetryStableId: null });
+    useChatStore.setState({ pendingRetry: null });
     sessionStorage.setItem(
       "omnigent.unsentMessages",
       JSON.stringify({
@@ -3256,11 +3256,60 @@ describe("Composer reply quotes", () => {
     expect(textarea()).toHaveValue("resend me as is");
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("resend me as is", undefined);
-    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_keep");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_keep");
+  });
+
+  it("judges an edit against the recovered text after the composer remounts", () => {
+    // Switching conversations remounts the composer while the conversation's
+    // store keeps the recovered identity. The text it belongs to has to survive
+    // that remount too, or an edited message would post under the old id and be
+    // deduped away by the server as a repeat of the original.
+    useChatStore.setState({ pendingRetry: null });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_remount: {
+          conversationId: "conv_test",
+          text: "first wording",
+          stableId: "sid_remount",
+        },
+      }),
+    );
+    const mounted = render(<Composer {...composerProps()} />);
+    expect(textarea()).toHaveValue("first wording");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_remount");
+    mounted.unmount();
+
+    // Back on the conversation: the record was already offered this page, so
+    // nothing re-recovers, but the identity is still armed in the store.
+    const props = composerProps();
+    render(<Composer {...props} />);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_remount");
+    fireEvent.change(textarea(), { target: { value: "first wording, edited" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("first wording, edited", undefined);
+    expect(useChatStore.getState().pendingRetry).toBeNull();
+  });
+
+  it("keeps a recovered send's identity for an unchanged resend after a remount", () => {
+    useChatStore.setState({ pendingRetry: null });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_back: { conversationId: "conv_test", text: "same after remount", stableId: "sid_back" },
+      }),
+    );
+    render(<Composer {...composerProps()} />).unmount();
+    const props = composerProps();
+    render(<Composer {...props} />);
+    fireEvent.change(textarea(), { target: { value: "same after remount" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("same after remount", undefined);
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_back");
   });
 
   it("drops a recovered send's identity when a different message is sent, even without typing", () => {
-    useChatStore.setState({ pendingRetryStableId: null });
+    useChatStore.setState({ pendingRetry: null });
     sessionStorage.setItem(
       "omnigent.unsentMessages",
       JSON.stringify({
@@ -3274,18 +3323,18 @@ describe("Composer reply quotes", () => {
     const props = composerProps();
     render(<Composer {...props} />);
     expect(textarea()).toHaveValue("original words");
-    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_edit");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_edit");
     // Recall replaces the text without a keystroke edit; the identity must still go.
     textarea().setSelectionRange(0, 0);
     fireEvent.keyDown(textarea(), { key: "ArrowUp" });
     expect(textarea()).toHaveValue("a different earlier prompt");
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("a different earlier prompt", undefined);
-    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(useChatStore.getState().pendingRetry).toBeNull();
   });
 
   it("drops a recovered send's identity when only inner whitespace changes", () => {
-    useChatStore.setState({ pendingRetryStableId: null });
+    useChatStore.setState({ pendingRetry: null });
     const code = "def f():\n    return 1";
     sessionStorage.setItem(
       "omnigent.unsentMessages",
@@ -3297,11 +3346,11 @@ describe("Composer reply quotes", () => {
     fireEvent.change(textarea(), { target: { value: "def f():\n  return 1" } });
     fireEvent.keyDown(textarea(), { key: "Enter" });
     expect(props.onSend).toHaveBeenCalledWith("def f():\n  return 1", undefined);
-    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(useChatStore.getState().pendingRetry).toBeNull();
   });
 
   it("keeps newer typed text over a recovered send, but re-attaches the identity to identical text", () => {
-    useChatStore.setState({ pendingRetryStableId: null });
+    useChatStore.setState({ pendingRetry: null });
     sessionStorage.setItem(
       "omnigent.unsentMessages",
       JSON.stringify({
@@ -3311,7 +3360,7 @@ describe("Composer reply quotes", () => {
     setSessionDraft("conv_test", { text: "something newer", files: [] });
     render(<Composer {...composerProps()} />);
     expect(textarea()).toHaveValue("something newer");
-    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    expect(useChatStore.getState().pendingRetry).toBeNull();
     cleanup();
 
     sessionStorage.setItem(
@@ -3323,7 +3372,7 @@ describe("Composer reply quotes", () => {
     setSessionDraft("conv_test", { text: "the same words", files: [] });
     render(<Composer {...composerProps()} />);
     expect(textarea()).toHaveValue("the same words");
-    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_b");
+    expect(useChatStore.getState().pendingRetry?.stableId).toBe("sid_b");
   });
 
   it.each([false, true])(
