@@ -753,6 +753,34 @@ async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Snapshots racing on a cold status cache share one probe and one warning."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "4e8b6d3a0f5c4c2d9a7e9b6f5c3d4e1a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first, second = await asyncio.gather(
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+        )
+
+    assert (first.status, second.status) == ("idle", "idle")
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert len([r for r in caplog.records if "Runner status probe" in r.getMessage()]) == 1
+    assert _mod._runner_status_probe_inflight.get(session_id) is None
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_status_probe_resumes_after_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -776,10 +804,14 @@ async def test_session_snapshot_status_probe_resumes_after_backoff(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_status_probe_backs_off_after_non_200(
+async def test_session_snapshot_status_probe_asks_again_after_non_200(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A runner that answers without a status is not asked again within the backoff."""
+    """A runner that does not know the session yet is asked again on the next snapshot.
+
+    A freshly bound runner answers 404 until session init lands; that answer is
+    cheap, so it must not put the session in the slow-probe backoff.
+    """
     from omnigent.server.routes import sessions as _mod
 
     session_id = "2c6f4b1e8d3a4a0b9e5c7f4d3a1b2c9e"
@@ -794,8 +826,9 @@ async def test_session_snapshot_status_probe_backs_off_after_non_200(
 
     assert first.status == "idle"
     assert second.status == "idle"
-    assert len(runner_client.get_calls) == 1
+    assert len(runner_client.get_calls) == 2
     assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
 
 
 @pytest.mark.asyncio
