@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import contextlib
+import contextvars
 import copy
 import json
 import logging
@@ -31,7 +32,7 @@ from rich.console import Console
 from rich.table import Table
 
 from omnigent._platform import IS_WINDOWS, resolve_repo_symlink
-from omnigent._startup_events import capture_cli_entry
+from omnigent._startup_events import capture_cli_entry, record_startup_event
 from omnigent.cli_common import (
     RESUME_PICKER_SENTINEL as _RESUME_PICKER_SENTINEL,
 )
@@ -124,7 +125,7 @@ def _load_config(path: str | None) -> dict[str, Any]:  # type: ignore[explicit-a
     """
     if path is None:
         return {}
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -594,7 +595,7 @@ def _migrate_legacy_state_dir() -> None:
     legacy_pid_file = legacy_src / "host.pid"
     if legacy_pid_file.exists():
         try:
-            first_line = legacy_pid_file.read_text().strip().splitlines()[0]
+            first_line = legacy_pid_file.read_text(encoding="utf-8").strip().splitlines()[0]
             legacy_pid = int(first_line)
         except (ValueError, OSError, IndexError):
             legacy_pid = None
@@ -869,8 +870,8 @@ def _peek_default_agent_harness(target: str) -> str | None:
     if not path.is_file():
         return None
     try:
-        raw = yaml.safe_load(path.read_text()) or {}
-    except (OSError, yaml.YAMLError):
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -1185,7 +1186,7 @@ def _save_global_config(  # type: ignore[explicit-any]
     path = _effective_global_config_path()
     _normalize_harness_scalar_on_write(cfg, path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -1273,7 +1274,7 @@ def _save_local_config(
         cfg.pop(key, None)
     _normalize_harness_scalar_on_write(cfg, path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=True)
 
 
@@ -2856,8 +2857,8 @@ def _read_daemon_record(path: Path) -> _HostDaemonRecord | None:
     :returns: Parsed daemon record, or ``None`` if unreadable or malformed.
     """
     try:
-        raw = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -2987,7 +2988,7 @@ def _load_existing_host_id() -> str | None:
 
     try:
         identity = load_host_identity_if_present()
-    except (OSError, yaml.YAMLError):
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
     return identity.host_id if identity is not None else None
 
@@ -3508,13 +3509,29 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         rather than continue this command mid-restart. ``False`` for a
         plain reuse, a transparent tunnel-health heal, or a first spawn.
     """
+    ensure_started_at = time.monotonic()
     target = _normalize_daemon_target(server_url)
     if server_url and _local_daemon_serves_target(target, server_url):
         # A caller may hand back the concrete URL discovered from local mode.
         # Re-enter through its ``local`` record so tunnel health is checked.
         return _ensure_host_daemon(None)
+    existing_before = _find_daemon_record(target)
+    process_was_running = existing_before is not None and _daemon_owner_is_live(existing_before)
+
+    def _record_host_state(action: str, *, running_before: bool = process_was_running) -> None:
+        record_startup_event(
+            "host_state_observed",
+            details={
+                "host_mode": "remote" if server_url else "local",
+                "host_process_state_at_launch": "running" if running_before else "not_running",
+                "host_process_action": action,
+                "host_ensure_elapsed_ms": round((time.monotonic() - ensure_started_at) * 1000, 3),
+            },
+        )
+
     decision = _reuse_existing_daemon_record(target)
     if decision.reuse:
+        _record_host_state("reused")
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
         # Cover a local daemon claiming this URL after the first check.
@@ -3522,16 +3539,20 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
-    args = [sys.executable, "-m", "omnigent.host._daemon_entry", *mode_args]
+    # Match runner/zygote startup: keep workspace code out of runtime imports
+    # without changing the caller's working directory or agent workspace.
+    args = [sys.executable, "-P", "-m", "omnigent.host._daemon_entry", *mode_args]
     config_sig = server_config_signature(include_features=not server_url)
     daemon_env = _build_host_daemon_env(server_url=server_url)
     daemon_env[DAEMON_CONFIG_SIG_ENV_VAR] = config_sig
     expected_host_id = _load_existing_host_id()
     spawned = _spawn_host_daemon_process(args=args, env=daemon_env)
     if spawned is None:
+        _record_host_state("start_failed")
         return False
     claimed = _wait_for_daemon_claim(target, spawned)
     if claimed is None:
+        _record_host_state("start_timeout")
         _stop_spawned_host_daemon_process(spawned)
         _delete_spawned_daemon_record(target, spawned)
         # The spawned daemon (or a concurrent winner) never wrote its record:
@@ -3543,6 +3564,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         )
     expected_host_id = expected_host_id or _load_existing_host_id()
     if expected_host_id is not None and claimed.host_id != expected_host_id:
+        _record_host_state("start_identity_mismatch")
         _stop_spawned_host_daemon_process(spawned)
         _delete_spawned_daemon_record(target, spawned)
         actual_host_id = claimed.host_id or "<missing>"
@@ -3552,6 +3574,13 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
             "Check OMNIGENT_HOST_ID, OMNIGENT_HOST_NAME, and OMNIGENT_CONFIG_HOME. "
             f"See {spawned.log_path}."
         )
+    if claimed.pid != spawned.pid:
+        action = "started_concurrently_during_launch"
+    elif process_was_running:
+        action = "restarted_during_launch"
+    else:
+        action = "started_during_launch"
+    _record_host_state(action)
     return decision.config_changed
 
 
@@ -3643,7 +3672,7 @@ def _read_host_pid_file() -> tuple[int, str] | None:
     if not _HOST_PID_PATH.exists():
         return None
     try:
-        lines = _HOST_PID_PATH.read_text().strip().splitlines()
+        lines = _HOST_PID_PATH.read_text(encoding="utf-8").strip().splitlines()
         if len(lines) < 2:
             return None
         return int(lines[0]), lines[1]
@@ -3808,7 +3837,8 @@ def _ensure_backend(server: str | None) -> str:
             concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool,
         ):
             auth_future = pool.submit(_ensure_databricks_server_auth, server)
-            daemon_future = pool.submit(_ensure_host_daemon, server)
+            daemon_context = contextvars.copy_context()
+            daemon_future = pool.submit(daemon_context.run, _ensure_host_daemon, server)
             # Raise auth errors before daemon errors: a login failure is
             # more actionable than a daemon-connect failure that would
             # have been caused by the same missing credentials.
@@ -4245,6 +4275,17 @@ def _assert_server_port_bindable(host: str, port: int) -> None:
         "loopback port and prints its URL."
     ),
 )
+@click.option(
+    "--base-path",
+    default=None,
+    help=(
+        "Public URL path prefix when serving behind a subpath reverse proxy, "
+        "e.g. --base-path /proxy/6767 for code-server's port proxy "
+        "(alternative to OMNIGENT_WEB_BASE_PATH). The Web UI prefixes its "
+        "API/WebSocket/asset URLs with this, and the server accepts requests "
+        "with or without the prefix. Default: served at the origin root."
+    ),
+)
 @click.pass_context
 def server(
     ctx: click.Context,
@@ -4259,6 +4300,7 @@ def server(
     auto_open: bool,
     admin_password: str | None,
     background: bool,
+    base_path: str | None,
 ) -> None:
     """Start the Omnigent server, or manage the background server.
 
@@ -4294,12 +4336,25 @@ def server(
     :param background: When True, spawn the server as a detached background
         process (the managed local server) instead of running it in the
         foreground.
+    :param base_path: Optional public URL path prefix from ``--base-path``,
+        e.g. ``"/proxy/6767"``. Folded into the ``OMNIGENT_WEB_BASE_PATH`` env
+        var that ``create_app`` reads; ``None`` leaves the env var untouched.
     :returns: None.
     """
     if ctx.invoked_subcommand is not None:
         # A subcommand (stop/status) handles this invocation; the body
         # below is the server path for the bare ``server`` group.
         return
+
+    # --base-path is sugar for OMNIGENT_WEB_BASE_PATH, which create_app reads.
+    # An env var (not a create_app kwarg) so the same toggle reaches every
+    # startup path (Docker entrypoint, canonical local server, e2e harness)
+    # that builds the app outside this command. Assigned (not setdefault) so an
+    # explicit flag wins over an inherited value and a --background reuse detects
+    # the change. Folded in before the --background branch below so a detached
+    # server (which spawns inheriting this process's environ) picks it up too.
+    if base_path:
+        os.environ["OMNIGENT_WEB_BASE_PATH"] = base_path
 
     if background:
         # `omnigent server --background` is the canonical spelling for the
@@ -4904,6 +4959,13 @@ def server_status(json_output: bool) -> None:
 @cli.command("start")
 @click.option("--server", default=None, help="Omnigent server URL to host on.")
 @click.option(
+    "--no-open",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_NO_OPEN",
+    show_envvar=True,
+    help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
+)
+@click.option(
     "--non-interactive",
     "non_interactive",
     is_flag=True,
@@ -4914,7 +4976,7 @@ def server_status(json_output: bool) -> None:
         "launching the browser login flow. Use this in scripts and CI."
     ),
 )
-def start(server: str | None, non_interactive: bool) -> None:
+def start(server: str | None, no_open: bool, non_interactive: bool) -> None:
     """Start Omnigent on this machine, in the background.
 
     The on switch, and the counterpart of ``omnigent stop``: brings up the
@@ -4930,6 +4992,7 @@ def start(server: str | None, non_interactive: bool) -> None:
     :param server: Omnigent server URL to host on, e.g.
         ``"https://example.databricksapps.com"``. ``None`` falls back to
         config; empty string forces local mode.
+    :param no_open: When ``True``, skip automatically opening the host web UI.
     :param non_interactive: When ``True``, never launch the browser login for
         an un-authed remote server — fail with the ``omnigent login`` hint
         instead.
@@ -4939,6 +5002,7 @@ def start(server: str | None, non_interactive: bool) -> None:
         _resolve_host_server(server),
         stop_command=f"{cli_invocation()} stop",
         non_interactive=non_interactive,
+        no_open=no_open,
     )
 
 
@@ -5018,7 +5082,7 @@ def _write_uninstall_manifest(ledger: InstallLedger) -> Path:
     """Write the ledger fields the POSIX uninstaller needs as tab records."""
     fd, manifest_name = tempfile.mkstemp(prefix="omnigent-uninstall-ledger-", suffix=".tsv")
     manifest = Path(manifest_name)
-    with os.fdopen(fd, "w") as handle:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
         for profile in ledger.entries.profiles:
             handle.write(
                 "\t".join(
@@ -6070,7 +6134,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     # ── config.yaml ──────────────────────────────────
     config_path = source / "config.yaml"
     if config_path.exists():
-        raw = yaml.safe_load(config_path.read_text())
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
         if isinstance(raw, dict):
             changed = _expand_config_env_vars(raw, expand_env_vars)
             if changed:
@@ -6086,7 +6150,7 @@ def _resolve_bundle_env_vars(source: Path) -> dict[str, str]:
     mcp_dir = source / "tools" / "mcp"
     if mcp_dir.is_dir():
         for yaml_file in sorted(mcp_dir.glob("*.yaml")):
-            raw = yaml.safe_load(yaml_file.read_text())
+            raw = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
             if not isinstance(raw, dict):
                 continue
             changed = False
@@ -7399,7 +7463,7 @@ def _materialize_harness_launcher_file(
     }
     if canonical in _OS_ENV_HARNESSES:
         raw["os_env"] = {"type": "caller_process", "sandbox": {"type": "none"}}
-    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False))
+    yaml_path.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
     return yaml_path
 
 
@@ -9376,19 +9440,27 @@ def _maybe_open_host_web_ui(
     server_url: str,
     *,
     non_interactive: bool,
+    no_open: bool,
     cfg: dict[str, Any] | None = None,  # type: ignore[explicit-any]
 ) -> None:
     """Open the host web UI when interactive and enabled."""
-    if non_interactive or not _stdin_is_tty():
+    if no_open or non_interactive or not _stdin_is_tty():
         return
     if cfg is None:
         cfg = _load_effective_config()
     if _resolve_auto_open_conversation_setting(cfg) is False:
         return
     from omnigent.conversation_browser import open_conversation_url
+    from omnigent.host.local_server import local_server_base_path
     from omnigent.util.server_url import display_server_url
 
     web_url = display_server_url(server_url)
+    # A local server started with --base-path serves the UI under that prefix;
+    # opening the bare root renders blank (BrowserRouter basename mismatch).
+    # No-op for a remote --server or an unconfigured/root local server.
+    base_path = local_server_base_path(server_url)
+    if base_path:
+        web_url = web_url.rstrip("/") + base_path
     try:
         opened = open_conversation_url(web_url)
     except OSError:
@@ -9402,6 +9474,7 @@ def _run_background_host(
     *,
     stop_command: str,
     non_interactive: bool,
+    no_open: bool,
 ) -> None:
     """Spawn (or reuse) the detached host daemon and report it.
 
@@ -9423,6 +9496,7 @@ def _run_background_host(
         matches how it was invoked.
     :param non_interactive: When ``True``, never launch the browser login —
         fail with the ``omnigent login`` hint instead.
+    :param no_open: When ``True``, skip automatically opening the host web UI.
     :raises click.ClickException: If the daemon cannot be spawned, exits
         immediately, fails to register, or (local mode) never serves its local
         Omnigent server.
@@ -9481,7 +9555,7 @@ def _run_background_host(
     click.echo()
     click.echo(_cli_style("Stop it with:", dim=True))
     click.echo(f"  {_cli_style(stop_command, bold=True)}")
-    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive)
+    _maybe_open_host_web_ui(server_url, non_interactive=non_interactive, no_open=no_open)
 
 
 def _echo_host_field(label: str, value: str) -> None:
@@ -9516,6 +9590,13 @@ def _host_stop_command(explicit_server: str | None) -> str:
 @cli.group("host", cls=_HostGroup, invoke_without_command=True)
 @click.option("--server", default=None, help="Remote omnigent server URL.")
 @click.option(
+    "--no-open",
+    is_flag=True,
+    envvar="OMNIGENT_HOST_NO_OPEN",
+    show_envvar=True,
+    help="Skip opening the host web UI in a browser. Sign-in may still open a browser.",
+)
+@click.option(
     "--background",
     "background",
     is_flag=True,
@@ -9543,6 +9624,7 @@ def host(
     ctx: click.Context,
     server: str | None,
     background: bool,
+    no_open: bool,
     non_interactive: bool,
 ) -> None:
     """
@@ -9554,6 +9636,7 @@ def host(
       omnigent host --server https://omnigent-app.databricksapps.com
       omnigent host ""   # spawn + connect to a local server
       omnigent host --background   # spawn detached, return immediately
+      omnigent host --no-open   # connect without opening the web UI
       omnigent host enable   # install and start a per-user system service
       omnigent host disable  # stop and remove the per-user system service
 
@@ -9576,6 +9659,7 @@ def host(
         to config; empty string selects local mode.
     :param background: When ``True``, spawn the daemon detached and return
         instead of running the daemon loop in the foreground.
+    :param no_open: When ``True``, skip automatically opening the host web UI.
     :param non_interactive: When ``True``, never launch the browser login
         for an un-authed remote server — fail with the ``omnigent login``
         hint instead.
@@ -9603,6 +9687,7 @@ def host(
             server,
             stop_command=_host_stop_command(explicit_server),
             non_interactive=non_interactive,
+            no_open=no_open,
         )
         return
 
@@ -9641,7 +9726,7 @@ def host(
         # (or a headless invocation) fails loud with the command to run.
         if remote_mode:
             _ensure_databricks_server_auth(server, non_interactive=non_interactive)
-        _maybe_open_host_web_ui(server, non_interactive=non_interactive, cfg=cfg)
+        _maybe_open_host_web_ui(server, non_interactive=non_interactive, no_open=no_open, cfg=cfg)
         run_host_process(server_url=server, daemon_target=target)
         stopped_cleanly = True
     except KeyboardInterrupt:
@@ -13583,8 +13668,8 @@ def _bundled_agent_brain_harness(name: str) -> str | None:
     if not config_path.is_file():
         return None
     try:
-        raw = yaml.safe_load(config_path.read_text()) or {}
-    except (OSError, yaml.YAMLError):
+        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+    except (OSError, UnicodeDecodeError, yaml.YAMLError):
         return None
     if not isinstance(raw, dict):
         return None
@@ -13908,4 +13993,8 @@ _register_native_commands(cli)
 
 
 if __name__ == "__main__":
+    # Omnigent is already loaded from the selected installation. Restore the
+    # workspace path for local tools, matching the console entry point.
+    if (_cwd := os.getcwd()) not in sys.path:
+        sys.path.insert(0, _cwd)
     cli()

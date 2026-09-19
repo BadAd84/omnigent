@@ -13,6 +13,7 @@ from pathlib import Path
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
+    CLAUDE_FRAMEWORK_CONTEXT_FILE,
     REQUEST_SESSION_ID_ENV_VAR,
     SWITCH_MODEL_DIALOG_HINT,
     ClaudePromptTimeout,
@@ -26,6 +27,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_claude_status_model,
     read_launch_model,
     read_model_env,
+    read_model_picker_values,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -38,7 +40,11 @@ from omnigent.inner.executor import (
     TurnComplete,
     describe_exception,
 )
-from omnigent.inner.native_attachments import attachment_reference_line
+from omnigent.inner.native_attachments import (
+    FRAMEWORK_NOTICE_BLOCK_TYPE,
+    attachment_reference_line,
+    framework_notices,
+)
 from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
 
 _logger = logging.getLogger(__name__)
@@ -114,10 +120,22 @@ class ClaudeNativeExecutor(Executor):
             return False
         try:
             async with self._inject_lock:
-                await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+                await self._inject_prompt(text, framework_notices(content))
         except RuntimeError:
             return False
         return True
+
+    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
+        """Inject user text with one-shot context while holding the injection lock."""
+        context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+        context_path.unlink(missing_ok=True)
+        if notices:
+            context_path.write_text("\n\n".join(notices), encoding="utf-8")
+        try:
+            await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+        except BaseException:
+            context_path.unlink(missing_ok=True)
+            raise
 
     async def run_turn(
         self,
@@ -159,6 +177,7 @@ class ClaudeNativeExecutor(Executor):
             )
             return
         text = _latest_user_text(messages, self._bridge_dir)
+        notices = _latest_framework_notices(messages)
         if not text:
             yield ExecutorError(message="Claude native turn had no user text to send")
             return
@@ -197,12 +216,14 @@ class ClaudeNativeExecutor(Executor):
         # box and verifies its submit) delivers the message — in order,
         # once.
         wanted_model = config.model if config is not None else None
-        # ``/model`` only accepts this session's aliases / custom slot; a
-        # bare catalog id is ignored and the pane keeps its old model.
+        # ``/model`` only accepts this session's picker values, aliases, and
+        # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
         try:
             with telemetry.span("claude_native.inject"):
                 async with self._inject_lock:
+                    context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+                    context_path.unlink(missing_ok=True)
                     if wanted_model_arg is not None:
                         # Accepted trade-off: ``/model <id>`` also saves the
                         # pick as the person's global default for new Claude
@@ -221,9 +242,7 @@ class ClaudeNativeExecutor(Executor):
                         # Track the routed id, not the alias: the next turn's
                         # comparison is against what routing asked for.
                         self._applied_model = wanted_model
-                    await self._inject(
-                        partial(inject_user_message, self._bridge_dir, content=text)
-                    )
+                    await self._inject_prompt(text, notices)
         except ClaudePromptTimeout as exc:
             _logger.exception(
                 "claude-native: prompt delivery to harness timed out",
@@ -286,9 +305,10 @@ class ClaudeNativeExecutor(Executor):
         Two gates: the switch must be needed at all
         (:meth:`_should_switch_model`), and the routed catalog id must
         translate into vocabulary ``/model`` accepts — the session's
-        family aliases, or the exact id of its custom picker slot. The
-        pinning comes from the terminal's launch env, recorded in the
-        bridge config because this process doesn't share that env.
+        picker values, its family aliases, or the exact id of its custom
+        picker slot. Both the pinning and the picker come from the launch,
+        recorded in the bridge config because this process doesn't share
+        the terminal's env.
 
         An untranslatable id fails open: the message still goes in, on
         the current model, with a warning. Typing a value the CLI won't
@@ -312,19 +332,24 @@ class ClaudeNativeExecutor(Executor):
             )
             return None
         env = read_model_env(self._bridge_dir) or None
-        wanted_arg = claude_model_command_arg(wanted_model, env)
+        # The launch recorded this pane's picker, which is the only
+        # vocabulary that spells a managed model of no Claude family.
+        picker_values = read_model_picker_values(self._bridge_dir)
+        wanted_arg = claude_model_command_arg(wanted_model, env, picker_values=picker_values)
         if wanted_arg is None:
             _logger.warning(
                 "claude-native: skipping /model — routed model %r has no spelling this "
-                "session accepts (pins=%s); sending the turn on the current model",
+                "session accepts (pins=%s, picker=%s); sending the turn on the current model",
                 wanted_model,
                 sorted(env or ()),
+                picker_values,
                 extra={"session_id": self._request_session_id},
             )
             return None
         if (
             self._applied_model is not None
-            and claude_model_command_arg(self._applied_model, env) == wanted_arg
+            and claude_model_command_arg(self._applied_model, env, picker_values=picker_values)
+            == wanted_arg
         ):
             # Resolves to the model the pane is already on, so the switch
             # would be a pointless prompt (and can pop a confirm dialog).
@@ -466,6 +491,8 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type", "")
+            if block_type == FRAMEWORK_NOTICE_BLOCK_TYPE:
+                continue
             if block_type == "input_text":
                 text = block.get("text")
                 if isinstance(text, str):
@@ -475,3 +502,11 @@ def _content_to_text(content: EnqueuedContent, bridge_dir: Path) -> str:
         parts = attachment_lines + text_parts
         return "\n\n".join(parts)
     return ""
+
+
+def _latest_framework_notices(messages: list[Message]) -> list[str]:
+    """Return framework context attached to the latest user turn."""
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return framework_notices(message.get("content"))
+    return []

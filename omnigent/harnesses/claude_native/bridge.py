@@ -29,6 +29,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import functools
 import hashlib
 import ipaddress
 import json
@@ -45,7 +46,7 @@ import tempfile
 import threading
 import time
 import urllib.parse
-from collections.abc import Awaitable, Callable, Iterator, Mapping
+from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import asdict, dataclass
 from datetime import datetime
@@ -53,7 +54,7 @@ from http import HTTPStatus
 from http.client import HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 from urllib import request
 
 from omnigent._platform import is_wsl, stable_user_id
@@ -78,14 +79,34 @@ from omnigent.native import native_bridge_common
 from omnigent.tools.base import Tool, ToolContext
 from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 
+CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+
 _logger = logging.getLogger(__name__)
 _INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
     "claude_native_injection_cancel_event", default=None
 )
+_INJECTION_LOCKS_GUARD = threading.Lock()
+_INJECTION_LOCKS: dict[str, threading.Lock] = {}
+_InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
+
+
+def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunction:
+    """Serialize complete tmux injection operations for each bridge directory."""
+
+    @functools.wraps(function)
+    def wrapped(bridge_dir: Path, *args: Any, **kwargs: Any) -> Any:
+        key = os.path.normcase(os.path.abspath(os.fspath(bridge_dir)))
+        with _INJECTION_LOCKS_GUARD:
+            lock = _INJECTION_LOCKS.setdefault(key, threading.Lock())
+        with lock:
+            return function(bridge_dir, *args, **kwargs)
+
+    return cast(_InjectionFunction, wrapped)
+
 
 # Bind/advertise coordinates for the bridge's HTTP servers (the tool relay and
 # the MCP control ingress). These default to loopback (127.0.0.1) so an
@@ -1462,6 +1483,7 @@ def prepare_bridge_dir(
     workspace: Path,
     launch_model: str | None = None,
     launch_env: Mapping[str, str] | None = None,
+    picker_values: Sequence[str] | None = None,
     sandbox: OSEnvSandboxSpec | None = None,
 ) -> Path:
     """
@@ -1482,6 +1504,10 @@ def prepare_bridge_dir(
         ``ANTHROPIC_CUSTOM_MODEL_OPTION``) are persisted so runner-side
         callers — which don't share the terminal's env — can translate a
         routed model id into a ``/model`` argument the CLI accepts.
+    :param picker_values: The ``/model`` spellings this session's picker
+        offers, e.g. ``["system.ai.glm-5-3"]``. Persisted for the same
+        translation: a gateway-managed picker names rows by served id, and
+        no pin spells those.
     :param sandbox: Resolved ``os_env.sandbox`` for this session (the
         agent spec's declared sandbox, already overridden by any
         ``enforce_sandbox``/``force_sandbox`` policy verdict). Persisted
@@ -1494,53 +1520,56 @@ def prepare_bridge_dir(
     """
     resolved_bridge_id = bridge_id or conversation_id
     bridge_dir = bridge_dir_for_bridge_id(resolved_bridge_id)
-    _ensure_secure_dir(bridge_dir)
-    # A parked permission hook only touches files in this root, so the runner
-    # owns creating and validating it before any hook can fire. Derived from the
-    # bridge dir just validated rather than read from the module global, so it
-    # lands in the same tree the caller asked for.
-    _ensure_secure_dir(bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME)
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    token = config.get("token") if isinstance(config, dict) else None
-    if not isinstance(token, str) or not token:
-        token = secrets.token_urlsafe(32)
-    payload: dict[str, object] = {
-        "bridge_id": resolved_bridge_id,
-        "active_session_id": conversation_id,
-        "conversation_id": conversation_id,
-        "workspace": str(workspace),
-        "token": token,
-        "updated_at": time.time(),
-    }
-    if launch_model is not None:
-        payload["launch_model"] = launch_model
-    model_env = {
-        key: launch_env[key]
-        for key in MODEL_VOCABULARY_ENV_VARS
-        if launch_env is not None and launch_env.get(key)
-    }
-    if model_env:
-        payload["model_env"] = model_env
-    if sandbox is not None:
-        payload["sandbox"] = _bridge_sandbox_payload(sandbox)
-    _write_json_file(bridge_dir / _CONFIG_FILE, payload)
-    # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
-    # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
-    # breaks approval routing on reattach/rebind. ``build_hook_settings``
-    # rewrites it on cold launch.
-    for filename in (
-        _SERVER_FILE,
-        _STATE_FILE,
-        _HOOKS_FILE,
-        OBSERVER_HOOK_STDERR_FILE,
-        _TOOL_RELAY_FILE,
-        _TMUX_FILE,
-    ):
-        with contextlib.suppress(FileNotFoundError):
-            (bridge_dir / filename).unlink()
-    # Owner-pid marker for the periodic dead-owner prune; refreshed every
-    # turn so it always names the current runner. See native_bridge_common.
-    native_bridge_common.write_owner_pid_marker(bridge_dir)
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+        _ensure_secure_dir(bridge_dir)
+        # A parked permission hook only touches files in this root, so the runner
+        # owns creating and validating it before any hook can fire. Derived from the
+        # bridge dir just validated rather than read from the module global, so it
+        # lands in the same tree the caller asked for.
+        _ensure_secure_dir(bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME)
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        token = config.get("token") if isinstance(config, dict) else None
+        if not isinstance(token, str) or not token:
+            token = secrets.token_urlsafe(32)
+        payload: dict[str, object] = {
+            "bridge_id": resolved_bridge_id,
+            "active_session_id": conversation_id,
+            "conversation_id": conversation_id,
+            "workspace": str(workspace),
+            "token": token,
+            "updated_at": time.time(),
+        }
+        if launch_model is not None:
+            payload["launch_model"] = launch_model
+        model_env = {
+            key: launch_env[key]
+            for key in MODEL_VOCABULARY_ENV_VARS
+            if launch_env is not None and launch_env.get(key)
+        }
+        if model_env:
+            payload["model_env"] = model_env
+        if picker_values is not None:
+            payload["model_picker_values"] = list(picker_values)
+        if sandbox is not None:
+            payload["sandbox"] = _bridge_sandbox_payload(sandbox)
+        _write_json_file(bridge_dir / _CONFIG_FILE, payload)
+        # Keep ``_PERMISSION_HOOK_FILE`` — the PermissionRequest command hook
+        # reads the Omnigent server URL from it at runtime, so wiping it on re-prep
+        # breaks approval routing on reattach/rebind. ``build_hook_settings``
+        # rewrites it on cold launch.
+        for filename in (
+            _SERVER_FILE,
+            _STATE_FILE,
+            _HOOKS_FILE,
+            OBSERVER_HOOK_STDERR_FILE,
+            _TOOL_RELAY_FILE,
+            _TMUX_FILE,
+        ):
+            with contextlib.suppress(FileNotFoundError):
+                (bridge_dir / filename).unlink()
+        # Owner-pid marker for the periodic dead-owner prune; refreshed every
+        # turn so it always names the current runner. See native_bridge_common.
+        native_bridge_common.write_owner_pid_marker(bridge_dir)
     return bridge_dir
 
 
@@ -1549,7 +1578,7 @@ def prune_orphaned_bridge_dirs() -> int:
     Remove claude-native bridge dirs whose owner process is provably dead.
 
     Delegates to the shared sweep against this harness's bridge root; the
-    runner calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+    global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
     at startup to reclaim dirs leaked by a prior runner that died without
     running the explicit delete path.
 
@@ -1734,11 +1763,29 @@ def read_model_env(bridge_dir: Path) -> dict[str, str]:
     }
 
 
+def read_model_picker_values(bridge_dir: Path) -> list[str]:
+    """
+    Read the ``/model`` spellings this session's picker offers.
+
+    :param bridge_dir: Bridge directory path.
+    :returns: Picker values, e.g. ``["system.ai.glm-5-3"]``; empty when the
+        launch recorded no catalog (an older session, or a failed probe).
+    """
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    if not isinstance(config, dict):
+        return []
+    values = config.get("model_picker_values")
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str) and value]
+
+
 def record_model_vocabulary(
     bridge_dir: Path,
     *,
     launch_env: Mapping[str, str] | None,
     launch_model: str | None,
+    picker_values: Sequence[str] | None = None,
 ) -> None:
     """
     Persist the launch's model vocabulary after the bridge dir exists.
@@ -1755,25 +1802,54 @@ def record_model_vocabulary(
         ``None`` for a bare subscription launch.
     :param launch_model: The model the launch pins via ``--model``, or
         ``None``.
+    :param picker_values: The ``/model`` spellings this session's picker
+        offers, or ``None`` when the catalog is unknown. An empty list clears it.
     :returns: None.
     """
-    config = _read_json_file(bridge_dir / _CONFIG_FILE)
-    if not isinstance(config, dict):
-        return
-    model_env = {
-        key: launch_env[key]
-        for key in MODEL_VOCABULARY_ENV_VARS
-        if launch_env is not None and launch_env.get(key)
-    }
-    changed = False
-    if model_env and config.get("model_env") != model_env:
-        config["model_env"] = model_env
-        changed = True
-    if launch_model and config.get("launch_model") != launch_model:
-        config["launch_model"] = launch_model
-        changed = True
-    if changed:
-        _write_json_file(bridge_dir / _CONFIG_FILE, config)
+    # Read-modify-write under the bridge dir's cross-process lock so a
+    # vocabulary refresh (e.g. serving model options) can never replace a
+    # concurrent bridge preparation's config — sandbox settings included —
+    # with its own stale read.
+    with _bridge_config_write_lock(bridge_dir):
+        config = _read_json_file(bridge_dir / _CONFIG_FILE)
+        if not isinstance(config, dict) or not config:
+            # No prepared bridge config yet (missing/malformed reads as {}):
+            # recording would materialize an incomplete bridge dir that has
+            # no owner.pid, which orphan pruning then skips forever.
+            return
+        model_env = {
+            key: launch_env[key]
+            for key in MODEL_VOCABULARY_ENV_VARS
+            if launch_env is not None and launch_env.get(key)
+        }
+        changed = False
+        if model_env and config.get("model_env") != model_env:
+            config["model_env"] = model_env
+            changed = True
+        if picker_values is not None and config.get("model_picker_values") != list(picker_values):
+            config["model_picker_values"] = list(picker_values)
+            changed = True
+        if launch_model and config.get("launch_model") != launch_model:
+            config["launch_model"] = launch_model
+            changed = True
+        if changed:
+            _write_json_file(bridge_dir / _CONFIG_FILE, config)
+
+
+@contextlib.contextmanager
+def _bridge_config_write_lock(bridge_dir: Path) -> Iterator[None]:
+    """Cross-process mutual exclusion for bridge-config read-modify-writes.
+
+    Uses the same on-disk lock file as bridge-dir preparation
+    (``<bridge root>/.locks/<bridge dir>.lock``), so config rewrites and
+    :func:`prepare_bridge_dir` exclude each other across processes.
+    """
+    from filelock import FileLock
+
+    lock_dir = bridge_dir.parent / ".locks"
+    lock_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with FileLock(str(lock_dir / f"{bridge_dir.name}.lock"), mode=0o600):
+        yield
 
 
 def read_bridge_id(bridge_dir: Path) -> str | None:
@@ -1958,6 +2034,19 @@ def build_hook_settings(
     observer_stderr = shlex.quote(str(bridge_dir / OBSERVER_HOOK_STDERR_FILE))
     command = f"{shlex.join(command_parts)} 2>> {observer_stderr}"
     hook = {"type": "command", "command": command}
+    framework_context_parts = [
+        python,
+        "-I",
+        "-m",
+        "omnigent.harnesses.claude_native.hook",
+        "framework-context",
+        "--bridge-dir",
+        str(bridge_dir),
+    ]
+    framework_context_hook = {
+        "type": "command",
+        "command": f"{shlex.join(framework_context_parts)} 2>> {observer_stderr}",
+    }
     session_start_hook = {
         "type": "command",
         "command": command,
@@ -1985,7 +2074,7 @@ def build_hook_settings(
         # (web-UI message via tmux send-keys, or direct keystrokes
         # into the embedded terminal). The transcript forwarder
         # translates it into ``session.status: running``.
-        "UserPromptSubmit": [{"hooks": [hook]}],
+        "UserPromptSubmit": [{"hooks": [hook, framework_context_hook]}],
         # ``TaskCreated`` fires when Claude creates a new native task
         # (shown with ``□`` in the TUI). The payload carries ``task_id``
         # and ``task_subject``; the forwarder converts all current tasks
@@ -2003,9 +2092,13 @@ def build_hook_settings(
         # calls ``TaskUpdate`` to change a native task's status (e.g.
         # to ``"in_progress"``). The payload carries ``tool_input.taskId``
         # and ``tool_input.status``.
+        # ``EnterWorktree`` / ``ExitWorktree`` move the session transcript
+        # into the new cwd's ``~/.claude/projects/<slug>/`` dir; observing
+        # them hands the forwarder the moved path now, not at the turn's Stop.
         "PostToolUse": [
             {"matcher": "TodoWrite", "hooks": [hook]},
             {"matcher": "TaskUpdate", "hooks": [hook]},
+            {"matcher": "EnterWorktree|ExitWorktree", "hooks": [hook]},
         ],
         # ``PreCompact`` fires right before Claude compacts its own
         # context — for both a manual ``/compact`` (web-UI button or
@@ -3633,6 +3726,7 @@ def write_tmux_target(
     _write_json_file(bridge_dir / _TMUX_FILE, payload)
 
 
+@_serialize_bridge_injection
 def inject_user_message(
     bridge_dir: Path,
     *,
@@ -4056,6 +4150,7 @@ def kill_session(
         raise
 
 
+@_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
     *,
@@ -4668,6 +4763,7 @@ def post_tools_changed(
     bridge_dir: Path,
     *,
     timeout_s: float = _TOOLS_CHANGED_READY_TIMEOUT_S,
+    cancelled: threading.Event | None = None,
 ) -> None:
     """
     Notify Claude Code that the MCP tool list changed.
@@ -4679,12 +4775,13 @@ def post_tools_changed(
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait for the bridge HTTP control
         endpoint to publish itself, e.g. ``30.0``.
+    :param cancelled: Stops waiting when the notifying task is cancelled.
     :returns: None.
     :raises RuntimeError: If the bridge server is not ready, cannot
         be reached, or rejects the notification.
     """
     try:
-        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s)
+        server = _wait_for_server_info(bridge_dir, timeout_s=timeout_s, cancelled=cancelled)
     except OSError as exc:
         # Reading the advertisement can fail for reasons other than the file
         # being absent — fd exhaustion is the one seen in the wild. Callers
@@ -6977,7 +7074,7 @@ def _attachment_transcript_items_from_entry(
         item_type="message",
         data={
             "role": "user",
-            "content": [{"type": "input_text", "text": prompt}],
+            "content": [{"type": "input_text", "text": _unwrap_pasted_content_markers(prompt)}],
         },
         response_id=_response_id_from_source(source_key),
     )
@@ -7002,6 +7099,46 @@ _COMMAND_STDOUT_RE = re.compile(r"<local-command-stdout>(.*?)</local-command-std
 _BASH_INPUT_RE = re.compile(r"<bash-input>(.*?)</bash-input>", re.DOTALL)
 _BASH_STDOUT_RE = re.compile(r"<bash-stdout>(.*?)</bash-stdout>", re.DOTALL)
 _BASH_STDERR_RE = re.compile(r"<bash-stderr>(.*?)</bash-stderr>", re.DOTALL)
+# Claude Code wraps text pasted into its TUI in these markers (the id repeats
+# in the closing tag). Omnigent injects every web-UI message as one bracketed
+# paste (see ``inject_user_message``), so even a short typed line comes back
+# wrapped; strip the wrapper when mirroring the user bubble. Distinct from
+# ``_PASTED_PLACEHOLDER_PREFIX`` (the input-box draft glyph) — this is the
+# transcript-side wrapper Claude persists and sends to the model.
+_PASTED_CONTENT_RE = re.compile(
+    r'<pasted_content id="[^"]*">(?P<inner>.*?)</pasted_content(?: id="[^"]*")?>',
+    re.DOTALL,
+)
+
+
+def _unwrap_pasted_content_markers(text: str) -> str:
+    """
+    Strip Claude Code's ``<pasted_content id=…>`` wrappers from user text.
+
+    Claude wraps bracketed-paste input as
+    ``<pasted_content id="x">\\n…\\n</pasted_content id="x">`` and prefixes the
+    block with a blank line. Omnigent delivers every web-UI message as a
+    bracketed paste, so the markers otherwise leak into the mirrored chat even
+    for a plainly typed line. Each block is replaced by its body — dropping the
+    single newline the wrapper adds on each side — and the blank lines it
+    introduced around the block are trimmed. Text with no marker (or a
+    malformed one that never matches) is returned unchanged.
+
+    :param text: Raw user text from a Claude transcript record.
+    :returns: The text with any paste wrappers removed.
+    """
+    if "<pasted_content" not in text:
+        return text
+
+    def _strip_block(match: re.Match[str]) -> str:
+        return match.group("inner").removeprefix("\n").removesuffix("\n")
+
+    unwrapped = _PASTED_CONTENT_RE.sub(_strip_block, text)
+    if unwrapped == text:
+        return text
+    return unwrapped.strip("\n")
+
+
 _TASK_NOTIFICATION_REQUIRED_MARKERS: tuple[str, ...] = (
     "<task-notification>",
     "<task-id>",
@@ -7566,7 +7703,9 @@ def _user_transcript_items_from_entry(
                 item_type="message",
                 data={
                     "role": "user",
-                    "content": [{"type": "input_text", "text": content}],
+                    "content": [
+                        {"type": "input_text", "text": _unwrap_pasted_content_markers(content)}
+                    ],
                 },
                 response_id=fallback_response_id,
             )
@@ -7615,7 +7754,9 @@ def _user_transcript_items_from_entry(
                 item_index += 1
                 saw_user_text = True
                 continue
-            user_blocks.append({"type": "input_text", "text": text})
+            user_blocks.append(
+                {"type": "input_text", "text": _unwrap_pasted_content_markers(text)}
+            )
             saw_user_text = True
             continue
         if block_type != "tool_result":
@@ -8108,22 +8249,30 @@ def _summary_text_from_blocks(content: object) -> str:
     return "\n".join(parts)
 
 
-def _wait_for_server_info(bridge_dir: Path, *, timeout_s: float) -> _JsonObject:
+def _wait_for_server_info(
+    bridge_dir: Path, *, timeout_s: float, cancelled: threading.Event | None = None
+) -> _JsonObject:
     """
     Wait for the bridge control HTTP endpoint file.
 
     :param bridge_dir: Bridge directory path.
     :param timeout_s: Seconds to wait, e.g. ``30.0``.
+    :param cancelled: Stops polling when the caller no longer needs the endpoint.
     :returns: Parsed server-info JSON object.
     :raises RuntimeError: If the server file never appears.
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _SERVER_FILE
     while time.monotonic() < deadline:
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("Claude native bridge notification was cancelled")
         payload = _read_json_file(path)
         if isinstance(payload, dict) and payload.get("url") and payload.get("token"):
             return payload
-        time.sleep(0.05)
+        if cancelled is None:
+            time.sleep(0.05)
+        else:
+            cancelled.wait(0.05)
     raise RuntimeError(
         "Claude native bridge is not ready yet. Wait for Claude Code "
         "startup to finish before notifying tool list changes."

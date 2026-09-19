@@ -2659,6 +2659,42 @@
         "title": "HostModelOptionsResponse",
         "type": "object"
       },
+      "ImportFailureRef": {
+        "description": "One session that could not be imported, with a user-facing reason.\n\n`external_session_id` / `source` name the source session when known (a\nhost that reports only a count leaves them `None`); `reason` explains the\nfailure so the UI can show it instead of an anonymous \"N failed\". Also the\nshape of each `{\"event\": \"failed\", ...}` line on the stream endpoint.",
+        "properties": {
+          "external_session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "External Session Id"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "source": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "title": "ImportFailureRef",
+        "type": "object"
+      },
       "ImportItemInput": {
         "description": "One normalized existing Omnigent item received from the CLI.",
         "properties": {
@@ -3012,6 +3048,13 @@
             "format": "int64",
             "title": "Failed",
             "type": "integer"
+          },
+          "failures": {
+            "items": {
+              "$ref": "#/components/schemas/ImportFailureRef"
+            },
+            "title": "Failures",
+            "type": "array"
           },
           "imported": {
             "format": "int64",
@@ -4484,6 +4527,18 @@
             ],
             "title": "Scope",
             "type": "string"
+          },
+          "task_description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Human label of the task/spawn this decision governed, e.g. `\"Research auth flows\"` \u2014 what ties a fan-out's decision to its sub-agent when every spawn shares one `agent` type. `None` when the spawn carried none, and on rows written before the field existed.",
+            "title": "Task Description"
           }
         },
         "required": [
@@ -5337,6 +5392,11 @@
             ],
             "description": "Which configured sandbox provider to provision on `host_type: \"managed\"` (one of the server's `sandbox_providers`); `None` takes the server's first. Only valid with `host_type: \"managed\"`.",
             "title": "Sandbox Provider"
+          },
+          "side_chat": {
+            "default": false,
+            "title": "Side Chat",
+            "type": "boolean"
           },
           "terminal_launch_args": {
             "anyOf": [
@@ -6635,6 +6695,22 @@
             "description": "Unique session identifier (also the underlying conversation ID), e.g. `\"conv_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "inference_configured": {
+            "default": false,
+            "title": "Inference Configured",
+            "type": "boolean"
+          },
+          "inference_error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Inference Error"
           },
           "items": {
             "description": "Committed conversation items in chronological order. Empty for a freshly created session.",
@@ -10049,7 +10125,7 @@
     },
     "/v1/imports/local/stream": {
       "post": {
-        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch; a terminal `{\"event\": \"done\", ...}`\ncarries the tally. A mid-stream host failure emits `{\"event\": \"error\", ...}` before `done` \u2014 the sessions read so far are already committed\nand a retry is idempotent. Request validation still fails ahead of the\nstream with the usual HTTP error.",
+        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch. Each session that could not be imported\nemits one `{\"event\": \"failed\", \"external_session_id\", \"source\", \"reason\"}` line (after the successes), and a terminal\n`{\"event\": \"done\", ...}` carries the tally plus the full `failures`\nlist. A mid-stream host read failure emits `{\"event\": \"error\", ...}`\nbefore `done` (the sessions read so far are already committed and a\nretry is idempotent). Request validation still fails ahead of the stream\nwith the usual HTTP error.",
         "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
         "requestBody": {
           "content": {
@@ -10773,6 +10849,75 @@
         "summary": "Mint Runner Owner Token",
         "tags": [
           "runners"
+        ]
+      }
+    },
+    "/v1/sandbox-providers/{provider}/harnesses/{harness}/model-options": {
+      "get": {
+        "operationId": "model_options_v1_sandbox_providers__provider__harnesses__harness__model_options_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "provider",
+            "required": true,
+            "schema": {
+              "title": "Provider",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "agent_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Agent Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Model Options V1 Sandbox Providers  Provider  Harnesses  Harness  Model Options Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Model Options",
+        "tags": [
+          "sandbox inference"
         ]
       }
     },
@@ -13968,7 +14113,7 @@
     },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/shell": {
       "post": {
-        "description": "Execute a shell command in an environment.\n\n**Returns:** Shell result.",
+        "description": "Execute a shell command in an environment.\n\nOwner-only. A command has no path to inspect, so unlike the\nfilesystem proxy there is no workspace-relative form that could\nbe opened to collaborators: any command reaches the owner's own\nmachine, the same boundary `_browse_level` closes for absolute\npaths, and it passes no policy or approval gate on the way.\n\n**Returns:** Shell result.",
         "operationId": "run_environment_shell_v1_sessions__session_id__resources_environments__environment_id__shell_post",
         "parameters": [
           {

@@ -177,6 +177,24 @@ describe("createSession", () => {
     });
   });
 
+  it("preserves the saved inference policy on an empty session catalog", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse({
+        id: "conv_policy",
+        agent_id: "agent_xyz",
+        status: "idle",
+        created_at: 1704067200,
+        inference_configured: true,
+        inference_error: "Gateway unavailable",
+        model_options: [],
+      }),
+    );
+    const session = await createSession("agent_xyz");
+    expect(session.inferenceConfigured).toBe(true);
+    expect(session.inferenceError).toBe("Gateway unavailable");
+    expect(session.codexModelOptions).toEqual([]);
+  });
+
   it("forwards initial_items when provided", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
@@ -768,7 +786,7 @@ describe("runner binding", () => {
     expect(JSON.parse(init.body as string)).toEqual({ subagent_routing_override: null });
   });
 
-  it("forwards silent:true so bind-time auto-apply skips runner forward", async () => {
+  it("forwards silent:true for persistence-only session updates", async () => {
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
         id: "conv_abc",
@@ -1393,6 +1411,7 @@ describe("importLocalSessions", () => {
         { id: "c1", title: "First" },
         { id: "c2", title: null },
       ],
+      failures: [],
     });
     // Hits the streaming endpoint with the snake_case body.
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -1402,6 +1421,37 @@ describe("importLocalSessions", () => {
       source: "all",
       limit: 25,
     });
+  });
+
+  it("collects per-session failure reasons from failed events and the tally", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "Good" }),
+        JSON.stringify({
+          event: "failed",
+          external_session_id: "bad-1",
+          source: "codex",
+          reason: "No visible messages to import.",
+        }),
+        JSON.stringify({
+          event: "done",
+          imported: 1,
+          already_imported: 0,
+          failed: 1,
+          failures: [
+            { external_session_id: "bad-1", source: "codex", reason: "No visible messages." },
+          ],
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "all", 25);
+
+    expect(result.imported).toBe(1);
+    expect(result.failed).toBe(1);
+    expect(result.failures).toEqual([
+      { externalSessionId: "bad-1", source: "codex", reason: "No visible messages to import." },
+    ]);
   });
 
   it("throws the server's message on a mid-stream error, keeping delivered sessions", async () => {
@@ -1477,6 +1527,7 @@ describe("importLocalSessions", () => {
         { id: "c1", title: "First" },
         { id: "c2", title: null },
       ],
+      failures: [],
     });
     // First the stream endpoint (404), then the buffered fallback.
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");
