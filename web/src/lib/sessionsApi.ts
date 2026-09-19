@@ -1484,3 +1484,53 @@ export async function approve(
     await readJsonOrThrow<{ queued: boolean; item_id?: string }>(res),
   );
 }
+
+/** The DOMException a fetch raises when its AbortSignal fires. */
+function isAbortError(err: unknown): boolean {
+  return (err as { name?: unknown } | null | undefined)?.name === "AbortError";
+}
+
+/**
+ * Whether a session snapshot load is worth retrying automatically.
+ *
+ * Transient: 5xx (the managed server answers 500 when its own request context
+ * was torn down mid-flight), 408/429, and a network drop, which fetch surfaces
+ * as a bare TypeError. Never an abort — that is the caller's own cancellation —
+ * never another 4xx (a missing, forbidden or malformed conversation does not
+ * fix itself), and never another exception class (a parsing or programming
+ * error would only fail again).
+ */
+export function isRetryableSessionLoadError(err: unknown): boolean {
+  if (isAbortError(err)) return false;
+  if (err instanceof ApiError) return err.status >= 500 || err.status === 408 || err.status === 429;
+  return err instanceof TypeError;
+}
+
+/**
+ * Whether a session load failure is final for this conversation (4xx other
+ * than 408/429): the page should say so instead of rendering the chat. Every
+ * other failure — 5xx, network, an abort — leaves the conversation usable with
+ * its history temporarily unavailable.
+ */
+export function isDefinitiveSessionLoadError(err: unknown): boolean {
+  return (
+    err instanceof ApiError &&
+    err.status >= 400 &&
+    err.status < 500 &&
+    err.status !== 408 &&
+    err.status !== 429
+  );
+}
+
+export type SessionLoadErrorKind =
+  "not_found" | "forbidden" | "unauthenticated" | "invalid" | "transient";
+
+/** Classify a load failure for the page's heading. */
+export function sessionLoadErrorKind(err: unknown): SessionLoadErrorKind {
+  if (!isDefinitiveSessionLoadError(err)) return "transient";
+  const status = (err as ApiError).status;
+  if (status === 404 || status === 410) return "not_found";
+  if (status === 401) return "unauthenticated";
+  if (status === 403) return "forbidden";
+  return "invalid";
+}

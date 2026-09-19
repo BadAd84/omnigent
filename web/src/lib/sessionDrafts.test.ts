@@ -102,3 +102,63 @@ describe("session drafts", () => {
     expect(sessionStorage.getItem(key)).toBeNull();
   });
 });
+
+describe("unsent messages", () => {
+  const unsentKey = "omnigent.unsentMessages";
+  beforeEach(() => {
+    vi.resetModules();
+    sessionStorage.clear();
+  });
+  afterEach(() => sessionStorage.clear());
+
+  it("keeps one record per send and clears only the acknowledged one", async () => {
+    const { recordUnsentMessage, clearUnsentMessage } = await import("./sessionDrafts");
+    recordUnsentMessage("sid_a", { conversationId: "conv", text: "first", stableId: "sid_a" });
+    recordUnsentMessage("sid_b", { conversationId: "conv", text: "second", stableId: "sid_b" });
+    recordUnsentMessage("sid_blank", { conversationId: "conv", text: "  " });
+    clearUnsentMessage("sid_a");
+    expect(JSON.parse(sessionStorage.getItem(unsentKey)!)).toEqual({
+      sid_b: { conversationId: "conv", text: "second", stableId: "sid_b" },
+    });
+  });
+
+  it("recovers a previous page's record once per page and keeps it stored until acknowledged", async () => {
+    sessionStorage.setItem(
+      unsentKey,
+      JSON.stringify({
+        sid_old: { conversationId: "conv", text: "from before the reload", stableId: "sid_old" },
+        sid_other: { conversationId: "other", text: "not this chat" },
+      }),
+    );
+    const { peekUnsentMessage, markUnsentRecovered, clearUnsentMessage } =
+      await import("./sessionDrafts");
+    const recovered = peekUnsentMessage("conv");
+    expect(recovered).toEqual({
+      recordId: "sid_old",
+      conversationId: "conv",
+      text: "from before the reload",
+      stableId: "sid_old",
+    });
+    // Peeking does not consume; marking does — once per page, and the record
+    // survives for the next reload.
+    expect(peekUnsentMessage("conv")).toEqual(recovered);
+    markUnsentRecovered("sid_old");
+    expect(peekUnsentMessage("conv")).toBeUndefined();
+    expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual([
+      "sid_old",
+      "sid_other",
+    ]);
+    clearUnsentMessage("sid_old");
+    expect(Object.keys(JSON.parse(sessionStorage.getItem(unsentKey)!))).toEqual(["sid_other"]);
+  });
+
+  it("never offers a record written during this page", async () => {
+    const { recordUnsentMessage, peekUnsentMessage } = await import("./sessionDrafts");
+    recordUnsentMessage("sid_now", {
+      conversationId: "conv",
+      text: "in flight",
+      stableId: "sid_now",
+    });
+    expect(peekUnsentMessage("conv")).toBeUndefined();
+  });
+});

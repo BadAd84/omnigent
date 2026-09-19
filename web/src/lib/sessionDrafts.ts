@@ -128,10 +128,114 @@ export function useHasSessionDraft(conversationId: string): boolean {
   );
 }
 
+const UNSENT_MESSAGES_KEY = "omnigent.unsentMessages";
+
+/**
+ * A message whose POST the server has not acknowledged, persisted so a reload
+ * mid-send can recover it. One record per message (keyed by the send's id), so
+ * overlapping sends never clobber each other, and kept apart from the editable
+ * composer draft: text the user is typing meanwhile must never be overwritten.
+ */
+export interface UnsentMessage extends ComposerDraft {
+  conversationId: string;
+  /** Send identity, when the send has one, so a recovered resend dedupes server-side. */
+  stableId?: string;
+}
+
+// Record ids written or recovered during this page's life. A record written
+// here is tracked in memory by the store (`failedSendDraft`); one recovered
+// here is already in the composer. Neither is offered again until a reload —
+// and a record stays stored until its POST is acknowledged, so its identity
+// survives any number of reloads.
+const unsentThisPage = new Set<string>();
+
+function loadUnsentMessages(): Record<string, UnsentMessage> {
+  if (typeof window === "undefined") return {};
+  try {
+    const raw = window.sessionStorage.getItem(UNSENT_MESSAGES_KEY);
+    if (!raw) return {};
+    const entries: unknown = JSON.parse(raw);
+    if (typeof entries !== "object" || entries === null || Array.isArray(entries)) return {};
+    const messages: Record<string, UnsentMessage> = {};
+    for (const [id, entry] of Object.entries(entries)) {
+      const draft = readComposerDraft(entry);
+      const { conversationId, stableId } = entry as {
+        conversationId?: unknown;
+        stableId?: unknown;
+      };
+      if (!draft?.text || typeof conversationId !== "string") continue;
+      messages[id] = {
+        ...draft,
+        conversationId,
+        ...(typeof stableId === "string" ? { stableId } : {}),
+      };
+    }
+    return messages;
+  } catch {
+    return {};
+  }
+}
+
+function saveUnsentMessages(messages: Record<string, UnsentMessage>): void {
+  if (typeof window === "undefined") return;
+  try {
+    if (Object.keys(messages).length === 0) {
+      window.sessionStorage.removeItem(UNSENT_MESSAGES_KEY);
+    } else {
+      window.sessionStorage.setItem(UNSENT_MESSAGES_KEY, JSON.stringify(messages));
+    }
+  } catch {
+    // Storage full or unavailable — the in-memory failedSendDraft still covers this page.
+  }
+}
+
+/** Persist an outgoing message under `recordId` until its POST is acknowledged. Blank text is not recorded. */
+export function recordUnsentMessage(recordId: string, message: UnsentMessage): void {
+  if (message.text.trim() === "") return;
+  unsentThisPage.add(recordId);
+  const messages = loadUnsentMessages();
+  messages[recordId] = message;
+  saveUnsentMessages(messages);
+}
+
+/** The server answered (accepted or denied): the record has served its purpose. */
+export function clearUnsentMessage(recordId: string): void {
+  const messages = loadUnsentMessages();
+  if (!(recordId in messages)) return;
+  saveUnsentMessages(
+    Object.fromEntries(Object.entries(messages).filter(([id]) => id !== recordId)),
+  );
+}
+
+export interface RecoverableUnsentMessage extends UnsentMessage {
+  /** Storage key — the send's `stableId` for a plain message, a private id for a slash command. */
+  recordId: string;
+}
+
+/**
+ * The oldest unacknowledged message for `conversationId` that this page has
+ * not yet recovered, or `undefined`. Does not mark it: the caller decides
+ * whether it can be shown, then calls `markUnsentRecovered`.
+ */
+export function peekUnsentMessage(conversationId: string): RecoverableUnsentMessage | undefined {
+  for (const [recordId, message] of Object.entries(loadUnsentMessages())) {
+    if (message.conversationId !== conversationId || unsentThisPage.has(recordId)) continue;
+    return { ...message, recordId };
+  }
+  return undefined;
+}
+
+/** Recovered into the composer: not offered again before a reload. The record stays until acknowledged. */
+export function markUnsentRecovered(recordId: string): void {
+  unsentThisPage.add(recordId);
+}
+
 /** Clear all drafts, primarily for logout/reset flows and isolated tests. */
 export function clearSessionDrafts(): void {
   sessionDrafts.clear();
   retiredDraftIds.clear();
   saveDraftsToStorage();
+  unsentThisPage.clear();
+  saveUnsentMessages({});
   notifyListeners();
 }

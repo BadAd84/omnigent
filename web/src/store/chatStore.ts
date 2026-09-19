@@ -67,6 +67,7 @@ import {
   createSession,
   getSessionSlim,
   fetchSessionItemsPage,
+  isRetryableSessionLoadError,
   INITIAL_WINDOW_ITEMS,
   interrupt as interruptSession,
   openSessionStream,
@@ -112,6 +113,7 @@ import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
 // ids without an import cycle back to the store.
 import { isTempConvId, newTempConversation } from "@/lib/tempConversationId";
+import { clearUnsentMessage, recordUnsentMessage } from "@/lib/sessionDrafts";
 import { useTerminalActivityStore } from "./terminalActivity";
 import { terminalInfoFromResource, terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 import type {
@@ -360,7 +362,14 @@ export function beginLocalConversation(
           boundAgentName: model.boundAgentName ?? null,
           sessionHostId: model.hostId ?? null,
           ...(model.llmModel !== undefined ? { llmModel: model.llmModel } : {}),
-          ...(model.harness !== undefined ? { sessionHarness: model.harness } : {}),
+          ...(model.harness !== undefined
+            ? {
+                sessionHarness: model.harness,
+                // Known before any snapshot: the POST no longer waits for one, so
+                // early events must already see the right bubble lifecycle.
+                isNativeTerminalSession: isNativeTerminalSessionFn({ harness: model.harness }),
+              }
+            : {}),
           ...(model.contextWindow !== undefined ? { contextWindow: model.contextWindow } : {}),
           ...(model.costControlModeOverride !== undefined
             ? { costControlModeOverride: model.costControlModeOverride }
@@ -1238,6 +1247,13 @@ conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
 // Snapshot reconciliation must teach the already-running stream pump which
 // native preview messages have finalized, including warm session revisits.
 const nativePreviewTombstonesByController = new WeakMap<AbortController, Set<string>>();
+// One history hydration per pump generation; a Retry while one is in flight joins it.
+const hydrationsByController = new WeakMap<AbortController, Promise<void>>();
+// Monotonic per-entry bind generation. An open bumps it; a hydration owns its
+// entry only while no newer open has happened on that same entry object, so a
+// pump that closed on its own keeps ownership (its hydration still publishes)
+// while a successor open, or a release + re-acquire of the id, retires it.
+const bindGenerationByEntry = new WeakMap<ConversationEntry, number>();
 
 /**
  * Evict a conversation from the live registry.
@@ -1513,6 +1529,10 @@ const STREAM_RECONNECT_BASE_MS = 250;
 const STREAM_RECONNECT_MAX_MS = 5_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_INTERVAL_MS = 60_000;
 export const ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS = 15_000;
+// Backoff between attempts to load a conversation's snapshot after a transient
+// failure (5xx, network). History never gates a send; this only bounds how long
+// the page waits before reporting history as unavailable.
+const SNAPSHOT_RETRY_DELAYS_MS = [1000, 2000, 4000];
 // A reverse proxy serves 404 for the stream route for the ~10-60s a backend
 // container takes to restart (upgrade, config change, re-seed bounce), so a
 // 404 mid-restart must not be treated as permanent. Bound the retries instead
@@ -2126,14 +2146,37 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // The session this send actually posts to, once resolved. Read in the
     // catch to decide whether a failure may touch the active session's UI.
     let postedSessionId: string | null = null;
+    // Durable copy of the outgoing text (sessionStorage) until the server
+    // acknowledges the POST, so a reload mid-send can recover it with the same
+    // send identity. Files are not persisted; the in-memory failedSendDraft
+    // covers them within this page.
+    let unsentRecorded = false;
+    const recordUnsent = (sessionId: string): void => {
+      unsentRecorded = true;
+      recordUnsentMessage(stableId, {
+        conversationId: sessionId,
+        text,
+        stableId,
+        replyDraft: opts?.replyDraft,
+      });
+    };
+    if (submitConversationId !== null) recordUnsent(submitConversationId);
 
     try {
       await waitForPrior();
       // `rekey` runs INSIDE the call, the moment `createSession` returns and
       // before the new id is published — a send issued during the bind would
       // otherwise resolve that id, find an empty chain, and overtake this POST.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, (id) => {
+        rekey(id);
+        // A brand-new session's id is durable from this moment, before the
+        // runner binds and the stream opens.
+        if (submitConversationId === null) recordUnsent(id);
+      });
       postedSessionId = sessionId;
+      // A send queued before the id existed learns it here, not via the create
+      // callback (only the creating send receives that).
+      if (!unsentRecorded) recordUnsent(sessionId);
 
       // Upload any attached files and build the real content blocks with
       // server-assigned file_ids (input_image for images, input_file
@@ -2171,6 +2214,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           stable_id: stableId,
         },
       });
+      // Accepted or denied, the server has answered: the durable copy is done.
+      clearUnsentMessage(stableId);
       // Policy denied the input — the server returned immediately
       // without starting a turn or persisting the user message, so
       // no session.input.consumed will reconcile this exact optimistic
@@ -2358,12 +2403,31 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
 
     // The session this command actually posts to, once resolved.
     let postedSessionId: string | null = null;
+    // Durable copy of the command text until the server answers (see `send`).
+    // A recovered command resends under its original record id, so the
+    // acknowledgment clears that record rather than leaving it to reappear.
+    const retryRecordId =
+      pinnedId === null
+        ? get().pendingRetryStableId
+        : (setterForState(pinnedId)?.pendingRetryStableId ?? null);
+    if (retryRecordId !== null) pinnedSetter({ pendingRetryStableId: null });
+    const unsentRecordId = retryRecordId ?? randomUUID().replace(/-/g, "");
+    let unsentRecorded = false;
+    const recordUnsent = (sessionId: string): void => {
+      unsentRecorded = true;
+      recordUnsentMessage(unsentRecordId, { conversationId: sessionId, text: commandText });
+    };
+    if (submitConversationId !== null) recordUnsent(submitConversationId);
 
     try {
       await waitForPrior();
       // See `send`: rekey inside the call, before the new id is visible.
-      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, rekey);
+      const sessionId = await ensureBoundSession(agentId, get, opts, submitConversationId, (id) => {
+        rekey(id);
+        if (submitConversationId === null) recordUnsent(id);
+      });
       postedSessionId = sessionId;
+      if (!unsentRecorded) recordUnsent(sessionId);
       // Same wire shape the REPL sends (repl/_repl.py). The server resolves
       // the skill, persists a visible receipt + hidden `<skill>` meta
       // message, and forwards the meta to the runner.
@@ -2371,6 +2435,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         type: "slash_command",
         data: { kind: "skill", name, arguments: args },
       });
+      clearUnsentMessage(unsentRecordId);
       if (postResult.denied) {
         // Denied commands publish no receipt, so nothing will pop the
         // optimistic echo — roll it back here alongside the status settle.
@@ -3053,8 +3118,15 @@ const rootSetState = useChatStore.setState;
 // ── Origin-wide stream slots ─────────────────────────────
 //
 // One held slot == one live stream this tab is counted for against the shared,
-// cross-tab cap (see `streamSlots`). Keyed by conversation id.
-const heldStreamSlots = new Map<string, StreamSlot>();
+// cross-tab cap (see `streamSlots`). Keyed by conversation id; each open of that
+// conversation holds a lease on the slot, and the slot is handed back only when
+// the last lease is released — so a stale open, or a stale pump ending late,
+// can never release a successor's reservation.
+interface StreamSlotLease {
+  slot: StreamSlot;
+  owners: number;
+}
+const heldStreamSlots = new Map<string, StreamSlotLease>();
 
 /**
  * Take an origin-wide stream slot for `id` before opening its stream.
@@ -3068,8 +3140,13 @@ const heldStreamSlots = new Map<string, StreamSlot>();
  * has nothing of its own to reclaim; the active conversation then opens over
  * budget (the caller proceeds anyway) and the too-many-tabs banner is raised.
  */
-async function acquireStreamSlot(id: string): Promise<boolean> {
-  if (heldStreamSlots.has(id)) return true; // rebinding a still-slotted stream
+async function acquireStreamSlot(id: string): Promise<StreamSlotLease | null> {
+  const held = heldStreamSlots.get(id);
+  if (held !== undefined) {
+    // Rebinding a still-slotted stream: share its slot.
+    held.owners += 1;
+    return held;
+  }
   let slot = await getStreamSlotManager().tryAcquire();
   // Inherently sequential: each iteration must fully release a reclaimed slot
   // (so the freed lock is observable) before re-checking, or we'd over-evict.
@@ -3077,25 +3154,40 @@ async function acquireStreamSlot(id: string): Promise<boolean> {
   while (slot === null) {
     const evictedId = conversationRegistry.evictLruEvictable(id);
     if (evictedId === null) break;
-    const evictedSlot = heldStreamSlots.get(evictedId);
-    if (evictedSlot !== undefined) {
+    const evictedLease = heldStreamSlots.get(evictedId);
+    if (evictedLease !== undefined) {
       heldStreamSlots.delete(evictedId);
-      await evictedSlot.release();
+      await evictedLease.slot.release();
     }
     slot = await getStreamSlotManager().tryAcquire();
   }
   /* eslint-enable no-await-in-loop */
-  if (slot !== null) heldStreamSlots.set(id, slot);
   setStreamBudgetExceeded(slot === null);
-  return slot !== null;
+  if (slot === null) return null;
+  // Another open for this id won its slot while we waited: one slot per
+  // conversation is enough, so hand this one straight back and share theirs.
+  const raced = heldStreamSlots.get(id);
+  if (raced !== undefined) {
+    void slot.release();
+    raced.owners += 1;
+    return raced;
+  }
+  const lease: StreamSlotLease = { slot, owners: 1 };
+  heldStreamSlots.set(id, lease);
+  return lease;
 }
 
-/** Hand back `id`'s stream slot when its stream ends (pump exits / disposed). */
-function releaseStreamSlot(id: string): void {
-  const slot = heldStreamSlots.get(id);
-  if (slot === undefined) return;
+/**
+ * Release one lease on `id`'s stream slot (pump exited, or its open was
+ * superseded). The slot goes back to the origin with the last lease; a lease
+ * the map no longer holds (evicted, or replaced by a successor) is a no-op.
+ */
+function releaseStreamSlot(id: string, lease: StreamSlotLease | null): void {
+  if (lease === null || heldStreamSlots.get(id) !== lease) return;
+  lease.owners -= 1;
+  if (lease.owners > 0) return;
   heldStreamSlots.delete(id);
-  void slot.release();
+  void lease.slot.release();
 }
 
 /**
@@ -3312,6 +3404,39 @@ export async function ensureConversationStreamed(id: string): Promise<void> {
   await bindStream(id, entrySetter(entry), entryGetter(entry), true);
 }
 
+/**
+ * Re-load a conversation's history after `conversationLoadError` was recorded,
+ * without tearing its entry down: optimistic bubbles, streamed blocks and drafts
+ * survive. A live pump re-hydrates in place (joining an in-flight hydration); a
+ * dead pump is reopened on the same entry. Resolves once the attempt settles —
+ * the store error tells whether it succeeded.
+ */
+export async function retryConversationHistory(id: string): Promise<void> {
+  const entry = conversationRegistry.peek(id);
+  if (entry === undefined || entry.disposed) {
+    await ensureConversationStreamed(id);
+    return;
+  }
+  const set = entrySetter(entry);
+  const get = entryGetter(entry);
+  const controller = get().abortController;
+  if (controller !== null && !controller.signal.aborted) {
+    const ignoredNativeMessageIds =
+      nativePreviewTombstonesByController.get(controller) ?? new Set<string>();
+    const handle: StreamHandle = {
+      controller,
+      ignoredNativeMessageIds,
+      entry,
+      generation: bindGenerationByEntry.get(entry) ?? 0,
+    };
+    await hydrateConversationHistory(id, set, get, handle, false);
+    return;
+  }
+  abortConversationStream(entry);
+  set({ conversationLoadError: null });
+  await bindStream(id, set, get);
+}
+
 // Route `useChatStore.setState` so a conversation-scoped write reaches the
 // active entry rather than the root store's projection of it.
 //
@@ -3412,8 +3537,6 @@ function nativeModelFamilyForSession(
  *     the caller can move its send-chain slot onto the real id before any other
  *     send can resolve that id and key an empty chain. See `enterSendChain`.
  * :returns: The bound session id.
- * :raises Error: Re-raises a ``conversationLoadError`` if a needed rebind
- *     of an existing session fails to establish the stream.
  */
 async function ensureBoundSession(
   agentId: string,
@@ -3458,6 +3581,9 @@ async function ensureBoundSession(
     entry.setState({
       boundAgentId: session.agentId,
       boundAgentName: session.agentName,
+      // From the create response, so events that beat the snapshot already see
+      // the right optimistic-bubble lifecycle.
+      isNativeTerminalSession: isNativeTerminalSessionFn(session),
       loadingConversation: true,
     });
     useChatStore.setState({ conversationId: sessionId });
@@ -3465,7 +3591,18 @@ async function ensureBoundSession(
     mirrorActiveEntry();
     opts?.onConversationCreated?.(sessionId);
     queryClient?.invalidateQueries({ queryKey: ["conversations"] });
-    await bindStream(sessionId, entrySetter(entry), entryGetter(entry));
+    // Open the pump, then POST. History hydration runs alongside and never
+    // gates the send: a slow or failed snapshot must not delay or drop it.
+    const handle = await openConversationStream(sessionId, entrySetter(entry), entryGetter(entry));
+    if (handle !== null) {
+      void hydrateConversationHistory(
+        sessionId,
+        entrySetter(entry),
+        entryGetter(entry),
+        handle,
+        false,
+      );
+    }
   } else {
     const streamCurrent = isConversationStreamCurrent(sessionId);
     const entry = conversationRegistry.acquire(sessionId);
@@ -3474,8 +3611,9 @@ async function ensureBoundSession(
       // intermediary closed the connection on idle, or this conversation was
       // evicted and re-acquired. POSTing without a live pump would queue the
       // message, run the turn, and publish events into an empty subscriber set;
-      // the user would never see the response. Rebind first, and fail loud if
-      // the rebind itself can't establish the stream.
+      // the user would never see the response. Rebind first. History hydration
+      // runs alongside: POST needs no snapshot, and a failed one must not drop
+      // the message — it surfaces as a history notice on the page instead.
       //
       // Tear the old pump down first. A snapshot failure leaves
       // `conversationLoadError` set while its pump is STILL OPEN (`bindStream`
@@ -3485,9 +3623,20 @@ async function ensureBoundSession(
       // dedupe, would then apply twice.
       abortConversationStream(entry);
       entry.setState({ conversationLoadError: null });
-      await bindStream(sessionId, entrySetter(entry), entryGetter(entry));
-      const loadError = entry.getState().conversationLoadError;
-      if (loadError !== null) throw loadError;
+      const handle = await openConversationStream(
+        sessionId,
+        entrySetter(entry),
+        entryGetter(entry),
+      );
+      if (handle !== null) {
+        void hydrateConversationHistory(
+          sessionId,
+          entrySetter(entry),
+          entryGetter(entry),
+          handle,
+          false,
+        );
+      }
     }
   }
 
@@ -3763,19 +3912,73 @@ async function bindStream(
   get: Getter,
   hydratePending = false,
 ): Promise<void> {
+  const handle = await openConversationStream(id, set, get);
+  if (handle === null) return;
+  await hydrateConversationHistory(id, set, get, handle, hydratePending);
+}
+
+/**
+ * A live SSE pump: its controller, the native preview ids it tombstoned, and
+ * the entry + bind generation it was opened for (see `bindGenerationByEntry`).
+ */
+interface StreamHandle {
+  controller: AbortController;
+  ignoredNativeMessageIds: Set<string>;
+  entry: ConversationEntry | undefined;
+  generation: number;
+}
+
+// One stream open per entry: a send and a Retry that both find no pump while
+// an open is still waiting for its slot must share it, not start two pumps.
+const opensByEntry = new WeakMap<ConversationEntry, Promise<StreamHandle | null>>();
+
+/**
+ * Open the SSE pump for `id`: take a stream slot, install the controller, resolve
+ * the session's host for keyed routing, start the pump. Returns `null` when the
+ * conversation was disposed while waiting for a slot. History is NOT loaded here
+ * (see `hydrateConversationHistory`), so a send can POST as soon as the pump is up.
+ * The host resolve is a routing prerequisite for the POST as much as for the
+ * stream, so it is awaited even though it is a metadata GET.
+ */
+function openConversationStream(
+  id: string,
+  set: Setter,
+  get: Getter,
+): Promise<StreamHandle | null> {
+  const entry = conversationRegistry.peek(id);
+  if (entry === undefined) return openStreamOnce(id, set, get);
+  const inflight = opensByEntry.get(entry);
+  if (inflight !== undefined) return inflight;
+  const run = openStreamOnce(id, set, get).finally(() => opensByEntry.delete(entry));
+  opensByEntry.set(entry, run);
+  return run;
+}
+
+async function openStreamOnce(id: string, set: Setter, get: Getter): Promise<StreamHandle | null> {
   racedNativeModelOptions.delete(id);
+  const entry = conversationRegistry.peek(id);
+  const generation = entry === undefined ? 0 : (bindGenerationByEntry.get(entry) ?? 0) + 1;
+  if (entry !== undefined) bindGenerationByEntry.set(entry, generation);
+  // This open no longer owns the id: the entry was disposed or replaced (release +
+  // re-acquire), or a newer open on the same entry took over.
+  const superseded = (): boolean =>
+    entry === undefined
+      ? isConversationDisposed(id)
+      : conversationRegistry.peek(id) !== entry ||
+        entry.disposed ||
+        bindGenerationByEntry.get(entry) !== generation;
   const controller = new AbortController();
   const ignoredNativeMessageIds = new Set<string>();
   nativePreviewTombstonesByController.set(controller, ignoredNativeMessageIds);
   // Take an origin-wide stream slot before opening the connection, evicting our
   // own LRU background stream to make room. A fresh tab that finds every slot
   // held by other tabs opens over budget (no slot) and raises the banner.
-  await acquireStreamSlot(id);
-  if (isConversationDisposed(id)) {
-    // Switched away / evicted while awaiting the slot — don't open a dead
-    // entry's stream, and hand any slot we took back to the origin.
-    releaseStreamSlot(id);
-    return;
+  const lease = await acquireStreamSlot(id);
+  if (superseded()) {
+    // Evicted, replaced, or overtaken while awaiting the slot — don't open a
+    // stream for an entry this open no longer owns; hand our lease back.
+    releaseStreamSlot(id, lease);
+    return null;
   }
   set({ abortController: controller });
 
@@ -3800,16 +4003,16 @@ async function bindStream(
     // Liveness, not the visible id: a background bind must survive a switch away
     // (that is the whole feature). Only a dispose (evicted) bails — and then the
     // slot taken above has to go back to the origin.
-    if (isConversationDisposed(id)) {
-      releaseStreamSlot(id);
-      return;
+    if (superseded()) {
+      releaseStreamSlot(id, lease);
+      return null;
     }
   }
 
   // The slot is held for the pump's whole lifetime; released when it exits (a
   // terminal close, an abort from switchTo/dispose, or eviction).
   void startStreamPump(id, controller, set, get, ignoredNativeMessageIds).finally(() =>
-    releaseStreamSlot(id),
+    releaseStreamSlot(id, lease),
   );
 
   // Background tabs can miss the `response.elicitation_resolved` SSE event
@@ -3828,6 +4031,98 @@ async function bindStream(
     });
   }
 
+  return { controller, ignoredNativeMessageIds, entry, generation };
+}
+
+/**
+ * Load `id`'s snapshot (session metadata + the most recent page of items) into
+ * its entry. One hydration per pump generation: a concurrent call joins the one
+ * in flight. Transient failures are retried on a bounded backoff; an attempt
+ * made obsolete by an abort, a dispose, or a newer pump publishes nothing.
+ */
+function hydrateConversationHistory(
+  id: string,
+  set: Setter,
+  get: Getter,
+  handle: StreamHandle,
+  hydratePending: boolean,
+): Promise<void> {
+  const inflight = hydrationsByController.get(handle.controller);
+  if (inflight !== undefined) return inflight;
+  const run = hydrateHistoryOnce(id, set, get, handle, hydratePending).finally(() => {
+    hydrationsByController.delete(handle.controller);
+  });
+  hydrationsByController.set(handle.controller, run);
+  return run;
+}
+
+/**
+ * Fetch the snapshot pair, retrying a transient failure up to
+ * `SNAPSHOT_RETRY_DELAYS_MS.length` times. The items request carries the pump's
+ * signal; the session request is the shared react-query fetch and is not
+ * cancelled from here. Throws the last error once out of retries, on a
+ * non-retryable error, or when the attempt has become obsolete.
+ */
+type SnapshotPair = [Session, Awaited<ReturnType<typeof fetchSessionItemsPage>>];
+
+async function fetchSnapshotWithRetry(
+  id: string,
+  client: QueryClient,
+  controller: AbortController,
+  obsolete: () => boolean,
+  attempt = 0,
+): Promise<SnapshotPair> {
+  const result = await attemptSnapshot(id, client, controller);
+  if (result.ok) return result.value;
+  const failure = result.error instanceof Error ? result.error : new Error(String(result.error));
+  const delay = SNAPSHOT_RETRY_DELAYS_MS[attempt];
+  if (delay === undefined || obsolete() || !isRetryableSessionLoadError(failure)) throw failure;
+  // Resolves (does not reject) on abort; the obsolete check below handles it.
+  await abortableDelay(delay, controller.signal);
+  if (obsolete()) throw failure;
+  return fetchSnapshotWithRetry(id, client, controller, obsolete, attempt + 1);
+}
+
+async function attemptSnapshot(
+  id: string,
+  client: QueryClient,
+  controller: AbortController,
+): Promise<{ ok: true; value: SnapshotPair } | { ok: false; error: unknown }> {
+  // Per-attempt signal so a failed session fetch also cancels its items
+  // sibling instead of leaving it running under the next attempt.
+  const attemptController = new AbortController();
+  const abortAttempt = (): void => attemptController.abort();
+  controller.signal.addEventListener("abort", abortAttempt, { once: true });
+  try {
+    // One larger page, so opening a session is a single round trip that then
+    // stays still — rather than a small page followed by background growth
+    // the reader sees as the transcript shifting seconds after it settled.
+    const value = await Promise.all([
+      client.fetchQuery({
+        queryKey: ["session", id],
+        queryFn: () => getSessionSlim(id, { refreshState: true }),
+        staleTime: 0,
+        retry: false,
+      }),
+      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal: attemptController.signal }),
+    ]);
+    return { ok: true, value };
+  } catch (error) {
+    attemptController.abort();
+    return { ok: false, error };
+  } finally {
+    controller.signal.removeEventListener("abort", abortAttempt);
+  }
+}
+
+async function hydrateHistoryOnce(
+  id: string,
+  set: Setter,
+  get: Getter,
+  handle: StreamHandle,
+  hydratePending: boolean,
+): Promise<void> {
+  const { controller, ignoredNativeMessageIds, entry, generation } = handle;
   // Snapshot the session metadata and hydrate the most recent page of
   // item history. The pump may have already pushed blocks by the time
   // this resolves — dedupe by item id.
@@ -3842,20 +4137,18 @@ async function bindStream(
     throw new Error("chatStore.bindStream: queryClient not initialized");
   }
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
+  // Aborted, disposed, or retired by a newer open on this entry (or a release +
+  // re-acquire of the id): this attempt must publish neither its error nor its
+  // result. A pump that closed on its own (401/403, terminal close) bumps no
+  // generation, so its hydration still publishes and the loading gate settles.
+  const obsolete = (): boolean =>
+    controller.signal.aborted ||
+    isConversationDisposed(id) ||
+    (entry !== undefined &&
+      (conversationRegistry.peek(id) !== entry || bindGenerationByEntry.get(entry) !== generation));
   try {
-    // One larger page, so opening a session is a single round trip that then
-    // stays still — rather than a small page followed by background growth
-    // the reader sees as the transcript shifting seconds after it settled.
-    const [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id, { refreshState: true }),
-        staleTime: 0,
-        retry: false,
-      }),
-      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS }),
-    ]);
-    if (isConversationDisposed(id)) return;
+    const [session, page] = await fetchSnapshotWithRetry(id, queryClient, controller, obsolete);
+    if (obsolete()) return;
     const items = page.items;
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
@@ -3878,10 +4171,10 @@ async function bindStream(
       const effectiveBindingPatch = catalogWonBindRace
         ? { ...bindingPatch, codexModelOptions: racedOptions! }
         : bindingPatch;
-      const seenItemIds = new Set(
+      const liveItemIds = new Set(
         currentBlocks.map((b) => b.ctx.itemId).filter((iid): iid is string => Boolean(iid)),
       );
-      const unique = snapshotBlocks.filter((b) => !b.ctx.itemId || !seenItemIds.has(b.ctx.itemId));
+      const missing = snapshotBlocks.filter((b) => !b.ctx.itemId || !liveItemIds.has(b.ctx.itemId));
       // Dedupe against any elicitation blocks already produced by
       // the live pump (the snapshot may race ahead of or behind
       // the SSE event — match by elicitationId).
@@ -3909,9 +4202,16 @@ async function bindStream(
       // branches that used to live here served the transcript LRU's revisit
       // path, which no longer exists — a revisit finds a live entry and never
       // re-binds.)
+      // The live order is the skeleton (older loaded history, the window, then
+      // anything streamed since); snapshot blocks the entry lacks are spliced in
+      // right after their snapshot predecessor, so a gap fills in place and a
+      // cold bind still puts history ahead of what the pump already pushed.
       const allBlocks = [
-        ...unique,
-        ...withoutRebuiltUserInputCards(currentBlocks, unique),
+        ...spliceMissingHistory(
+          withoutRebuiltUserInputCards(currentBlocks, missing),
+          snapshotBlocks,
+          liveItemIds,
+        ),
         ...uniquePendingElicitations,
       ];
       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
@@ -4000,6 +4300,7 @@ async function bindStream(
         blocks: syntheticError !== null ? [...allBlocks, syntheticError] : allBlocks,
         pendingUserMessages: snapshotPending,
         loadingConversation: false,
+        conversationLoadError: null,
         hasMoreHistory: page.hasMore,
         oldestItemId,
         // The window cursor was reset: void any in-flight loadMoreHistory.
@@ -4046,7 +4347,7 @@ async function bindStream(
     });
     racedNativeModelOptions.delete(id);
   } catch (err) {
-    if (isConversationDisposed(id)) return;
+    if (obsolete()) return;
     set({
       loadingConversation: false,
       conversationLoadError: err instanceof Error ? err : new Error(String(err)),
@@ -4389,6 +4690,54 @@ function reconcileElicitationBlocks(
  * @param historyBlocks - Blocks translated from persisted items.
  * @returns `liveBlocks` without the copies history now carries.
  */
+/**
+ * Merge a snapshot into retained live blocks without reordering the live ones.
+ * Each snapshot block absent from `live` is inserted right after the live copy
+ * of its nearest preceding snapshot item; blocks with no such anchor (older than
+ * everything live, or a snapshot with no overlap at all) go first.
+ */
+function spliceMissingHistory(
+  live: AnyBlock[],
+  snapshot: AnyBlock[],
+  liveItemIds: Set<string>,
+): AnyBlock[] {
+  const head: AnyBlock[] = [];
+  const afterAnchor = new Map<string, AnyBlock[]>();
+  let anchor: string | null = null;
+  for (const b of snapshot) {
+    const itemId = b.ctx.itemId;
+    if (itemId && liveItemIds.has(itemId)) {
+      anchor = itemId;
+      continue;
+    }
+    if (anchor === null) head.push(b);
+    else afterAnchor.set(anchor, [...(afterAnchor.get(anchor) ?? []), b]);
+  }
+  if (afterAnchor.size === 0 && !live.some((b) => b.ctx.itemId && liveItemIds.has(b.ctx.itemId))) {
+    return [...head, ...live];
+  }
+  const merged: AnyBlock[] = [];
+  const placedAnchors = new Set<string>();
+  let headPlaced = false;
+  for (const b of live) {
+    const itemId = b.ctx.itemId;
+    const isSnapshotItem = Boolean(itemId) && snapshot.some((sb) => sb.ctx.itemId === itemId);
+    if (!headPlaced && isSnapshotItem) {
+      merged.push(...head);
+      headPlaced = true;
+    }
+    merged.push(b);
+    if (itemId && !placedAnchors.has(itemId)) {
+      const gap = afterAnchor.get(itemId);
+      if (gap !== undefined) {
+        merged.push(...gap);
+        placedAnchors.add(itemId);
+      }
+    }
+  }
+  return headPlaced ? merged : [...head, ...merged];
+}
+
 function withoutRebuiltUserInputCards(
   liveBlocks: AnyBlock[],
   historyBlocks: AnyBlock[],
@@ -4531,6 +4880,8 @@ async function rehydrateWindowOnReconnect(
       hasMoreHistory: fresh.hasMore,
       oldestItemId: fresh.items[0]?.id ?? null,
       loadingMoreHistory: false,
+      // History was rebuilt from the server: drop the unavailable notice.
+      conversationLoadError: null,
       // The window cursor was reset: void any in-flight loadMoreHistory.
       historyGeneration: s.historyGeneration + 1,
     };
@@ -4659,6 +5010,9 @@ async function reconcileOnReconnect(
     );
     const unseen = snapshotBlocks.filter((b) => b.ctx.itemId && !seen.has(b.ctx.itemId));
     const patch: Partial<ChatState> = reconnectStatusPatch(session, s, launchBeforeFetch);
+    // A reconnect that recovered the transcript is as good as a successful
+    // hydration: drop the history-unavailable notice.
+    patch.conversationLoadError = null;
     // `session.input.consumed` is not replayed, so recovered user blocks are
     // the durable equivalent of its FIFO acknowledgement.
     const recoveredUserInputs = unseen.filter(

@@ -3222,6 +3222,110 @@ describe("Composer reply quotes", () => {
     if (structured) expect(vi.mocked(props.onSend).mock.calls[0]?.[2]).toEqual(replyDraft);
   });
 
+  it("recovers a previous page's unacknowledged send into an empty composer with its identity", () => {
+    useChatStore.setState({ pendingRetryStableId: null });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_reload: {
+          conversationId: "conv_test",
+          text: "typed before the reload",
+          stableId: "sid_reload",
+        },
+      }),
+    );
+    render(<Composer {...composerProps()} />);
+    expect(textarea()).toHaveValue("typed before the reload");
+    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_reload");
+    // Recovery is not acknowledgment: the record stays until the POST is accepted.
+    expect(Object.keys(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages")!))).toEqual([
+      "sid_reload",
+    ]);
+  });
+
+  it("keeps a recovered send's identity for an unchanged resend", () => {
+    useChatStore.setState({ pendingRetryStableId: null });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_keep: { conversationId: "conv_test", text: "resend me as is", stableId: "sid_keep" },
+      }),
+    );
+    const props = composerProps();
+    render(<Composer {...props} />);
+    expect(textarea()).toHaveValue("resend me as is");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("resend me as is", undefined);
+    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_keep");
+  });
+
+  it("drops a recovered send's identity when a different message is sent, even without typing", () => {
+    useChatStore.setState({ pendingRetryStableId: null });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_edit: { conversationId: "conv_test", text: "original words", stableId: "sid_edit" },
+      }),
+    );
+    localStorage.setItem(
+      "omnigent:prompt-history:conv_test",
+      JSON.stringify(["a different earlier prompt"]),
+    );
+    const props = composerProps();
+    render(<Composer {...props} />);
+    expect(textarea()).toHaveValue("original words");
+    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_edit");
+    // Recall replaces the text without a keystroke edit; the identity must still go.
+    textarea().setSelectionRange(0, 0);
+    fireEvent.keyDown(textarea(), { key: "ArrowUp" });
+    expect(textarea()).toHaveValue("a different earlier prompt");
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("a different earlier prompt", undefined);
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+  });
+
+  it("drops a recovered send's identity when only inner whitespace changes", () => {
+    useChatStore.setState({ pendingRetryStableId: null });
+    const code = "def f():\n    return 1";
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({ sid_ws: { conversationId: "conv_test", text: code, stableId: "sid_ws" } }),
+    );
+    const props = composerProps();
+    render(<Composer {...props} />);
+    expect(textarea()).toHaveValue(code);
+    fireEvent.change(textarea(), { target: { value: "def f():\n  return 1" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(props.onSend).toHaveBeenCalledWith("def f():\n  return 1", undefined);
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+  });
+
+  it("keeps newer typed text over a recovered send, but re-attaches the identity to identical text", () => {
+    useChatStore.setState({ pendingRetryStableId: null });
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_a: { conversationId: "conv_test", text: "the same words", stableId: "sid_a" },
+      }),
+    );
+    setSessionDraft("conv_test", { text: "something newer", files: [] });
+    render(<Composer {...composerProps()} />);
+    expect(textarea()).toHaveValue("something newer");
+    expect(useChatStore.getState().pendingRetryStableId).toBeNull();
+    cleanup();
+
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_b: { conversationId: "conv_test", text: "the same words", stableId: "sid_b" },
+      }),
+    );
+    setSessionDraft("conv_test", { text: "the same words", files: [] });
+    render(<Composer {...composerProps()} />);
+    expect(textarea()).toHaveValue("the same words");
+    expect(useChatStore.getState().pendingRetryStableId).toBe("sid_b");
+  });
+
   it.each([false, true])(
     "edits and persists queued messages with explicit metadata only: %s",
     (structured) => {
