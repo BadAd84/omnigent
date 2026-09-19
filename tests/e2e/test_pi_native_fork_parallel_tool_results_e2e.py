@@ -2,8 +2,8 @@
 
 Regression coverage: when Omnigent rebuilds a native Pi session from copied
 conversation items (a fork with carry-history, or a cold resume -- both go
-through :func:`omnigent.pi_native_resume.ensure_local_pi_resume_session` ->
-:func:`omnigent.pi_native_resume.pi_session_records_from_session_items`), each
+through :func:`omnigent.harnesses.pi_native.resume.ensure_local_pi_resume_session` ->
+:func:`omnigent.harnesses.pi_native.resume.pi_session_records_from_session_items`), each
 ``function_call`` is emitted as its OWN single-``toolCall`` assistant message
 and each ``function_call_output`` as an independent ``toolResult`` message. For
 a response with multiple (parallel) tool calls the rebuilt Pi JSONL therefore
@@ -680,6 +680,7 @@ def pi_fork_rig(
                         online = True
                         break
             except httpx.HTTPError:
+                # Server still booting; keep polling until the deadline.
                 pass
             time.sleep(0.5)
         if not online:
@@ -720,7 +721,7 @@ def _create_native_pi_session(base_url: str, runner_id: str) -> str:
     """Register the ``pi-native`` wrapper agent and bind its session.
 
     Reuses the exact terminal-first spec ``omnigent pi`` ships
-    (:func:`omnigent.pi_native._materialize_pi_agent_spec`) and stamps the same
+    (:func:`omnigent.harnesses.pi_native.main._materialize_pi_agent_spec`) and stamps the same
     wrapper / terminal-first labels the CLI writes. Binding the session to the
     runner triggers the runner's pi-native auto-launch (tmux + bridge +
     extension + managed models.json).
@@ -729,7 +730,7 @@ def _create_native_pi_session(base_url: str, runner_id: str) -> str:
     :param runner_id: The token-bound runner id to bind.
     :returns: The new session/conversation id.
     """
-    from omnigent.pi_native import _SESSION_LABELS, _materialize_pi_agent_spec
+    from omnigent.harnesses.pi_native.main import _SESSION_LABELS, _materialize_pi_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         spec_path = _materialize_pi_agent_spec(Path(tmp))
