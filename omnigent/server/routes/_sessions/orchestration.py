@@ -10639,13 +10639,19 @@ async def _run_runner_status_probe(
         else:
             elapsed = time.monotonic() - started
             if resp.status_code == 200:
-                raw = str(resp.json().get("status", "idle"))
-                _session_status_cache[session_id] = raw
-                if raw in ("idle", "running", "waiting", "failed"):
-                    session_live_state.persist_live_status(session_id, raw)
-                _runner_status_probe_backoff.pop(session_id, None)
-                return raw
-            if elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
+                try:
+                    payload = resp.json()
+                except ValueError:
+                    payload = None
+                if isinstance(payload, dict):
+                    raw = str(payload.get("status", "idle"))
+                    _session_status_cache[session_id] = raw
+                    if raw in ("idle", "running", "waiting", "failed"):
+                        session_live_state.persist_live_status(session_id, raw)
+                    _runner_status_probe_backoff.pop(session_id, None)
+                    return raw
+                failure = "HTTP 200 with a malformed body"
+            elif elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
                 _runner_status_probe_backoff.pop(session_id, None)
                 _logger.debug(
                     "Runner status probe for session=%s answered HTTP %s",
@@ -10654,7 +10660,8 @@ async def _run_runner_status_probe(
                     extra={"session_id": session_id},
                 )
                 return None
-            failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
+            else:
+                failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
         previous = _runner_status_probe_backoff.get(session_id)
         failures = (previous.failures if previous is not None else 0) + 1
         window = _runner_status_probe_window_s(failures)

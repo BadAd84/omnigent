@@ -978,6 +978,46 @@ async def test_session_snapshot_probe_backoff_doubles_per_slow_probe_and_resets_
     assert _mod._runner_status_probe_backoff.get(session_id) is None
 
 
+class _MalformedRunnerClient:
+    """Fake runner whose 200 carries a body that is not a JSON object."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=200, json=lambda: ["not", "an", "object"])
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_malformed_200_probe_fails_softly_for_every_waiter(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A 200 without a status object is a failed probe, not an exception every waiter sees."""
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "8c2f0b7e4d9a4a6b1e3c5d0f9a8b7c6d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _MalformedRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first, second = await asyncio.gather(
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
+        )
+
+    assert (first.status, second.status) == ("idle", "idle")
+    assert len(runner_client.get_calls) == 1
+    assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "malformed body" in warnings[0].getMessage()
+
+
 @pytest.mark.asyncio
 async def test_session_snapshot_status_probe_bound_holds_over_the_tunnel_transport(
     monkeypatch: pytest.MonkeyPatch,
