@@ -52,6 +52,110 @@ def test_store_and_load_token(token_dir) -> None:
     assert result == "jwt-abc", f"Expected 'jwt-abc', got {result!r}."
 
 
+@pytest.mark.parametrize("consumer", ["management", "sync", "async"])
+@pytest.mark.parametrize("expired", [False, True], ids=["rejected", "expired"])
+async def test_session_clients_renew_stored_login_over_http(
+    token_dir, monkeypatch: pytest.MonkeyPatch, consumer: str, expired: bool
+) -> None:
+    """Stored login, real HTTP clients, renewal, replay, and persistence compose."""
+    import json
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import parse_qs
+
+    import httpx
+
+    from omnigent import chat, cli
+    from omnigent.cli_auth import load_token, store_token
+
+    received_bearers: list[str | None] = []
+    refresh_requests: list[dict[str, list[str]]] = []
+
+    class AuthServer(BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:
+            pass
+
+        def respond(self, status: int, payload: dict[str, object]) -> None:
+            body = json.dumps(payload).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self) -> None:
+            if self.path != "/oauth/token":
+                self.respond(404, {})
+                return
+            body = self.rfile.read(int(self.headers["Content-Length"])).decode()
+            refresh_requests.append(parse_qs(body))
+            self.respond(
+                200,
+                {
+                    "access_token": "renewed-token",
+                    "refresh_token": "renewed-grant",
+                    "expires_in": 3600,
+                },
+            )
+
+        def do_GET(self) -> None:
+            bearer = self.headers.get("Authorization")
+            received_bearers.append(bearer)
+            self.respond(200 if bearer == "Bearer renewed-token" else 401, {"ok": True})
+
+    monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
+    monkeypatch.setattr(cli, "_host_http_headers_cache", {})
+    monkeypatch.setattr(cli, "_host_http_keyless_demotions", set())
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    with ThreadingHTTPServer(("127.0.0.1", 0), AuthServer) as server:
+        base_url = f"http://127.0.0.1:{server.server_port}"
+        store_token(
+            base_url,
+            token="old-token",
+            user_id="test-user",
+            expires_at=time.time() + (-60 if expired else 3600),
+            refresh_token="stored-grant",
+        )
+        thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.01})
+        thread.start()
+        try:
+            if consumer == "management":
+                for _ in range(2):
+                    result = cli._host_http_json(
+                        base_url=base_url, method="GET", path="/v1/sessions/conv_123"
+                    )
+                    assert result.status_code == 200
+                assert cli._host_request_headers(base_url=base_url, host_id=None)[
+                    "Authorization"
+                ] == ("Bearer renewed-token")
+            elif consumer == "sync":
+                with httpx.Client(
+                    auth=chat._DatabricksTokenAuth(base_url), trust_env=False
+                ) as client:
+                    for _ in range(2):
+                        assert client.get(f"{base_url}/v1/sessions/conv_123").status_code == 200
+            else:
+                async with httpx.AsyncClient(
+                    auth=chat._DatabricksTokenAuth(base_url), trust_env=False
+                ) as client:
+                    for _ in range(2):
+                        response = await client.get(f"{base_url}/v1/sessions/conv_123")
+                        assert response.status_code == 200
+            assert load_token(base_url) == "renewed-token"
+            assert json.loads((token_dir / "auth_tokens.json").read_text())[base_url][
+                "refresh_token"
+            ] == ("renewed-grant")
+            assert refresh_requests == [
+                {"grant_type": ["refresh_token"], "refresh_token": ["stored-grant"]}
+            ]
+            expected = ["Bearer renewed-token", "Bearer renewed-token"]
+            assert received_bearers == (expected if expired else ["Bearer old-token", *expected])
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+
+
 def test_load_returns_none_when_no_file(token_dir) -> None:
     """load_token returns None when no token file exists.
 
@@ -918,6 +1022,117 @@ def test_refresh_stored_token_skips_when_already_fresh(token_dir, monkeypatch) -
 
     monkeypatch.setattr(httpx, "post", _boom)
     assert refresh_stored_token("http://localhost:6767") == "already-fresh"
+
+
+def test_refresh_stored_token_force_renews_rejected_fresh_token(token_dir, monkeypatch) -> None:
+    """A server rejection can force renewal despite the stored expiry."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="revoked",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+    posted: list[str] = []
+
+    def _fake_post(url, *, data=None, timeout=None):
+        del data, timeout
+        posted.append(url)
+        return httpx.Response(
+            200,
+            json={"access_token": "fresh", "expires_in": 3600},
+            request=httpx.Request("POST", url),
+        )
+
+    monkeypatch.setattr(httpx, "post", _fake_post)
+
+    assert refresh_stored_token("http://localhost:6767", force=True) == "fresh"
+    assert posted == ["http://localhost:6767/oauth/token"]
+
+
+def test_refresh_stored_token_force_reuses_concurrently_replaced_token(
+    token_dir, monkeypatch
+) -> None:
+    """Forced refresh does not rotate a token another process already replaced."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="replacement",
+        user_id="a@x",
+        expires_at=time.time() + 3600,
+        refresh_token="refresh-1",
+    )
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("replacement token must avoid another refresh")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+
+    assert (
+        refresh_stored_token(
+            "http://localhost:6767",
+            force=True,
+            rejected_token="rejected",
+        )
+        == "replacement"
+    )
+
+
+def test_refresh_stored_token_force_derives_rejected_token_before_lock(
+    token_dir, monkeypatch
+) -> None:
+    """A forced refresh without an explicit bearer still deduplicates."""
+    import httpx
+
+    import omnigent.cli_auth as cli_auth
+
+    entries = iter(
+        (
+            {"token": "rejected", "refresh_token": "refresh-1"},
+            {
+                "token": "replacement",
+                "expires_at": time.time() + 3600,
+                "refresh_token": "refresh-2",
+            },
+        )
+    )
+    monkeypatch.setattr(cli_auth, "_load_entry", lambda _url: next(entries))
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("replacement token must avoid another refresh")
+
+    monkeypatch.setattr(httpx, "post", _boom)
+
+    assert cli_auth.refresh_stored_token("http://localhost:6767", force=True) == "replacement"
+
+
+def test_refresh_stored_token_tolerates_invalid_proxy_url(token_dir, monkeypatch) -> None:
+    """Malformed proxy settings degrade like other refresh transport errors."""
+    import httpx
+
+    from omnigent.cli_auth import refresh_stored_token, store_token
+
+    store_token(
+        "http://localhost:6767",
+        token="stale",
+        user_id="a@x",
+        expires_at=time.time() - 10,
+        refresh_token="refresh-1",
+    )
+
+    def _invalid_proxy(*_args, **_kwargs):
+        raise httpx.InvalidURL("bad proxy")
+
+    monkeypatch.setattr(httpx, "post", _invalid_proxy)
+
+    assert refresh_stored_token("http://localhost:6767") is None
 
 
 def test_refresh_no_material_does_not_touch_lock_file(token_dir, monkeypatch) -> None:
