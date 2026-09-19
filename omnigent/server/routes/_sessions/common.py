@@ -558,10 +558,14 @@ class _RunnerStatusProbeBackoff:
 
     :param skip_until: Monotonic time before which the probe is skipped.
     :param failures: Consecutive slow or failed probes; sets the next window.
+    :param runner_id: Runner the slow probes were against, e.g.
+        ``"runner_0123456789abcdef"``; a rebind to another runner discards
+        the window.
     """
 
     skip_until: float
     failures: int
+    runner_id: str | None
 
 
 _runner_status_probe_backoff: WorkspaceScopedCache[str, _RunnerStatusProbeBackoff] = (

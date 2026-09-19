@@ -1019,6 +1019,40 @@ async def test_session_snapshot_malformed_200_probe_fails_softly_for_every_waite
 
 
 @pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_is_discarded_when_the_runner_changes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skip window recorded against one runner does not silence probes of its replacement."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "9d3a1c8f6b5e4e7d0f2a4b6c8e1d3f5a"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    stalled = _HangingRunnerClient()
+
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    assert await orchestration._probe_runner_live_status(stalled, session_id, "runner_old") is None  # type: ignore[arg-type]
+    assert _mod._runner_status_probe_backoff.get(session_id).runner_id == "runner_old"
+
+    class _HealthyRunnerClient:
+        def __init__(self) -> None:
+            self.get_calls: list[str] = []
+
+        async def get(self, url: str, timeout: float) -> Any:
+            self.get_calls.append(url)
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+    replacement = _HealthyRunnerClient()
+    status = await orchestration._probe_runner_live_status(replacement, session_id, "runner_new")  # type: ignore[arg-type]
+
+    assert status == "running"
+    assert replacement.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+    assert _mod._session_status_cache.get(session_id) == "running"
+
+
+@pytest.mark.asyncio
 async def test_session_snapshot_status_probe_bound_holds_over_the_tunnel_transport(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

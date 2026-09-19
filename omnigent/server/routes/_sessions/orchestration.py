@@ -10586,7 +10586,7 @@ def _runner_status_probe_window_s(failures: int) -> float:
 
 
 async def _probe_runner_live_status(
-    runner_client: httpx.AsyncClient, session_id: str
+    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None = None
 ) -> str | None:
     """
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
@@ -10598,15 +10598,20 @@ async def _probe_runner_live_status(
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_id: The session's bound runner, e.g.
+        ``"runner_0123456789abcdef"``. A skip window recorded against a
+        different runner is discarded so a rebound session is probed at once.
     :returns: The runner's raw status, e.g. ``"running"``, or ``None`` when the
         probe is in backoff, timed out, failed, or returned a non-200.
     """
     probe = _runner_status_probe_inflight.get(session_id)
     if probe is None:
         backoff = _runner_status_probe_backoff.get(session_id)
-        if backoff is not None and time.monotonic() < backoff.skip_until:
+        if backoff is not None and backoff.runner_id != runner_id:
+            _runner_status_probe_backoff.pop(session_id, None)
+        elif backoff is not None and time.monotonic() < backoff.skip_until:
             return None
-        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id))
+        probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id, runner_id))
         _runner_status_probe_inflight[session_id] = probe
     # Shielded so one cancelled snapshot request does not abort the probe the
     # other waiters share.
@@ -10614,13 +10619,14 @@ async def _probe_runner_live_status(
 
 
 async def _run_runner_status_probe(
-    runner_client: httpx.AsyncClient, session_id: str
+    runner_client: httpx.AsyncClient, session_id: str, runner_id: str | None
 ) -> str | None:
     """
     Run one bounded runner status probe and record its outcome.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+    :param runner_id: The session's bound runner, recorded with any skip window.
     :returns: The runner's raw status on a 200, else ``None``.
     """
     started = time.monotonic()
@@ -10666,7 +10672,7 @@ async def _run_runner_status_probe(
         failures = (previous.failures if previous is not None else 0) + 1
         window = _runner_status_probe_window_s(failures)
         _runner_status_probe_backoff[session_id] = _RunnerStatusProbeBackoff(
-            skip_until=time.monotonic() + window, failures=failures
+            skip_until=time.monotonic() + window, failures=failures, runner_id=runner_id
         )
         _logger.warning(
             "Runner status probe for session=%s failed (%s); skipping it for %.0fs",
@@ -10808,7 +10814,10 @@ async def _get_session_snapshot(
         # relay values (``"waiting"`` → ``"running"``), so the raw cache value
         # is only needed here when it is actually missing (None).
         if _session_status_cache.get(session_id) is None and runner_client is not None:
-            if await _probe_runner_live_status(runner_client, session_id) is not None:
+            if (
+                await _probe_runner_live_status(runner_client, session_id, conv.runner_id)
+                is not None
+            ):
                 status = _session_status_from_cache(session_id)
     # last_total_tokens and last_task_error come from the context-tokens
     # label written by the forwarder (tasks table has been removed).
