@@ -1478,8 +1478,11 @@ def _wait_for_agy_prompt_ready(socket_path: str, tmux_target: str, *, timeout_s:
     hand the composer back before the paste. Escape is never spent while a
     footer marker is visible: on the idle composer it could clear a draft,
     and mid-turn it would cancel the running turn. An empty (torn) capture is
-    "unknown" and earns no Escape. Mirrors claude-native's
-    ``_restore_occupied_input``.
+    "unknown" and earns no Escape. This presumes a sustained marker-less,
+    non-empty screen only occurs outside a running turn (agy keeps the
+    ``esc to cancel`` footer visible mid-turn); a panel that hid that footer
+    for two polls would be Escaped and the turn cancelled. Mirrors
+    claude-native's ``_restore_occupied_input``.
 
     :param socket_path: tmux server socket path.
     :param tmux_target: tmux pane target.
