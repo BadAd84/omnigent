@@ -203,6 +203,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _runner_relay_tasks,
     _runner_status_probe_backoff,
     _runner_status_probe_inflight,
+    _RunnerStatusProbeBackoff,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -10555,16 +10556,33 @@ async def _load_acp_model_options(
 
 
 # The tunnel transport does not enforce httpx timeouts, so the runner status
-# probe below is bounded here. A healthy runner answers from memory in tens of
-# milliseconds; one that cannot answer in this budget is stalled, and the relay
-# publishes the real status once it can.
-_RUNNER_STATUS_PROBE_TIMEOUT_S: float = 2.0
-# A probe that timed out or failed in transport is not repeated for this long,
-# so a slow runner costs each snapshot of its session at most one probe per
-# window instead of one per request. A non-200 answer is cheap and is asked
-# again on the next snapshot: a runner that has not registered the session
-# yet answers 404 until session init lands.
+# probe below is bounded here. Healthy runners answer from memory (99.85% of
+# production probes finish inside 5 s), and the runner's own launch-config
+# read of this snapshot has a 10 s budget the bound must leave room for.
+_RUNNER_STATUS_PROBE_TIMEOUT_S: float = 5.0
+# A non-200 that arrives within this is a prompt answer from a responsive
+# runner (a freshly bound one answers 404 until session init lands) and is
+# asked again next snapshot; a slower one counts as a slow probe.
+_RUNNER_STATUS_PROBE_SLOW_S: float = 1.0
+# After a slow probe the session's probe is skipped for a window that doubles
+# per consecutive slow probe up to the cap, so a runner stalled for hours
+# costs a probe every few minutes instead of every window. A prompt answer
+# resets the streak.
 _RUNNER_STATUS_PROBE_BACKOFF_S: float = 30.0
+_RUNNER_STATUS_PROBE_BACKOFF_CAP_S: float = 300.0
+
+
+def _runner_status_probe_window_s(failures: int) -> float:
+    """
+    Return the skip window after *failures* consecutive slow probes.
+
+    :param failures: Consecutive slow probes so far, e.g. ``1`` after the first.
+    :returns: Seconds to skip the probe, e.g. ``30.0`` then ``60.0``, capped.
+    """
+    return min(
+        _RUNNER_STATUS_PROBE_BACKOFF_S * (2 ** (failures - 1)),
+        _RUNNER_STATUS_PROBE_BACKOFF_CAP_S,
+    )
 
 
 async def _probe_runner_live_status(
@@ -10574,8 +10592,9 @@ async def _probe_runner_live_status(
     Ask a session's bound runner for its live status, bounded, shared, and backed off.
 
     Concurrent snapshots of one session await the same in-flight probe. A 200
-    records the status in ``_session_status_cache``; a probe that timed out or
-    failed in transport puts the session in backoff instead.
+    records the status in ``_session_status_cache``; a probe that timed out,
+    failed in transport, or answered slowly without a status puts the session
+    in a skip window that doubles per consecutive slow probe.
 
     :param runner_client: HTTP client pointed at the session's runner.
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
@@ -10584,10 +10603,9 @@ async def _probe_runner_live_status(
     """
     probe = _runner_status_probe_inflight.get(session_id)
     if probe is None:
-        skip_until = _runner_status_probe_backoff.get(session_id)
-        if skip_until is not None and time.monotonic() < skip_until:
+        backoff = _runner_status_probe_backoff.get(session_id)
+        if backoff is not None and time.monotonic() < backoff.skip_until:
             return None
-        _runner_status_probe_backoff.pop(session_id, None)
         probe = asyncio.create_task(_run_runner_status_probe(runner_client, session_id))
         _runner_status_probe_inflight[session_id] = probe
     # Shielded so one cancelled snapshot request does not abort the probe the
@@ -10605,6 +10623,7 @@ async def _run_runner_status_probe(
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :returns: The runner's raw status on a 200, else ``None``.
     """
+    started = time.monotonic()
     try:
         try:
             resp = await asyncio.wait_for(
@@ -10618,27 +10637,35 @@ async def _run_runner_status_probe(
         except (httpx.HTTPError, ConnectionError) as exc:
             failure = f"{type(exc).__name__}: {exc}"
         else:
+            elapsed = time.monotonic() - started
             if resp.status_code == 200:
                 raw = str(resp.json().get("status", "idle"))
                 _session_status_cache[session_id] = raw
                 if raw in ("idle", "running", "waiting", "failed"):
                     session_live_state.persist_live_status(session_id, raw)
+                _runner_status_probe_backoff.pop(session_id, None)
                 return raw
-            _logger.debug(
-                "Runner status probe for session=%s answered HTTP %s",
-                session_id,
-                resp.status_code,
-                extra={"session_id": session_id},
-            )
-            return None
-        _runner_status_probe_backoff[session_id] = (
-            time.monotonic() + _RUNNER_STATUS_PROBE_BACKOFF_S
+            if elapsed < _RUNNER_STATUS_PROBE_SLOW_S:
+                _runner_status_probe_backoff.pop(session_id, None)
+                _logger.debug(
+                    "Runner status probe for session=%s answered HTTP %s",
+                    session_id,
+                    resp.status_code,
+                    extra={"session_id": session_id},
+                )
+                return None
+            failure = f"HTTP {resp.status_code} after {elapsed:.1f}s"
+        previous = _runner_status_probe_backoff.get(session_id)
+        failures = (previous.failures if previous is not None else 0) + 1
+        window = _runner_status_probe_window_s(failures)
+        _runner_status_probe_backoff[session_id] = _RunnerStatusProbeBackoff(
+            skip_until=time.monotonic() + window, failures=failures
         )
         _logger.warning(
             "Runner status probe for session=%s failed (%s); skipping it for %.0fs",
             session_id,
             failure,
-            _RUNNER_STATUS_PROBE_BACKOFF_S,
+            window,
             extra={"session_id": session_id},
         )
         return None

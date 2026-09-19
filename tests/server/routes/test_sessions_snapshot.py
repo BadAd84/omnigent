@@ -762,9 +762,11 @@ async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
     # One probe, cut off at the budget; the second snapshot skipped it entirely.
     assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
     assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
     warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
     assert len(warnings) == 1
     assert "no answer within 0.05s" in warnings[0].getMessage()
+    assert "skipping it for 30s" in warnings[0].getMessage()
 
 
 @pytest.mark.asyncio
@@ -877,6 +879,102 @@ async def test_session_snapshot_status_probe_asks_again_after_non_200(
     assert second.status == "idle"
     assert len(runner_client.get_calls) == 2
     assert _mod._session_status_cache.get(session_id) is None
+    assert _mod._runner_status_probe_backoff.get(session_id) is None
+
+
+class _SlowNotFoundRunnerClient:
+    """Fake runner that answers 404 only after a delay: stalled, and without the session."""
+
+    def __init__(self, delay_s: float) -> None:
+        self.delay_s = delay_s
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.sleep(self.delay_s)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_slow_non_200_probe_enters_backoff(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A non-200 that took longer than the slow threshold is treated like a failed probe."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "6a0d8f5c2b7e4e4f9c1a3b8d7e6f5a4b"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_SLOW_S", 0.01)
+    runner_client = _SlowNotFoundRunnerClient(delay_s=0.05)
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 1
+    assert _mod._runner_status_probe_backoff.get(session_id).failures == 1
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "HTTP 404 after" in warnings[0].getMessage()
+
+
+class _SwitchableRunnerClient:
+    """Fake runner that hangs until told to answer 200."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.answer = False
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        if self.answer:
+            return SimpleNamespace(status_code=200, json=lambda: {"status": "idle"})
+        await asyncio.Future()
+        return None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_probe_backoff_doubles_per_slow_probe_and_resets_on_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Consecutive slow probes double the skip window up to the cap; a prompt answer clears it."""
+    import time
+
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "7b1e9a6d3c8f4f5a0d2b4c9e8f7a6b5c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _SwitchableRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    def _window_s() -> float:
+        return _mod._runner_status_probe_backoff.get(session_id).skip_until - time.monotonic()
+
+    def _expire_window() -> None:
+        _mod._runner_status_probe_backoff.get(session_id).skip_until = time.monotonic() - 1.0
+
+    expected_windows = [30.0, 60.0, 120.0, 240.0, 300.0, 300.0]
+    for failures, expected in enumerate(expected_windows, start=1):
+        await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        entry = _mod._runner_status_probe_backoff.get(session_id)
+        assert entry.failures == failures
+        assert abs(_window_s() - expected) < 2.0, (failures, _window_s())
+        _expire_window()
+    assert len(runner_client.get_calls) == len(expected_windows)
+
+    runner_client.answer = True
+    snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert snapshot.status == "idle"
+    assert _mod._session_status_cache.get(session_id) == "idle"
     assert _mod._runner_status_probe_backoff.get(session_id) is None
 
 
