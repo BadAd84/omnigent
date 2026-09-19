@@ -53,9 +53,9 @@ def test_store_and_load_token(token_dir) -> None:
 
 
 @pytest.mark.parametrize("consumer", ["management", "sync", "async"])
-@pytest.mark.parametrize("expired", [False, True], ids=["rejected", "expired"])
-async def test_session_clients_renew_stored_login_over_http(
-    token_dir, monkeypatch: pytest.MonkeyPatch, consumer: str, expired: bool
+@pytest.mark.parametrize("scenario", ["rejected", "expired", "forbidden", "gateway_forbidden"])
+async def test_session_clients_refresh_only_auth_failures_over_http(
+    token_dir, monkeypatch: pytest.MonkeyPatch, consumer: str, scenario: str
 ) -> None:
     """Stored login, real HTTP clients, renewal, replay, and persistence compose."""
     import json
@@ -70,6 +70,9 @@ async def test_session_clients_renew_stored_login_over_http(
 
     received_bearers: list[str | None] = []
     refresh_requests: list[dict[str, list[str]]] = []
+    expired = scenario == "expired"
+    forbidden = scenario == "forbidden"
+    expected_status = 403 if forbidden else 200
 
     class AuthServer(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
@@ -101,7 +104,13 @@ async def test_session_clients_renew_stored_login_over_http(
         def do_GET(self) -> None:
             bearer = self.headers.get("Authorization")
             received_bearers.append(bearer)
-            self.respond(200 if bearer == "Bearer renewed-token" else 401, {"ok": True})
+            if forbidden:
+                self.respond(403, {"error": {"code": "forbidden", "message": "Owner required"}})
+            else:
+                rejected_status = 403 if scenario == "gateway_forbidden" else 401
+                self.respond(
+                    200 if bearer == "Bearer renewed-token" else rejected_status, {"ok": True}
+                )
 
     monkeypatch.delenv("OMNIGENT_REMOTE_AUTH_TOKEN", raising=False)
     monkeypatch.setattr(cli, "_host_http_headers_cache", {})
@@ -125,23 +134,31 @@ async def test_session_clients_renew_stored_login_over_http(
                     result = cli._host_http_json(
                         base_url=base_url, method="GET", path="/v1/sessions/conv_123"
                     )
-                    assert result.status_code == 200
+                    assert result.status_code == expected_status
                 assert cli._host_request_headers(base_url=base_url, host_id=None)[
                     "Authorization"
-                ] == ("Bearer renewed-token")
+                ] == ("Bearer old-token" if forbidden else "Bearer renewed-token")
             elif consumer == "sync":
                 with httpx.Client(
                     auth=chat._DatabricksTokenAuth(base_url), trust_env=False
                 ) as client:
                     for _ in range(2):
-                        assert client.get(f"{base_url}/v1/sessions/conv_123").status_code == 200
+                        with client.stream("GET", f"{base_url}/v1/sessions/conv_123") as response:
+                            assert response.status_code == expected_status
             else:
                 async with httpx.AsyncClient(
                     auth=chat._DatabricksTokenAuth(base_url), trust_env=False
                 ) as client:
                     for _ in range(2):
-                        response = await client.get(f"{base_url}/v1/sessions/conv_123")
-                        assert response.status_code == 200
+                        async with client.stream(
+                            "GET", f"{base_url}/v1/sessions/conv_123"
+                        ) as response:
+                            assert response.status_code == expected_status
+            if forbidden:
+                assert received_bearers == ["Bearer old-token", "Bearer old-token"]
+                assert refresh_requests == []
+                assert load_token(base_url) == "old-token"
+                return
             assert load_token(base_url) == "renewed-token"
             assert json.loads((token_dir / "auth_tokens.json").read_text())[base_url][
                 "refresh_token"

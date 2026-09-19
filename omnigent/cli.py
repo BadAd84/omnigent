@@ -3497,6 +3497,15 @@ def _load_or_create_host_id() -> str | None:
         return None
 
 
+def _ensure_local_daemon_for_explicit_url() -> bool:
+    """Recover a local daemon, ending the command if its server config changed."""
+    if _ensure_host_daemon(None):
+        local_url = _discover_local_server_url()
+        _update_daemon_resolved_server_url(_LOCAL_DAEMON_MARKER, local_url)
+        _exit_for_auth_mode_change(local_url)
+    return False
+
+
 def _ensure_host_daemon(server_url: str | None) -> bool:
     """Start or reuse a host daemon for one target.
 
@@ -3508,13 +3517,15 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         should ask the user to re-run against the freshly-restarted server
         rather than continue this command mid-restart. ``False`` for a
         plain reuse, a transparent tunnel-health heal, or a first spawn.
+    :raises SystemExit: If an explicit local URL triggers a config restart;
+        waits for the new server and displays the re-run notice first.
     """
     ensure_started_at = time.monotonic()
     target = _normalize_daemon_target(server_url)
     if server_url and _local_daemon_serves_target(target, server_url):
         # A caller may hand back the concrete URL discovered from local mode.
-        # Re-enter through its ``local`` record so tunnel health is checked.
-        return _ensure_host_daemon(None)
+        # Handle server restarts here: explicit-URL callers cannot follow them.
+        return _ensure_local_daemon_for_explicit_url()
     existing_before = _find_daemon_record(target)
     process_was_running = existing_before is not None and _daemon_owner_is_live(existing_before)
 
@@ -3535,7 +3546,7 @@ def _ensure_host_daemon(server_url: str | None) -> bool:
         return False
     if not decision.config_changed and _local_daemon_serves_target(target, server_url):
         # Cover a local daemon claiming this URL after the first check.
-        return _ensure_host_daemon(None)
+        return _ensure_local_daemon_for_explicit_url()
 
     _HOST_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
     mode_args = ["--local"] if not server_url else ["--server", server_url]
@@ -3817,15 +3828,10 @@ def _ensure_backend(server: str | None) -> str:
     )
 
     if server:
-        # Remote / explicit-server mode: the server isn't ours to restart, so
-        # there's no auth-mode-flip "re-run" to surface (config_changed is
-        # always False for a non-local target). Expand a bare workspace URL
-        # to its /api/2.0/omnigent mount, then sign in first when the
-        # server is Databricks-fronted and we hold no usable credentials —
-        # otherwise the session-create call deep in the REPL bring-up
-        # surfaces the edge redirect as an opaque non-JSON-response
-        # traceback.
-        #
+        # Explicit URLs return unchanged; local config restarts exit inside
+        # _ensure_host_daemon. Sign in before session creation so expired
+        # Databricks logins produce actionable errors.
+
         # The auth probe (GET /v1/me, ~0.65s) and the daemon tunnel start
         # (~2s) are independent — run them concurrently so the auth check
         # is hidden under the longer daemon wait.
@@ -9944,6 +9950,7 @@ def _host_http_json(
     """
     import httpx
 
+    from omnigent.chat import _remote_auth_rejected
     from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER
 
     def _send(headers: dict[str, str]) -> tuple[_HostHttpResult, bool]:
@@ -9961,10 +9968,7 @@ def _host_http_json(
             body = resp.text
         else:
             body = cast(_HostJsonObject, decoded) if isinstance(decoded, dict) else str(decoded)
-        location = resp.headers.get("location", "")
-        auth_rejected = resp.status_code in (401, 403) or (
-            300 <= resp.status_code < 400 and ("/oidc/" in location or "/.auth/" in location)
-        )
+        auth_rejected = _remote_auth_rejected(resp)
         return _HostHttpResult(status_code=resp.status_code, body=body), auth_rejected
 
     try:

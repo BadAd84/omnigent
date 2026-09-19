@@ -793,10 +793,19 @@ def _refreshable_stored_token(
 
 
 def _remote_auth_rejected(response: httpx.Response) -> bool:
-    """Return whether a response requires replacing its bearer."""
+    """Classify auth failures with redirects unfollowed and 403 bodies buffered."""
+    if response.status_code == 403:
+        try:
+            body = response.json()
+        except ValueError:
+            pass
+        else:
+            error = body.get("error") if isinstance(body, dict) else None
+            if isinstance(error, dict) and error.get("code") == "forbidden":
+                return False
     if response.status_code in (401, 403):
         return True
-    if not response.is_redirect:
+    if not 300 <= response.status_code < 400:
         return False
     location = response.headers.get("location", "")
     return "/oidc/" in location or "/.auth/" in location
@@ -1172,6 +1181,8 @@ class _DatabricksTokenAuth(httpx.Auth):
         retry_suppression: str | None = None
         while True:
             response = yield request
+            if response.status_code == 403:
+                response.read()
             if (
                 not auth_replayed
                 and not self._static_token
@@ -1238,6 +1249,8 @@ class _DatabricksTokenAuth(httpx.Auth):
         retry_suppression: str | None = None
         while True:
             response = yield request
+            if response.status_code == 403:
+                await response.aread()
             if (
                 not auth_replayed
                 and not self._static_token

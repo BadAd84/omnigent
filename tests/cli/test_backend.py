@@ -510,6 +510,77 @@ def test_ensure_host_daemon_concrete_local_url_heals_offline_tunnel(
     assert "--server" not in args
 
 
+@pytest.mark.parametrize("through_backend", [False, True])
+@pytest.mark.parametrize("concurrent_local_claim", [False, True])
+def test_explicit_local_url_config_drift_waits_and_exits(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    through_backend: bool,
+    concurrent_local_claim: bool,
+) -> None:
+    """Explicit URLs cannot continue across a restart, even when the port changes."""
+    captured: dict[str, object] = {}
+    _patch_daemon_spawn(monkeypatch, tmp_path, captured)
+    _write_daemon_registry_record(
+        tmp_path,
+        pid=4242,
+        target="local",
+        mode="local",
+        server_url=None,
+        log_path=str(tmp_path / "daemon.log"),
+        config_sig="stale-auth-signature",
+        resolved_server_url="http://127.0.0.1:8123",
+    )
+    monkeypatch.setattr(cli, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(cli, "_pid_is_recorded_daemon", lambda record: True)
+    monkeypatch.setattr(cli, "_terminate_daemon", lambda record, *, force: None)
+    monkeypatch.setattr(cli, "_ensure_databricks_server_auth", lambda server: None)
+    restarted = False
+    ready = False
+    startup_polls = 0
+    new_url = "http://127.0.0.1:8124"
+
+    def stop_server() -> None:
+        nonlocal restarted
+        restarted = True
+
+    def healthy_url() -> str | None:
+        nonlocal concurrent_local_claim, startup_polls, ready
+        if concurrent_local_claim:
+            concurrent_local_claim = False
+            return None
+        if not restarted:
+            return "http://127.0.0.1:8123"
+        startup_polls += 1
+        ready = startup_polls > 1
+        return new_url if ready else None
+
+    def server_info(**kwargs: object) -> cli._HostHttpResult:
+        assert ready
+        assert kwargs["base_url"] == new_url
+        assert kwargs["path"] == "/v1/info"
+        return cli._HostHttpResult(200, {"accounts_enabled": True, "needs_setup": True})
+
+    monkeypatch.setattr(cli, "stop_local_omnigent_server", stop_server)
+    monkeypatch.setattr(cli, "local_server_url_if_healthy", healthy_url)
+    monkeypatch.setattr(cli, "_host_http_json", server_info)
+
+    ensure = _ensure_backend if through_backend else _ensure_host_daemon
+    with pytest.raises(SystemExit) as exc:
+        ensure("http://127.0.0.1:8123")
+
+    assert exc.value.code == 0
+    assert restarted and ready
+    assert startup_polls == 2
+    record = cli._find_daemon_record("local")
+    assert record is not None and record.resolved_server_url == new_url
+    output = capsys.readouterr().err
+    assert "Auth mode changed" in output
+    assert new_url in output
+    assert "re-run" in output
+
+
 def test_terminate_host_unit_preserves_server_for_tunnel_heal(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
