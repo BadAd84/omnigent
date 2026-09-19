@@ -690,6 +690,167 @@ async def test_session_snapshot_queries_runner_on_cache_miss(
     )
 
 
+class _HangingRunnerClient:
+    """Fake runner whose status GET never answers, like a stalled runner behind a live tunnel."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        await asyncio.Future()
+
+
+class _NotFoundRunnerClient:
+    """Fake runner that does not know the session."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
+
+
+def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
+    monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
+    monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A runner that never answers costs one bounded probe, then none until the backoff ends.
+
+    The tunnel transport ignores httpx timeouts, so an unanswered probe used to
+    hold every snapshot of the session until the runner spoke or its tunnel
+    dropped, and nothing was cached, so the next snapshot waited again.
+    """
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "0a4d2f9c6b1e4e8f9c3a7d5b2e1f0a9c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
+        first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    # One probe, cut off at the budget; the second snapshot skipped it entirely.
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) is None
+    warnings = [r for r in caplog.records if "Runner status probe" in r.getMessage()]
+    assert len(warnings) == 1
+    assert "no answer within 0.05s" in warnings[0].getMessage()
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_resumes_after_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Once the backoff has elapsed the next snapshot probes the runner again."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "1b5e3a0d7c2f4f9a8d4b6e3c2f0a1b8d"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_BACKOFF_S", 0.0)
+    runner_client = _HangingRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert len(runner_client.get_calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_backs_off_after_non_200(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner that answers without a status is not asked again within the backoff."""
+    from omnigent.server.routes import sessions as _mod
+
+    session_id = "2c6f4b1e8d3a4a0b9e5c7f4d3a1b2c9e"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _NotFoundRunnerClient()
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    first = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+    second = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+
+    assert first.status == "idle"
+    assert second.status == "idle"
+    assert len(runner_client.get_calls) == 1
+    assert _mod._session_status_cache.get(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_status_probe_bound_holds_over_the_tunnel_transport(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Over the real tunnel an unanswered probe ends at the budget with nothing in flight."""
+    import time
+
+    import httpx
+
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    class _IdleWS:
+        async def send_text(self, data: str) -> None:
+            return None
+
+        async def receive_text(self) -> str:
+            return await asyncio.Future()
+
+    session_id = "3d7a5c2f9e4b4b1c8f6d8a5e4b2c3d0f"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.1)
+    registry = TunnelRegistry()
+    registry.register(
+        "runner_one",
+        _IdleWS(),
+        HelloFrame(runner_version="0.1.0", frame_protocol_version=1, harnesses=[], envs=[]),
+    )
+    runner_client = httpx.AsyncClient(
+        transport=WSTunnelTransport(registry, "runner_one"), base_url="http://runner"
+    )
+    _use_runner_client(monkeypatch, runner_client)
+    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+
+    try:
+        started = time.monotonic()
+        snapshot = await _get_session_snapshot(conv_store, session_id)  # type: ignore[arg-type]
+        elapsed = time.monotonic() - started
+    finally:
+        await runner_client.aclose()
+
+    assert snapshot.status == "idle"
+    assert elapsed < 1.0
+    tunnel = registry.get("runner_one")
+    assert tunnel is not None
+    assert tunnel.in_flight == {}
+    assert _mod._runner_status_probe_backoff.get(session_id) is not None
+
+
 @pytest.mark.asyncio
 async def test_session_snapshot_uses_persisted_status_after_server_restart(
     monkeypatch: pytest.MonkeyPatch,
