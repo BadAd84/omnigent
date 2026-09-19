@@ -712,6 +712,21 @@ class _NotFoundRunnerClient:
         return SimpleNamespace(status_code=404, json=lambda: {"error": "not_found"})
 
 
+class _GatedRunnerClient:
+    """Fake runner whose status GET blocks until released, so callers provably overlap."""
+
+    def __init__(self) -> None:
+        self.get_calls: list[str] = []
+        self.arrived = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def get(self, url: str, timeout: float) -> Any:
+        self.get_calls.append(url)
+        self.arrived.set()
+        await self.release.wait()
+        return SimpleNamespace(status_code=200, json=lambda: {"status": "running"})
+
+
 def _use_runner_client(monkeypatch: pytest.MonkeyPatch, runner_client: object) -> None:
     monkeypatch.setattr("omnigent.runtime.get_runner_client", lambda: runner_client)
     monkeypatch.setattr("omnigent.runtime.get_runner_router", lambda: None)
@@ -753,31 +768,65 @@ async def test_session_snapshot_status_probe_is_bounded_and_backed_off(
 
 
 @pytest.mark.asyncio
-async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Snapshots racing on a cold status cache share one probe and one warning."""
+async def test_session_snapshot_concurrent_cache_misses_share_one_status_probe() -> None:
+    """Callers racing on a cold status cache await one shared in-flight probe.
+
+    The runner's answer is gated on an event the test controls, so the second
+    caller provably attaches while the first probe is still in flight; the pass
+    cannot come from two probes merely running back to back.
+    """
     from omnigent.server.routes import sessions as _mod
     from omnigent.server.routes._sessions import orchestration
 
     session_id = "4e8b6d3a0f5c4c2d9a7e9b6f5c3d4e1a"
     _mod._session_status_cache.pop(session_id, None)
     _mod._runner_status_probe_backoff.pop(session_id, None)
-    monkeypatch.setattr(orchestration, "_RUNNER_STATUS_PROBE_TIMEOUT_S", 0.05)
-    runner_client = _HangingRunnerClient()
-    _use_runner_client(monkeypatch, runner_client)
-    conv_store = _ConversationStore([_message_item("item_1", "hi")])
+    runner_client = _GatedRunnerClient()
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.server.routes.sessions"):
-        first, second = await asyncio.gather(
-            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
-            _get_session_snapshot(conv_store, session_id),  # type: ignore[arg-type]
-        )
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    # One yield schedules `second` onto the shared probe; only then may it finish.
+    await asyncio.sleep(0)
+    runner_client.release.set()
 
-    assert (first.status, second.status) == ("idle", "idle")
+    assert await asyncio.gather(first, second) == ["running", "running"]
     assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
-    assert len([r for r in caplog.records if "Runner status probe" in r.getMessage()]) == 1
+    assert _mod._session_status_cache.get(session_id) == "running"
     assert _mod._runner_status_probe_inflight.get(session_id) is None
+
+
+@pytest.mark.asyncio
+async def test_session_snapshot_cancelled_caller_does_not_abort_shared_status_probe() -> None:
+    """Cancelling one caller's snapshot leaves the shared probe running for the rest."""
+    from omnigent.server.routes import sessions as _mod
+    from omnigent.server.routes._sessions import orchestration
+
+    session_id = "5f9c7e4b1a2d4d3e8b0f1c9d6e5a7b2c"
+    _mod._session_status_cache.pop(session_id, None)
+    _mod._runner_status_probe_backoff.pop(session_id, None)
+    runner_client = _GatedRunnerClient()
+
+    first = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.wait_for(runner_client.arrived.wait(), timeout=1.0)
+    second = asyncio.create_task(
+        orchestration._probe_runner_live_status(runner_client, session_id)  # type: ignore[arg-type]
+    )
+    await asyncio.sleep(0)
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    runner_client.release.set()
+
+    assert await second == "running"
+    assert runner_client.get_calls == [f"/v1/sessions/{session_id}"]
+    assert _mod._session_status_cache.get(session_id) == "running"
 
 
 @pytest.mark.asyncio
