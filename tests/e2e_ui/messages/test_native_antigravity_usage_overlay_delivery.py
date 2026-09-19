@@ -4,16 +4,17 @@ With an Antigravity (``agy``) session, opening **Terminal View**,
 running the ``/usage`` slash command, leaving its full-screen overlay on
 screen, then switching back to **Chat** and sending a prompt loses the prompt.
 The antigravity-native delivery path
-(:func:`omnigent.antigravity_native_bridge.inject_user_message_via_tui`) keys
+(:func:`omnigent.harnesses.antigravity_native.bridge.inject_user_message_via_tui`) keys
 readiness on agy's statusline markers (``? for shortcuts`` idle /
 ``esc to cancel`` active); a full-screen overlay panel renders neither (agy >=
 1.0.17 removed those hints from overlay panels — see the changelog embedded in
 the agy binary), so the readiness gate burns its whole budget, the bracketed
-paste is swallowed by the overlay, and the turn dies with ``Could not deliver
-the turn to the agy TUI: agy did not render the pasted message in its input
-box before submit``. Unlike claude-native (whose bridge reclaims an occupied
-composer with a verified Escape — ``_restore_occupied_input`` in
-``omnigent/claude_native_bridge.py``, guarded by
+paste is swallowed by the overlay, and the turn is lost — it hangs with no
+reply, or records ``Could not deliver the turn to the agy TUI: agy did not
+render the pasted message in its input box before submit``. Unlike
+claude-native (whose bridge reclaims an occupied composer with a verified
+Escape — ``_restore_occupied_input`` in
+``omnigent/harnesses/claude_native/bridge.py``, guarded by
 ``test_native_claude_composer_delivers_into_an_occupied_tui``), the agy bridge
 never restores prompt readiness, so the user's message is lost.
 
@@ -38,8 +39,9 @@ server + shimmed harness binary) in ``tests/e2e_ui/conftest.py``.
 Expected (post-fix) behavior, per the report: Omnigent restores prompt
 readiness (e.g. a verified Escape) before injecting, so the prompt reaches
 agy — the pane echoes it and no delivery error is recorded. Before the fix
-this test fails: the transcript gains the delivery ExecutorError and the pane
-still shows the overlay.
+this test fails: the prompt never reaches the pane (the transcript gains the
+delivery ExecutorError, or the turn just hangs) and the pane still shows the
+overlay.
 """
 
 from __future__ import annotations
@@ -256,14 +258,14 @@ def _write_agy_stub(shim_dir: Path) -> None:
 def _antigravity_bundle() -> bytes:
     """Build the exact terminal-first bundle ``omnigent antigravity`` ships.
 
-    Reuses :func:`omnigent.antigravity_native._materialize_antigravity_agent_spec`
+    Reuses :func:`omnigent.harnesses.antigravity_native.main._materialize_antigravity_agent_spec`
     so the fixture never drifts from production. The spec carries no
     ``spec_version``, so a non-``config.yaml`` arcname routes it through the
     omnigent compat translator (mirrors ``_create_native_cursor_session``).
 
     :returns: Gzipped tarball bytes for the session-create upload.
     """
-    from omnigent.antigravity_native import _materialize_antigravity_agent_spec
+    from omnigent.harnesses.antigravity_native.main import _materialize_antigravity_agent_spec
 
     with tempfile.TemporaryDirectory() as tmp:
         spec_path = _materialize_antigravity_agent_spec(Path(tmp))
@@ -334,7 +336,7 @@ def _bridge_tmux_info(session_id: str) -> dict[str, str] | None:
         fixture stamps no explicit bridge-id label).
     :returns: ``{"socket_path": ..., "tmux_target": ...}`` or ``None``.
     """
-    from omnigent.antigravity_native_bridge import bridge_dir_for_bridge_id
+    from omnigent.harnesses.antigravity_native.bridge import bridge_dir_for_bridge_id
 
     advert = bridge_dir_for_bridge_id(session_id) / "tmux.json"
     if not advert.exists():
@@ -618,10 +620,10 @@ def test_chat_prompt_delivers_while_usage_overlay_is_open(
     prompt. The prompt must reach agy (the pane echoes it after the bridge
     restores prompt readiness) and the turn must not die with the TUI-delivery
     ExecutorError. Before the fix, the readiness gate times out against the
-    footer-less overlay, the paste is swallowed, the transcript records
-    ``Could not deliver the turn to the agy TUI: agy did not render the pasted
-    message in its input box before submit`` — and the Terminal view still
-    shows the captured ``/usage`` screen.
+    footer-less overlay, the paste is swallowed, the turn is lost (it hangs, or
+    the transcript records ``Could not deliver the turn to the agy TUI: agy did
+    not render the pasted message in its input box before submit``) — and the
+    Terminal view still shows the captured ``/usage`` screen.
     """
     base_url, session_id = antigravity_overlay_session
     marker = f"OVERLAY_PROBE_{uuid.uuid4().hex[:8]}"
