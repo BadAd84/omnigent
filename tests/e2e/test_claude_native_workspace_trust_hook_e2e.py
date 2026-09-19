@@ -2,8 +2,8 @@ r"""End-to-end guard: claude-native must not run unreviewed project hooks at sta
 
 ``claude-native`` pre-seeds Claude Code's first-run trust + onboarding gates
 pre-launch, without user confirmation:
-:func:`omnigent.claude_native_bridge.ensure_claude_workspace_trusted` writes
-``hasCompletedOnboarding`` and ``projects[<abs cwd>].hasTrustDialogAccepted``
+:func:`omnigent.harnesses.claude_native.bridge.ensure_claude_workspace_trusted`
+writes ``hasCompletedOnboarding`` and ``projects[<abs cwd>].hasTrustDialogAccepted``
 into the launch ``HOME``'s ``~/.claude.json`` so a host-spawned (web-UI-driven)
 session never blocks on Claude's unhookable trust/onboarding TUI prompts.
 
@@ -64,7 +64,7 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.claude_native_bridge import ensure_claude_workspace_trusted
+from omnigent.harnesses.claude_native.bridge import ensure_claude_workspace_trusted
 from omnigent.inner.bundle_skills import claude_native_skill_args
 
 pytestmark = pytest.mark.skipif(
@@ -189,8 +189,8 @@ def test_claude_native_pre_seeded_trust_runs_unreviewed_project_hook(
         encoding="utf-8",
     )
 
-    # omnigent's real pre-launch trust seed (claude_native_bridge.py). No prompt,
-    # no confirmation --- and it lands in the launch HOME, not an isolated home.
+    # omnigent's real pre-launch trust seed. No prompt, no confirmation --- and
+    # it lands in the launch HOME, not an isolated home.
     ensure_claude_workspace_trusted(workspace)
 
     claude_config = json.loads((fake_home / ".claude.json").read_text(encoding="utf-8"))
