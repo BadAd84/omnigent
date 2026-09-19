@@ -1983,6 +1983,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           type: "message",
           data: { role: "user", content, stable_id: head.stableId },
         });
+        // Accepted: a recovered message's durable copy is done (see `send`).
+        if (head.stableId !== undefined) clearUnsentMessage(head.stableId);
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -3389,8 +3391,9 @@ function mirrorActiveEntry(): void {
  *
  * No-op when the entry is already live and healthy (stream bound or still
  * loading), and for a blank or client-only (temp) id. When a prior attempt left
- * the entry with a load error, it is released and re-bound so a failed side chat
- * can recover on retry (a plain membership check would strand it forever).
+ * the entry with a load error, history is retried in place while its pump is
+ * live, and a dead entry is released and re-bound, so a failed side chat can
+ * recover on retry (a plain membership check would strand it forever).
  *
  * @param id Conversation id to stream, e.g. a side-chat child.
  */
@@ -3398,12 +3401,18 @@ export async function ensureConversationStreamed(id: string): Promise<void> {
   if (id === "" || isTempConvId(id)) return;
   const existing = conversationRegistry.peek(id);
   if (existing !== undefined) {
-    // Reuse only while a load is in flight (guards a double-bind) or the stream
-    // is actually live. A non-reconnectable `server_closed` tears down the
+    // Reuse while a load is in flight (guards a double-bind) or the stream is
+    // actually live. A non-reconnectable `server_closed` tears down the
     // controller WITHOUT setting a load error, so an error-free entry can still
     // be dead — reusing it would strand a remounted pane on stale state. This
     // mirrors switchTo's `isConversationStreamCurrent` liveness gate.
-    if (existing.getState().loadingConversation || isConversationStreamCurrent(id)) return;
+    if (existing.getState().loadingConversation) return;
+    if (isConversationStreamCurrent(id)) {
+      // A live pump whose history failed to load: retry that in place (a pane
+      // remount, or its Retry button) rather than leave the error standing.
+      if (existing.getState().conversationLoadError !== null) await retryConversationHistory(id);
+      return;
+    }
     // Dead: drop the entry so the acquire below rebinds.
     conversationRegistry.release(id);
   }

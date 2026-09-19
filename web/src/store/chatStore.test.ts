@@ -2320,6 +2320,42 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(state.conversationLoadError).not.toBeNull();
   });
 
+  it("ensureConversationStreamed retries a live entry's failed history in place", async () => {
+    // A side-chat pane's mount and its Retry button both go through
+    // ensureConversationStreamed. With a live pump and a failed snapshot it must
+    // reload history without replacing that pump — or Retry would do nothing.
+    seedSession("conv_side", [assistantMessage("resp_s", "side reply")]);
+    let failSnapshot = true;
+    const openedStreams: AbortSignal[] = [];
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/sessions/conv_side/stream")) {
+        if (init?.signal) openedStreams.push(init.signal);
+        return mockResponse(null, { bodyStream: pushableStream().stream });
+      }
+      if (url.split("?")[0] === "/v1/sessions/conv_side" && (init?.method ?? "GET") === "GET") {
+        if (failSnapshot) return mockResponse({}, { ok: false, status: 404 });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    await ensureConversationStreamed("conv_side");
+    const entry = conversationRegistry.peek("conv_side")!;
+    expect(entry.getState().conversationLoadError).not.toBeNull();
+    const controller = entry.getState().abortController;
+    expect(controller).not.toBeNull();
+
+    failSnapshot = false;
+    await ensureConversationStreamed("conv_side");
+
+    const state = entry.getState();
+    expect(state.conversationLoadError).toBeNull();
+    expect(state.blocks.map((b) => b.ctx.itemId)).toEqual(["msg_resp_s_asst"]);
+    expect(state.abortController).toBe(controller);
+    expect(openedStreams).toHaveLength(1);
+    expect(openedStreams[0]!.aborted).toBe(false);
+  });
+
   it("retries history in place without disturbing the live pump or its bubbles", async () => {
     seedSession("conv_hist", [assistantMessage("resp_1", "earlier")]);
     let failSnapshot = true;
@@ -13340,6 +13376,38 @@ describe("chatStore — background cross-session flush", () => {
     // One POST to conv_bg (FIFO head only); its head left the queue, tail stays.
     expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["bg-second"]);
+  });
+
+  it("clears a recovered message's durable record once its background flush is accepted", async () => {
+    // A recovered message queued behind a running turn keeps its record id. When
+    // the flush happens after the user switched away, the acknowledgment must
+    // still retire that record, or a later reload would recover it again.
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    sessionStorage.setItem(
+      "omnigent.unsentMessages",
+      JSON.stringify({
+        sid_bg: { conversationId: "conv_bg", text: "recovered then queued", stableId: "sid_bg" },
+      }),
+    );
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [
+        {
+          queueId: "q_1",
+          text: "recovered then queued",
+          conversationId: "conv_bg",
+          stableId: "sid_bg",
+        },
+      ],
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+
+    expect(eventPosts()).toEqual([{ id: "conv_bg", text: "recovered then queued" }]);
+    await vi.waitFor(() =>
+      expect(JSON.parse(sessionStorage.getItem("omnigent.unsentMessages") ?? "{}")).toEqual({}),
+    );
   });
 
   it("does not flush a non-active conversation that is not idle", async () => {
