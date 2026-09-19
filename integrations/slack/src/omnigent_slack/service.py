@@ -98,6 +98,13 @@ _RESTART_ABANDONED_TEXT = (
 # Shutdown's gather waits on every cancelled turn, so this bounds the restart.
 _SHUTDOWN_NOTICE_GRACE_SECONDS = 5.0
 
+# How long shutdown lets in-flight turns finish before cancelling them. A turn
+# whose answer is already committed server-side (e.g. unblocked by a verdict
+# moments before a deploy restart) delivers it within this window instead of
+# dropping it from the thread; stragglers are cancelled and post the restart
+# notice as before.
+_SHUTDOWN_DRAIN_GRACE_SECONDS = 5.0
+
 # Shown when a MANAGED session has no runner: usually the server is still
 # provisioning its sandbox (tens of seconds on a first message), but the server
 # raises the SAME 503 ``runner_unavailable`` when the sandbox launch failed
@@ -244,8 +251,13 @@ class SlackOmnigentService:
     def elicitations(self) -> ElicitationCoordinator:
         return self._elicitations
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, *, grace: float = _SHUTDOWN_DRAIN_GRACE_SECONDS) -> None:
         tasks = list(self._turn_tasks)
+        if tasks and grace > 0:
+            # Let turns mid-delivery finish (bounded); cancelling them outright
+            # drops answer text that is already committed but not yet posted.
+            await asyncio.wait(tasks, timeout=grace)
+            tasks = list(self._turn_tasks)
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)

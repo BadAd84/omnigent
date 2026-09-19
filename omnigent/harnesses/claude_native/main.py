@@ -1171,6 +1171,12 @@ async def _run_claude_model_probe(
             process.kill()
         with contextlib.suppress(Exception):
             await process.wait()
+        # The interrupted communicate() left the pipe transports open. Close
+        # them while the loop still runs, or the transport's __del__ spews
+        # "RuntimeError: Event loop is closed" onto the terminal at exit.
+        transport = getattr(process, "_transport", None)
+        if transport is not None:
+            transport.close()
         if isinstance(exc, asyncio.CancelledError):
             raise
         _logger.warning("Claude model probe timed out")

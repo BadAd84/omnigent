@@ -289,3 +289,50 @@ async def test_catalog_keeps_enabled_fable_and_future_picker_models(
         },
         {"id": "future", "model": "vendor-future", "displayName": "Future model"},
     ]
+
+
+@pytest.mark.parametrize("failure", ["cancelled", "timeout"])
+async def test_interrupted_probe_closes_its_subprocess_transport(
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    """An interrupted probe must close its transport while the loop runs;
+    an unclosed one is destroyed only at event-loop close and spews
+    "RuntimeError: Event loop is closed" onto the user's terminal."""
+    closed: list[bool] = []
+
+    class Transport:
+        def close(self) -> None:
+            closed.append(True)
+
+    class Process:
+        returncode: int | None = None
+
+        def __init__(self) -> None:
+            self._transport = Transport()
+
+        async def communicate(self, input: bytes | None = None) -> tuple[bytes, bytes]:
+            if failure == "cancelled":
+                raise asyncio.CancelledError
+            raise TimeoutError
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return -9
+
+    async def spawn(command: str, *args: str, **kwargs: Any) -> Process:
+        return Process()
+
+    monkeypatch.setattr(
+        claude_native,
+        "asyncio",
+        SimpleNamespace(**{**vars(asyncio), "create_subprocess_exec": spawn}),
+    )
+    if failure == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            await claude_native._run_claude_model_probe(None, stream_input=True)
+    else:
+        assert await claude_native._run_claude_model_probe(None, stream_input=True) is None
+    assert closed, f"{failure}: the probe did not close its subprocess transport"

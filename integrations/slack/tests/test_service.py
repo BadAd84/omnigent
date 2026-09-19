@@ -1809,7 +1809,7 @@ async def test_message_while_parked_in_process_points_to_pending_request(tmp_pat
     assert not any("still working" in e["text"].lower() for e in slack.ephemerals)
 
     # Tear down with the card still parked (shutdown cancels the resolver).
-    await service.shutdown()
+    await service.shutdown(grace=0)
 
 
 async def test_idle_follow_up_message_runs_in_thread(tmp_path: Path) -> None:
@@ -2871,7 +2871,7 @@ async def test_abandoned_elicitation_at_turn_end_is_declined(tmp_path: Path) -> 
     )
     await _wait_for_card(slack)
     # Tear the turn down with the card still parked (mirrors a process shutdown).
-    await service.shutdown()
+    await service.shutdown(grace=0)
 
     # The abandoned request was declined server-side (accepted=False), and the
     # card shows the abandonment label with a retry hint — not "Answered elsewhere".
@@ -2957,7 +2957,7 @@ async def test_verdict_post_failure_shows_delivery_failed_not_approved(tmp_path:
     )
     # The turn never gets the push (the server never received the verdict); the
     # card is finalized at turn teardown with the delivery-failure outcome.
-    await service.shutdown()
+    await service.shutdown(grace=0)
 
     assert slack.updates
     card_text = slack.updates[-1]["blocks"][0]["text"]["text"]
@@ -3007,7 +3007,7 @@ async def test_delivery_failed_releases_server_park_at_turn_end(tmp_path: Path) 
     await service.handle_elicitation_action(
         session_id=sid, elicitation_id=eid, verdict=Verdict(accepted=True)
     )
-    await service.shutdown()
+    await service.shutdown(grace=0)
 
     # Two calls: the failed verdict delivery (accepted=True), then the park-release
     # decline (accepted=False) at turn end so the server isn't left wedged.
@@ -3038,7 +3038,7 @@ async def test_resolver_tasks_are_cancelled_on_shutdown(tmp_path: Path) -> None:
     assert len(service._elicitation._resolvers) == 1  # type: ignore[attr-defined]
     resolver = next(iter(service._elicitation._resolvers))  # type: ignore[attr-defined]
 
-    await service.shutdown()
+    await service.shutdown(grace=0)
 
     # The resolver was cancelled/finished and dropped from the tracking set.
     assert resolver.done()
@@ -3225,7 +3225,7 @@ async def test_unsupported_typed_input_links_to_web_ui(tmp_path: Path) -> None:
         context={"bot_user_id": "B1"},
     )
     await _wait_for_turn_end(slack)
-    await service.shutdown()
+    await service.shutdown(grace=0)
 
     # A link to the approve page was posted; no approval card, no auto-resolve.
     links = [p for p in slack.posts if "/approve/conv_1/elicit_typed" in str(p.get("text"))]
