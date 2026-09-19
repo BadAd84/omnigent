@@ -111,6 +111,7 @@ from omnigent.host.daemon_launch import (
     wait_for_host_online,
     wait_for_runner_online,
 )
+from omnigent.inner import _proc
 from omnigent.models import model_catalog
 from omnigent.models.claude_model_vocabulary import (
     ALIAS_MODEL_ENV_VARS,
@@ -988,6 +989,7 @@ async def _resolve_claude_model_alias(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_proc.spawn_kwargs(),
         )
     except OSError:
         _logger.debug("Claude alias resolution could not launch for %r", alias, exc_info=True)
@@ -1159,6 +1161,7 @@ async def _run_claude_model_probe(
             stdin=asyncio.subprocess.PIPE if stream_input else asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **_proc.spawn_kwargs(),
         )
     except OSError:
         _logger.warning("Claude model probe could not launch the claude CLI", exc_info=True)

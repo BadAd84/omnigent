@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import sys
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -11,6 +14,62 @@ from typing import Any
 import pytest
 
 from omnigent.harnesses.claude_native import main as claude_native
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Controlling terminals require POSIX")
+@pytest.mark.parametrize("kind", ["initialize", "legacy", "alias"])
+def test_model_probes_cannot_change_host_terminal(kind: str) -> None:
+    """A noninteractive probe must not reopen and change its parent's terminal."""
+    pexpect = pytest.importorskip("pexpect")
+    script = textwrap.dedent(
+        r"""
+        import asyncio
+        import os
+        import sys
+        import termios
+        from omnigent.harnesses.claude_native import main
+
+        probe = (
+            "import os, tty\n"
+            "try:\n"
+            "    fd = os.open('/dev/tty', os.O_RDWR)\n"
+            "except OSError:\n"
+            "    pass\n"
+            "else:\n"
+            "    tty.setraw(fd)\n"
+            "    os.close(fd)\n"
+            'print(\'{"type":"system","subtype":"init","model":"probe-model"}\')\n'
+        )
+        main._claude_model_probe_invocation = lambda *args, **kwargs: (
+            sys.executable, ["-c", probe], dict(os.environ)
+        )
+        before = termios.tcgetattr(sys.stdin.fileno())
+        kind = sys.argv[1]
+        async def run():
+            if kind == "alias":
+                result = await main._resolve_claude_model_alias(None, "default")
+                assert result == {"model": "probe-model"}, result
+            else:
+                result = await main._run_claude_model_probe(
+                    None, stream_input=kind == "initialize"
+                )
+                assert '"model":"probe-model"' in result, result
+        asyncio.run(run())
+        after = termios.tcgetattr(sys.stdin.fileno())
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, before)
+        assert after == before, "Model probe changed the host terminal modes"
+        print("TERMINAL_UNCHANGED", flush=True)
+        """
+    )
+    child = pexpect.spawn(sys.executable, ["-c", script, kind], encoding="utf-8", timeout=30)
+    try:
+        output = child.read()
+        child.close()
+        assert child.exitstatus == 0, output
+        assert "TERMINAL_UNCHANGED" in output
+    finally:
+        if not child.closed:
+            child.close(force=True)
 
 
 def _stub_picker(
