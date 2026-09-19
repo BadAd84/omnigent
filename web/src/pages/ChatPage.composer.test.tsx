@@ -116,7 +116,7 @@ vi.mock("@/lib/goalApi", async (importOriginal) => ({
 import type { ElicitationBlock } from "@/lib/blocks";
 import { getGoal } from "@/lib/goalApi";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { Composer, shouldQueueSend } from "./ChatPage";
+import { Composer, computeIsWorking, shouldQueueSend } from "./ChatPage";
 import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
 import {
   BUILTIN_SLASH_COMMANDS,
@@ -2780,6 +2780,28 @@ describe("Composer pending elicitation", () => {
     expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
   });
 
+  it("keeps Interrupt available and preserves a draft typed during a pending elicitation", () => {
+    useChatStore.setState({ conversationId: "conv_interrupt_draft", blocks: [elicitationBlock()] });
+    const onStop = vi.fn();
+    const onSend = vi.fn();
+    render(<Composer {...composerProps({ isWorking: true, onStop, onSend })} />);
+
+    fireEvent.change(textarea(), { target: { value: "keep this draft" } });
+    fireEvent.click(screen.getByRole("button", { name: "Interrupt" }));
+
+    expect(onStop).toHaveBeenCalledTimes(1);
+    expect(onSend).not.toHaveBeenCalled();
+    expect(textarea()).toHaveValue("keep this draft");
+  });
+
+  it("keeps ChatPage's waiting elicitation interruptible", () => {
+    // A pending request blocks sending but keeps the waiting turn interruptible.
+    useChatStore.setState({ conversationId: "conv_wiring", blocks: [elicitationBlock()] });
+    const isWorking = computeIsWorking("waiting");
+    render(<Composer {...composerProps({ isWorking, status: "streaming" })} />);
+    expect(screen.getByRole("button", { name: "Interrupt" })).toBeEnabled();
+  });
+
   it("unlocks once the elicitation is responded", () => {
     useChatStore.setState({
       blocks: [elicitationBlock({ status: "responded", response: { action: "accept" } })],
@@ -4631,3 +4653,67 @@ function setComposerState(
     ...(skillsStatus === undefined ? {} : { skillsStatus }),
   });
 }
+
+describe("saved sandbox inference policy", () => {
+  let previous: ChatState;
+  beforeEach(() => {
+    previous = useChatStore.getState();
+    useChatStore.setState({
+      conversationId: "conv_policy",
+      sessionHarness: "claude-sdk",
+      sessionModelOverride: null,
+      sessionModelSeeded: false,
+      llmModel: "private/default",
+      costControlModeOverride: null,
+      pendingModelChange: null,
+      setModel: vi.fn().mockResolvedValue(undefined),
+    });
+  });
+  afterEach(() => {
+    cleanup();
+    useChatStore.setState(previous, true);
+  });
+
+  it("offers only the saved shortlist for a configured SDK session", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: false,
+          modelPickerKind: "configured",
+          inferenceConfigured: true,
+          codexModelOptions: [
+            { id: "private/default", displayName: "Primary", isDefault: true },
+            { id: "private/fast", displayName: "Fast" },
+          ],
+        })}
+      />,
+    );
+    await openSessionModels();
+    expect(screen.queryByTestId("composer-agent-model-default")).toBeNull();
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Fast" }));
+    await waitFor(() =>
+      expect(useChatStore.getState().setModel).toHaveBeenCalledWith("private/fast", {
+        expectConfirmation: false,
+      }),
+    );
+  });
+
+  it("does not offer an unrestricted default when the saved catalog is unavailable", async () => {
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          showModels: true,
+          showEffort: false,
+          modelPickerKind: "configured",
+          inferenceConfigured: true,
+          inferenceError: "The gateway could not be reached.",
+          codexModelOptions: [],
+        })}
+      />,
+    );
+    await openSessionModels();
+    expect(screen.getByText("The gateway could not be reached.")).toBeVisible();
+    expect(screen.queryByTestId("composer-agent-model-default")).toBeNull();
+  });
+});

@@ -729,11 +729,9 @@ export function ChatPage() {
   // Hoisted above the early-return guards so the title-update effect can read them.
   const activeConv = sessionConvId ? conversations?.find((c) => c.id === sessionConvId) : null;
 
-  // `isWorking` gates the parent's OWN turn (Stop/Interrupt) and must NOT
-  // include child-session activity. `showsWorking` is display-only (tab title
-  // + shimmer/pill) for the main chat and is suppressed mid-elicitation or
-  // when the runner is known offline.
-  const isWorking = !hasPendingElicitation && computeIsWorking(sessionStatus);
+  // Keep the parent's Stop action live while its turn waits on an elicitation.
+  // Child activity and display suppression belong to `showsWorking` below.
+  const isWorking = computeIsWorking(sessionStatus);
   // Managed-sandbox stages own the in-progress slot with specific pipeline
   // copy. A normal terminal runner launch keeps the standard Working shimmer
   // so startup does not introduce a second, special chat state.
@@ -897,14 +895,19 @@ export function ChatPage() {
   const { data: hostProbeOptions } = useHostModelOptions(
     activeSession?.hostId ?? null,
     hostProbeHarness ?? "",
-    hostProbeHarness !== null && sessionModelOptions.length === 0,
+    !activeSession?.inferenceConfigured &&
+      hostProbeHarness !== null &&
+      sessionModelOptions.length === 0,
   );
   // Identity-stable on purpose: substitute only when the host rows actually
   // exist, else keep the store's own array reference — a fresh [] here would
   // re-render every options consumer (composer, gear, agent-info popover) on
   // each streaming/liveness tick.
   const codexModelOptions =
-    sessionModelOptions.length === 0 && hostProbeOptions != null && hostProbeOptions.length > 0
+    !activeSession?.inferenceConfigured &&
+    sessionModelOptions.length === 0 &&
+    hostProbeOptions != null &&
+    hostProbeOptions.length > 0
       ? hostProbeOptions
       : sessionModelOptions;
 
@@ -1046,6 +1049,7 @@ export function ChatPage() {
       return {
         labels: activeSession.labels ?? {},
         harness: activeSession.harness,
+        inferenceConfigured: activeSession.inferenceConfigured,
         parentSessionId: activeSession.parentSessionId ?? null,
       };
     // Keep the seeded native identity through the temp-to-real ID handoff,
@@ -1156,6 +1160,8 @@ export function ChatPage() {
       showModels={modelPickerKind !== null}
       modelPickerKind={modelPickerKind}
       codexModelOptions={codexModelOptions}
+      inferenceConfigured={activeSession?.inferenceConfigured}
+      inferenceError={activeSession?.inferenceError}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
@@ -1434,6 +1440,8 @@ interface MainAgentSurfaceProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -1583,6 +1591,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   showModels,
   modelPickerKind,
   codexModelOptions,
+  inferenceConfigured,
+  inferenceError,
   modelLabelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
@@ -1888,6 +1898,8 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             showModels={showModels}
             modelPickerKind={modelPickerKind}
             codexModelOptions={codexModelOptions}
+            inferenceConfigured={inferenceConfigured}
+            inferenceError={inferenceError}
             modelLabelOptions={modelLabelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
@@ -2013,6 +2025,8 @@ interface ComposerProps {
   modelPickerKind: NativeModelPickerKind | null;
   /** Runner-owned model picker rows for native sessions. */
   codexModelOptions: readonly NativeModelOption[];
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -2356,6 +2370,8 @@ function ComposerImpl(
     showModels,
     modelPickerKind,
     codexModelOptions,
+    inferenceConfigured,
+    inferenceError,
     modelLabelOptions = codexModelOptions,
     showCodexPlanMode,
     showClaudePermissionMode = false,
@@ -2870,7 +2886,7 @@ function ComposerImpl(
 
   // Depends on mentionedItems (from the hook above), so it's computed here.
   const hasDraft = fullText.trim().length > 0 || files.length > 0 || mentionedItems.length > 0;
-  const showInterruptButton = isWorking && !hasDraft;
+  const showInterruptButton = isWorking && (!hasDraft || hasPendingElicitation);
 
   // Drain externally-queued attachments (file viewer "Attach to agent") into
   // the local mention chips, deduping against what's already tagged, then
@@ -3964,6 +3980,8 @@ function ComposerImpl(
                   effortLevels={effortLevels}
                   modelPickerKind={modelPickerKind}
                   codexModelOptions={codexModelOptions}
+                  inferenceConfigured={inferenceConfigured}
+                  inferenceError={inferenceError}
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
@@ -4291,7 +4309,7 @@ const PI_NATIVE_EFFORT_LEVELS = [
 ] as const;
 
 type NativeModelPickerKind =
-  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp";
+  "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
 
 type LabelSource = { labels?: Record<string, string | null> | null } | null | undefined;
 
@@ -4419,6 +4437,7 @@ export function modelPickerKindForConv(
         labels?: Record<string, string | null> | null;
         harness?: string | null;
         parentSessionId?: string | null;
+        inferenceConfigured?: boolean;
       }
     | null
     | undefined,
@@ -4452,6 +4471,7 @@ export function modelPickerKindForConv(
       // model_select handler, so the picker surfaces that as the live model.
       return "pi";
     default:
+      if (conv?.inferenceConfigured) return "configured";
       // Generic ACP sessions carry no wrapper label; the server canonicalizes
       // ``acp:<slug>`` ids to "acp" in the snapshot's harness field.
       if (conv?.harness === "acp" && modelOptions.length > 1) return "acp";
@@ -4461,7 +4481,13 @@ export function modelPickerKindForConv(
 
 export function shouldShowModelPicker(
   conv:
-    { labels?: Record<string, string | null> | null; harness?: string | null } | null | undefined,
+    | {
+        labels?: Record<string, string | null> | null;
+        harness?: string | null;
+        inferenceConfigured?: boolean;
+      }
+    | null
+    | undefined,
   modelOptions: readonly NativeModelOption[] = [],
 ): boolean {
   return modelPickerKindForConv(conv, modelOptions) !== null;
@@ -4590,6 +4616,8 @@ function SessionHarnessPicker({
   effortLevels,
   modelPickerKind,
   codexModelOptions,
+  inferenceConfigured,
+  inferenceError,
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
@@ -4609,6 +4637,8 @@ function SessionHarnessPicker({
   effortLevels: readonly string[];
   modelPickerKind: NativeModelPickerKind | null;
   codexModelOptions: readonly NativeModelOption[];
+  inferenceConfigured?: boolean;
+  inferenceError?: string | null;
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
@@ -4770,8 +4800,14 @@ function SessionHarnessPicker({
             ? {
                 testId: "composer-agent-models",
                 header: "Models",
+                leading:
+                  inferenceConfigured && (inferenceError || modelOptions.length === 0) ? (
+                    <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
+                      {inferenceError ?? "No usable models are available for this session."}
+                    </div>
+                  ) : undefined,
                 choices: [
-                  ...(!modelOptions.some((model) => model.isDefault)
+                  ...(!inferenceConfigured && !modelOptions.some((model) => model.isDefault)
                     ? [
                         {
                           key: "__default__",
@@ -5038,7 +5074,8 @@ function useResolvedComposerModel(
     modelPickerKind === "pi" ||
     modelPickerKind === "opencode" ||
     modelPickerKind === "devin" ||
-    modelPickerKind === "acp";
+    modelPickerKind === "acp" ||
+    modelPickerKind === "configured";
   const modelOptions: readonly {
     id: string;
     model?: string;
